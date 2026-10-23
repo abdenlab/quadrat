@@ -39,7 +39,19 @@ pileup runs.
 
 from importlib.metadata import version
 
-__all__ = ["__version__"]
+from quadrat.pileup import pileup_alignments, pileup_many
+from quadrat.reference import chrom_lengths
+from quadrat.tables import CUT_SITE_SUFFIX, read_manifest, require_complete
+
+__all__ = [
+    "CUT_SITE_SUFFIX",
+    "__version__",
+    "chrom_lengths",
+    "pileup_alignments",
+    "pileup_many",
+    "read_manifest",
+    "require_complete",
+]
 
 # public
 __version__ = version("quadrat")
