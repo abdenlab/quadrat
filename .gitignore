@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+
+# Environments
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+# Docs
+docs/_build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# SDLC working state: local review roles, guides and accumulated review
+# documents. Untracked here as it is in the sibling projects -- the
+# review history is versioned by its own repo under .sdlc, and the
+# guides are local working config rather than a project artifact.
+.sdlc/
