@@ -1,0 +1,94 @@
+name: Run tests
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every version `requires-python` admits, which is what makes a
+        # green run evidence for the floor rather than for whichever
+        # interpreter the author happens to develop against. The floor
+        # has no ceiling above it, so a new release is admitted silently
+        # and has to be added here deliberately.
+        python-version:
+          - '3.11'
+          - '3.12'
+          - '3.13'
+          - '3.14'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # The version comes from the tag history, which a shallow
+          # clone does not carry: at the default depth every build
+          # would report the initial release plus a commit, whatever
+          # tag it was actually built from.
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The pileup extra resolves giql from a git revision, so the
+      # install needs network here. See the comment on
+      # `[tool.uv.sources]` in pyproject.toml.
+      #
+      # `--locked` so a green run says the committed lock resolves,
+      # rather than that some resolution uv wrote and discarded did.
+      - name: Install
+        run: uv sync --locked --all-extras
+
+      - name: Lint
+        run: |
+          uv run ruff format --check src tests build-hooks
+          uv run ruff check src tests build-hooks
+
+      - name: Test
+        run: uv run pytest -q
+
+  base-install:
+    name: Base install
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # The version comes from the tag history, which a shallow
+          # clone does not carry: at the default depth every build
+          # would report the initial release plus a commit, whatever
+          # tag it was actually built from.
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          python-version: '3.11'
+
+      # No extras and no dev group, which is the install the README and
+      # the package docstring call sufficient. It is a job of its own
+      # because syncing without extras would strip the venv the test job
+      # needs.
+      - name: Install
+        run: uv sync --locked --no-dev
+
+      - name: Import
+        run: uv run --no-sync python -c "import quadrat; print(quadrat.__version__)"

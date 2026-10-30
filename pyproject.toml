@@ -1,0 +1,147 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[project]
+authors = [
+    { name = "Nezar Abdennur", email = "nabdennur@gmail.com" },
+    { name = "Conrad Bzura", email = "conradbzura@gmail.com" },
+]
+# No licence classifier: PEP 639 deprecates them and directs tools not
+# to combine one with `License-Expression`, which `license = "MIT"`
+# below produces. PyPI rejects a distribution carrying both.
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+description = "Sequence-to-function training data, straight from BAM."
+dynamic = ["version"]
+license = "MIT"
+maintainers = [
+    { name = "Nezar Abdennur", email = "nabdennur@gmail.com" },
+    { name = "Conrad Bzura", email = "conradbzura@gmail.com" },
+]
+name = "quadrat"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Floors, not tested ceilings. 3.11 rather than 3.10 because the pileup
+# engine -- polars-bio, polars, giql -- is gated there, and the pileup is
+# not an optional part of what this package is for.
+dependencies = [
+    "numpy>=1.14.2",
+    "pandas>=1.3.3",
+    "torch>=2.9.0",
+    "tqdm>=4.64.1",
+    "joblib>=1.0.0",
+    "tangermeme>=1.5.0",
+]
+
+# `pyfaidx` belongs in this extra rather than in a dev group: the
+# pileup imports it at runtime, so it is a runtime dependency of the
+# extra rather than a test one. The lazy-import guarantee that makes
+# the base install sufficient is stated in the package docstring.
+[project.optional-dependencies]
+pileup = [
+    "polars-bio>=0.35.1",
+    "polars>=1.30",
+    "giql>=0.7",
+    "pyfaidx>=0.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-mock>=3.14",
+    "hypothesis>=6.0.0",
+    "pysam",
+    "ruff>=0.1.0",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-autobuild>=2024.0",
+    "sphinx-book-theme>=1.1",
+    "sphinx-design>=0.6",
+]
+
+# BRANCH-ONLY. The datafusion-bio GIQL target is not on PyPI and lives on
+# a proof-of-concept branch, so this pins the public commit at that
+# branch's tip. Its library code is identical to what cherimoya builds
+# against; the only delta is benchmark material outside `src`. Replace
+# with a version specifier once the target reaches `main` and ships.
+[tool.uv.sources]
+giql = { git = "https://github.com/abdenlab/giql", rev = "59c74276e07cc4680cb24303a9192c3a71c11d59" }
+
+# The version is the repository's, not a literal anyone has to
+# remember to bump: a `vMAJOR.MINOR.PATCH` tag names a release and every
+# commit between tags reports the last release plus the commit it is.
+# Releasing is therefore pushing a tag, and nothing in the tree has to
+# change for one.
+[tool.hatch.metadata.hooks.custom]
+path = "build-hooks/metadata.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quadrat"]
+
+# The whole test tree ships, so the suite runs from an sdist exactly as
+# it does from the repository -- without conftest.py it would run
+# against a different cache directory than the one the suite assumes.
+#
+# Stated here rather than in a MANIFEST.in, which hatchling does not
+# read: a MANIFEST.in's directives are inert under this backend, and an
+# sdist built with or without the file is byte-identical.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "tests",
+    "build-hooks",
+    "README.md",
+    "LICENSE",
+]
+
+# `**` on both sides, because this is a gitignore-style pattern: one
+# containing a slash is anchored at the project root and a single `*`
+# spans one path segment, so `*/.ipynb_checkpoints/*` excludes a
+# checkpoint directory one level down and ships every deeper one.
+exclude = ["**/.ipynb_checkpoints/**"]
+
+[tool.ruff]
+line-length = 89
+
+# Stated explicitly rather than left to the default, which has widened
+# over ruff releases and would otherwise change what passes when the
+# pin moves. Pyflakes plus the pycodestyle errors that are errors:
+# undefined names, unused imports, broken syntax.
+#
+# Deliberately absent are the style-migration families -- UP, SIM, FURB,
+# RUF. The code ported from cherimoya uses `str.format` throughout and
+# `class X(object)` by convention. Flagging either would mean rewriting
+# thousands of lines in the same change that moves them, which is the
+# one thing that makes a port unreviewable.
+#
+# `I` is in despite that argument, because import order is mechanical in
+# ported code too, `--fix` for it is safe and localised, and getting it
+# wrong is the one style defect a reviewer reliably misses.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# `--strict-markers` turns a misspelt marker into an error rather than a
+# test that is silently neither selected nor deselected.
+[tool.pytest.ini_options]
+addopts = ["--strict-markers"]
+testpaths = ["tests"]
+markers = [
+    "packaging: spawns a fresh interpreter or a real build to observe import-time or artifact state",
+]
+
+# Scoped rather than blanket: a deprecation raised inside `quadrat` is a
+# stale API this suite should fail on, while pysam deprecates ahead of
+# removals on a schedule this project does not set.
+filterwarnings = [
+    "error::DeprecationWarning:quadrat.*",
+    "ignore::DeprecationWarning:pysam.*",
+]
