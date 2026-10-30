@@ -126,6 +126,12 @@ line-length = 89
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]
 
+# A test module calls `pytest.importorskip` before importing quadrat, so
+# a machine without the pileup extra skips the module instead of failing
+# collection. That necessarily puts imports after statements.
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+
 [tool.ruff.format]
 docstring-code-format = true
 
