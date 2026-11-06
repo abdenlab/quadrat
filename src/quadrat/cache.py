@@ -28,7 +28,6 @@ import time
 import weakref
 
 import numpy
-import torch
 
 from quadrat._engine import (
     TRACK_TABLE,
@@ -256,6 +255,7 @@ class WindowSignalCache(ProcessLocalHandles):
         rows per channel that are not zero.
         """
 
+        torch = import_on_first_use("torch")
         offsets, pos, val, chan = self._arrays()
         out = numpy.zeros((self.n_channels, length), dtype=numpy.float32)
 
@@ -762,6 +762,7 @@ def window_group_sums(windows, tracks, group_sizes):
         count.
     """
 
+    torch = import_on_first_use("torch")
     n_windows = len(windows)
     totals = numpy.zeros((n_windows, len(group_sizes)), dtype=numpy.float64)
 

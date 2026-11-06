@@ -16,13 +16,17 @@ Reading a track and reading a reference are what the base install is
 for, so nothing here reaches for the ``pileup`` extra: a store reads
 Parquet through polars and sequence through pyfaidx, both base
 dependencies, and neither is imported until a store is built.
+
+Nor are torch and tangermeme, which are heavier than either and come
+through the same seam for a second reason: ``tqdm`` arrives with them,
+and `quadrat._engine.engine` quiets the engine's progress bars by
+setting ``TQDM_DISABLE`` before importing it -- which only works while
+nothing has imported ``tqdm`` already.
 """
 
 import os
 
 import numpy
-import torch
-from tangermeme.utils import one_hot_encode
 
 from quadrat._engine import fspath_or_none, import_on_first_use
 from quadrat.tables import TRACK_SUFFIX, require_complete, track_chrom_path
@@ -134,8 +138,9 @@ class SequenceStore(ProcessLocalHandles):
             wherever the residue is one of ``ignore``.
         """
 
+        encode = import_on_first_use("tangermeme.utils").one_hot_encode
         residues = self._fasta()[str(chrom)][int(start) : int(end)].seq.upper()
-        return one_hot_encode(residues, alphabet=self.alphabet, ignore=self.ignore)
+        return encode(residues, alphabet=self.alphabet, ignore=self.ignore)
 
     def _fasta(self):
         """This process's open reference, opened on first use."""
@@ -217,6 +222,7 @@ class TrackStore(ProcessLocalHandles):
         """
 
         polars = import_on_first_use("polars")
+        torch = import_on_first_use("torch")
         start, end = int(start), int(end)
         out = numpy.zeros((self.n_channels, end - start), dtype=numpy.float32)
 

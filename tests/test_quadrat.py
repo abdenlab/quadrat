@@ -229,10 +229,46 @@ class TestDistribution:
         assert result.stdout.split() == []
 
     @pytest.mark.packaging
-    @pytest.mark.skipif(
-        shutil.which("uv") is None,
-        reason="uv builds the wheel under test",
-    )
+    def test_quadrat_cache_should_import_neither_the_engine_nor_a_tensor_library(self):
+        """Test what importing the window cache costs before it is used.
+
+        Given:
+            A fresh interpreter in an environment where everything is
+            installed.
+        When:
+            ``quadrat.cache`` is imported and the loaded modules
+            inspected.
+        Then:
+            It should have loaded none of the engine, torch, tangermeme
+            or tqdm, so importing the module costs nothing that running
+            it will.
+
+        tqdm is the one that bites rather than merely costs.
+        `quadrat._engine.engine` quiets the engine's progress bars by
+        setting ``TQDM_DISABLE`` before importing polars-bio, and that
+        works only while nothing has imported tqdm already -- so a
+        module-level torch or tangermeme import here puts the bars back
+        on every grouping run, which is how this was found.
+        """
+
+        # Arrange
+        for name in PILEUP_MODULES:
+            pytest.importorskip(name)
+        names = tuple(PILEUP_MODULES) + ("torch", "tangermeme", "tqdm")
+        program = (
+            "import sys, quadrat.cache\n"
+            "names = {!r}\n"
+            "print(' '.join(n for n in names if n in sys.modules))\n".format(names)
+        )
+
+        # Act
+        result = run_child(
+            [sys.executable, "-c", program], "the child interpreter failed"
+        )
+
+        # Assert
+        assert result.stdout.split() == []
+
     @pytest.mark.packaging
     @pytest.mark.skipif(
         shutil.which("uv") is None,
