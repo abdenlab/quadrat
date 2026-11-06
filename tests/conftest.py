@@ -57,8 +57,14 @@ class Corpus:
 
     ``fasta``, ``peaks``, ``negatives`` and ``exclusion`` stay ``None``
     until something builds them, where ``None`` means nothing built
-    that rather than built and empty. ``bams`` is an empty list for the
-    same reason.
+    that rather than built and empty. ``bams`` and ``tracks`` are empty
+    lists for the same reason.
+
+    ``in_window``, ``out_window`` and ``max_jitter`` are recorded
+    rather than used: nothing here renders a window, but a test that
+    reads one needs the geometry its tracks were built to agree with
+    the geometry it asks for, and carrying both on the corpus is what
+    keeps them from being spelled twice.
 
     :param root: The directory holding this corpus's files, as a
         `pathlib.Path`. `Corpus.path` returns members of it as strings,
@@ -66,6 +72,10 @@ class Corpus:
     :param chrom_sizes: The geometry the corpus was built to, copied
         rather than aliased, so a caller mutating its own mapping
         afterwards cannot alter what this corpus reports.
+    :param in_window: The input window span, or ``None`` where the
+        caller asked for no geometry.
+    :param out_window: The output window span, or ``None``.
+    :param max_jitter: The largest offset a draw may be shifted by.
 
     .. rubric:: Implementation notes
 
@@ -79,19 +89,29 @@ class Corpus:
         "chrom_sizes",
         "fasta",
         "bams",
+        "tracks",
         "peaks",
         "negatives",
         "exclusion",
+        "in_window",
+        "out_window",
+        "max_jitter",
     )
 
-    def __init__(self, root, chrom_sizes):
+    def __init__(
+        self, root, chrom_sizes, *, in_window=None, out_window=None, max_jitter=0
+    ):
         self.root = root
         self.chrom_sizes = dict(chrom_sizes)
         self.fasta = None
         self.bams = []
+        self.tracks = []
         self.peaks = None
         self.negatives = None
         self.exclusion = None
+        self.in_window = in_window
+        self.out_window = out_window
+        self.max_jitter = max_jitter
 
     def path(self, name):
         """Return a path inside this corpus's directory, as a string."""
@@ -258,8 +278,11 @@ def corpus_factory(tmp_path_factory):
     even when their chromosome sizes agree, which is what makes one
     session-scoped factory safe for the whole suite to share.
 
-    Window geometry is not a parameter: nothing here renders a window,
-    so a suite that needs one supplies it itself.
+    Window geometry is recorded, not rendered. Nothing here builds a
+    window, but a corpus that carries tracks has to agree with the
+    geometry the test reading them asks for, so the factory takes the
+    geometry, validates that it can be placed, and hands it back on the
+    corpus rather than leaving each module to spell it twice.
 
     :param name: Prefix for the corpus's own temporary directory.
     :param chrom_sizes: Contig name to length, rendered into every
@@ -288,6 +311,22 @@ def corpus_factory(tmp_path_factory):
     :param exclusion: Rows for an exclusion BED; empty leaves
         ``exclusion`` unset. The path this factory gives it ends
         ``.bed.gz``.
+    :param tracks: One row list per channel, each reaching
+        `builders.write_track`; empty leaves ``tracks`` empty. Channel
+        ``n`` is written to ``tn.track.parquet``, and the order is the
+        channel axis every reader of the set takes.
+    :param in_window: The input window span, recorded on the corpus. A
+        span that cannot be placed -- ``in_window`` plus jitter on both
+        sides exceeding the shortest contig -- raises `ValueError`,
+        because every window a test draws from such a corpus would be
+        filtered out and the test would pass over nothing.
+    :param out_window: The output window span, recorded on the corpus.
+        It must not exceed ``in_window``; the output window sits inside
+        the input one, and a swapped pair is otherwise only visible as
+        a wrong-shaped tensor much later.
+    :param max_jitter: The largest offset a draw may be shifted by,
+        recorded on the corpus and counted on both sides of the
+        placement check above.
 
     Requesting an alignment or a FASTA index needs ``pysam``, so a call
     that asks for either skips without it. The rest of the surface has
@@ -309,9 +348,35 @@ def corpus_factory(tmp_path_factory):
         peaks=(),
         negatives=(),
         exclusion=(),
+        tracks=(),
+        in_window=None,
+        out_window=None,
+        max_jitter=0,
     ):
         if n_bams or index_fasta:
             pytest.importorskip("pysam")
+        if tracks:
+            pytest.importorskip("polars")
+        if out_window is not None and in_window is not None and out_window > in_window:
+            raise ValueError(
+                "out_window {} exceeds in_window {}: the output window "
+                "sits inside the input one".format(out_window, in_window)
+            )
+        if in_window is not None:
+            span = in_window + 2 * max_jitter
+            shortest = min(chrom_sizes, key=chrom_sizes.get)
+            if span > chrom_sizes[shortest]:
+                raise ValueError(
+                    "a {} bp window with {} bp of jitter needs {} bp and {} "
+                    "is {} bp long, so no window could be placed on "
+                    "it".format(
+                        in_window,
+                        max_jitter,
+                        span,
+                        shortest,
+                        chrom_sizes[shortest],
+                    )
+                )
         if header_contigs is not None:
             uncovered = [
                 chrom
@@ -326,7 +391,13 @@ def corpus_factory(tmp_path_factory):
                 )
 
         root = tmp_path_factory.mktemp(name)
-        corpus = Corpus(root, chrom_sizes)
+        corpus = Corpus(
+            root,
+            chrom_sizes,
+            in_window=in_window,
+            out_window=out_window,
+            max_jitter=max_jitter,
+        )
         corpus.fasta = builders.write_fasta(
             corpus.path("genome.fa"),
             chrom_sizes,
@@ -372,6 +443,10 @@ def corpus_factory(tmp_path_factory):
             corpus.exclusion = builders.write_bed(
                 corpus.path("exclusion.bed.gz"), exclusion
             )
+        corpus.tracks = [
+            builders.write_track(corpus.path("t{}.track.parquet".format(channel)), rows)
+            for channel, rows in enumerate(tracks)
+        ]
         return corpus
 
     return build

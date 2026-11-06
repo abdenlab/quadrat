@@ -566,6 +566,143 @@ def test_corpus_factory_should_render_a_corpus_to_any_geometry(
 
 
 @pytest.mark.packaging
+def test_corpus_factory_should_write_one_track_per_channel(corpus_factory):
+    """Test that a track request lands as the channel axis.
+
+    Given:
+        Two channels' worth of rows.
+    When:
+        A corpus is built from them.
+    Then:
+        It should write one track per channel, in the order given, so
+        the list a reader takes as its channel axis is the list the
+        test wrote.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    import quadrat
+
+    # Act
+    corpus = corpus_factory(
+        "channels",
+        TWO_CONTIGS,
+        tracks=[[("chr1", 10, 1.0)], [("chr1", 20, 2.0), ("chr2", 5, 3.0)]],
+    )
+
+    # Assert
+    assert [os.path.basename(path) for path in corpus.tracks] == [
+        "t0.track.parquet",
+        "t1.track.parquet",
+    ]
+    assert [quadrat.read_manifest(path)["rows"] for path in corpus.tracks] == [1, 2]
+
+
+def test_corpus_factory_should_leave_an_empty_track_request_unset(corpus_factory):
+    """Test that asking for no tracks builds none.
+
+    Given:
+        No track rows.
+    When:
+        A corpus is built.
+    Then:
+        It should leave ``tracks`` empty, which means nothing built
+        them rather than built and empty, and should not require
+        polars to do it.
+    """
+
+    # Act
+    corpus = corpus_factory("no-tracks", TWO_CONTIGS)
+
+    # Assert
+    assert corpus.tracks == []
+
+
+def test_corpus_factory_should_record_the_window_geometry(corpus_factory):
+    """Test that the geometry a corpus was built to is readable from it.
+
+    Given:
+        An input window, an output window and a jitter bound.
+    When:
+        A corpus is built to them.
+    Then:
+        It should carry all three, so a test reading this corpus's
+        tracks asks the corpus for the geometry rather than repeating
+        the numbers its tracks were built to.
+    """
+
+    # Act
+    corpus = corpus_factory(
+        "geometry", TWO_CONTIGS, in_window=60, out_window=30, max_jitter=6
+    )
+
+    # Assert
+    assert (corpus.in_window, corpus.out_window, corpus.max_jitter) == (60, 30, 6)
+
+
+def test_corpus_factory_should_default_the_window_geometry_to_unset(corpus_factory):
+    """Test what a corpus built without a geometry reports.
+
+    Given:
+        No geometry.
+    When:
+        A corpus is built.
+    Then:
+        It should report both window spans as ``None`` and no jitter,
+        so a corpus that was never given a geometry cannot be read as
+        having one.
+    """
+
+    # Act
+    corpus = corpus_factory("no-geometry", TWO_CONTIGS)
+
+    # Assert
+    assert (corpus.in_window, corpus.out_window, corpus.max_jitter) == (None, None, 0)
+
+
+def test_corpus_factory_should_raise_when_the_window_cannot_be_placed(corpus_factory):
+    """Test the refusal of a geometry no contig can hold.
+
+    Given:
+        A window whose span plus jitter on both sides exceeds the
+        shortest contig.
+    When:
+        A corpus is asked for.
+    Then:
+        It should raise `ValueError` naming the contig and both
+        lengths.
+
+    Every window drawn from such a corpus would be filtered out for
+    falling off the end, so the test reading it would pass over nothing
+    and say so by passing.
+    """
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"chr2 is 500 bp long"):
+        corpus_factory("unplaceable", TWO_CONTIGS, in_window=400, max_jitter=60)
+
+
+def test_corpus_factory_should_raise_when_the_output_window_is_the_wider_one(
+    corpus_factory,
+):
+    """Test the refusal of a swapped window pair.
+
+    Given:
+        An output window wider than the input window.
+    When:
+        A corpus is asked for.
+    Then:
+        It should raise `ValueError` naming both spans.
+
+    The output window sits inside the input one, so a swapped pair is
+    otherwise visible only as a wrong-shaped tensor much later.
+    """
+
+    # Act & assert
+    with pytest.raises(ValueError, match="out_window 60 exceeds in_window 30"):
+        corpus_factory("swapped", TWO_CONTIGS, in_window=30, out_window=60)
+
+
 def test_quadrat_cache_dir_should_be_set_before_the_package_is_imported():
     """Test that nothing can read the variable before it is in place.
 
