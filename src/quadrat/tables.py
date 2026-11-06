@@ -256,8 +256,6 @@ class TrackWriter(object):
             shutil.rmtree(staging, ignore_errors=True)
 
 
-# Called by #4's `CutSiteStore`, which reads one contig at a time;
-# nothing in this package addresses a table by contig yet.
 # public
 def track_chrom_path(source, chrom):
     """Path to one chromosome's Parquet file inside a track directory.
@@ -336,8 +334,8 @@ def read_manifest(source):
     The record is a JSON object beside the track directory, at
     `manifest_path`, and this is the published schema: an
     interoperability contract rather than an implementation detail,
-    because cherimoya writes tables this package reads and #4's
-    synthetic track builder writes them too.
+    because cherimoya writes tables this package reads and the
+    suite's synthetic track builder writes them too.
 
     :param source: A track directory, as a `str`, `bytes` or
         `os.PathLike`.
