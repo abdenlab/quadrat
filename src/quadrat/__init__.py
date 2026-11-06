@@ -40,12 +40,14 @@ pileup runs.
 __all__ = [
     "EngineOptionWarning",
     "__version__",
+    "bam_contigs",
     "chrom_lengths",
 ]
 
 from importlib.metadata import version
 
 from quadrat._engine import EngineOptionWarning
+from quadrat.alignments import bam_contigs
 from quadrat.reference import chrom_lengths
 
 # public
