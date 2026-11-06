@@ -1310,6 +1310,34 @@ def test_pileup_alignments_should_release_its_tables_when_it_finishes(
     assert not bound(pb, "quadrat_chrom_sizes")
 
 
+def test_engine_should_name_the_extra_when_polars_bio_is_absent(mocker):
+    """Test what the engine says when the extra is not installed.
+
+    Given:
+        No importable polars-bio.
+    When:
+        The engine handle is asked for.
+    Then:
+        It should raise `ImportError` naming both the module and the
+        extra that installs it, rather than letting a bare
+        ``ModuleNotFoundError`` out of the middle of a pileup.
+
+    polars-bio and giql are what the ``pileup`` extra installs, and
+    they are the only modules whose absence means a base install rather
+    than a broken one -- a base install reads tracks and cannot build
+    new ones.
+    """
+
+    # Arrange
+    mocker.patch.object(
+        _engine.importlib, "import_module", side_effect=ImportError("no polars_bio")
+    )
+
+    # Act & assert
+    with pytest.raises(ImportError, match=r"polars_bio is needed.*pileup"):
+        _engine.engine()
+
+
 def test_registered_frames_should_drop_the_tables_when_the_block_ends(reference_fasta):
     """Test that a frame registration does not outlive its block.
 

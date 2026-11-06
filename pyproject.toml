@@ -41,18 +41,26 @@ dependencies = [
     "tqdm>=4.64.1",
     "joblib>=1.0.0",
     "tangermeme>=1.5.0",
+    # Reading, not writing, which is why these two are here and the
+    # engine below is not. A track is Parquet and a reference is a
+    # faidx FASTA, so a caller who already has tracks needs both to
+    # read a single window -- and that caller is what the base install
+    # is for. Both are still imported on first use rather than at
+    # package import time; `quadrat._engine.import_on_first_use` is
+    # the seam and `tests/test_quadrat.py` pins it.
+    "polars>=1.30",
+    "pyfaidx>=0.9",
 ]
 
-# `pyfaidx` belongs in this extra rather than in a dev group: the
-# pileup imports it at runtime, so it is a runtime dependency of the
-# extra rather than a test one. The lazy-import guarantee that makes
-# the base install sufficient is stated in the package docstring.
+# The engine that *builds* tracks, and nothing else. polars-bio reads
+# the alignments and giql transpiles the aggregate; neither is needed
+# to read a track that already exists, which is the line this extra
+# draws. polars and pyfaidx were here until the per-window readers
+# landed and made them a base-install requirement.
 [project.optional-dependencies]
 pileup = [
     "polars-bio>=0.35.1",
-    "polars>=1.30",
     "giql>=0.7",
-    "pyfaidx>=0.9",
 ]
 
 [dependency-groups]

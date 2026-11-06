@@ -2072,6 +2072,8 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pandas" },
+    { name = "polars" },
+    { name = "pyfaidx" },
     { name = "tangermeme" },
     { name = "torch" },
     { name = "tqdm" },
@@ -2080,9 +2082,7 @@ dependencies = [
 [package.optional-dependencies]
 pileup = [
     { name = "giql" },
-    { name = "polars" },
     { name = "polars-bio" },
-    { name = "pyfaidx" },
 ]
 
 [package.dev-dependencies]
@@ -2107,9 +2107,9 @@ requires-dist = [
     { name = "joblib", specifier = ">=1.0.0" },
     { name = "numpy", specifier = ">=1.14.2" },
     { name = "pandas", specifier = ">=1.3.3" },
-    { name = "polars", marker = "extra == 'pileup'", specifier = ">=1.30" },
+    { name = "polars", specifier = ">=1.30" },
     { name = "polars-bio", marker = "extra == 'pileup'", specifier = ">=0.35.1" },
-    { name = "pyfaidx", marker = "extra == 'pileup'", specifier = ">=0.9" },
+    { name = "pyfaidx", specifier = ">=0.9" },
     { name = "tangermeme", specifier = ">=1.5.0" },
     { name = "torch", specifier = ">=2.9.0" },
     { name = "tqdm", specifier = ">=4.64.1" },

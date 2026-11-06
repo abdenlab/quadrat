@@ -440,20 +440,8 @@ def require_complete(source):
         # and returning it unchecked is what let `require_complete(42)`
         # and `require_complete(None)` read as verified.
         #
-        # The import is attempted rather than assumed, so that the
-        # refusal below is reachable on a base install: polars ships
-        # with the `pileup` extra, and without it a caller cannot be
-        # holding a polars frame -- which is the whole of what this
-        # branch had to import polars to ask. A reader on a base
-        # install was otherwise told its argument could not be
-        # imported when the answer was that it was the wrong type.
-        try:
-            polars = import_on_first_use("polars")
-        except ImportError:
-            polars = None
-        if polars is not None and isinstance(
-            source, (polars.DataFrame, polars.LazyFrame)
-        ):
+        polars = import_on_first_use("polars")
+        if isinstance(source, (polars.DataFrame, polars.LazyFrame)):
             return source
         raise TypeError(
             "require_complete verifies a track: a path to one, "
