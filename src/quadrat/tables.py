@@ -154,20 +154,10 @@ class TrackWriter(object):
     it is what keeps a globbed scan of the whole directory filterable
     on ``chrom``.
 
-    The directory is assembled under a ``.staging.{hex}`` sibling and
-    moved into place with ``os.replace``, which is atomic within a
-    filesystem -- the staging sibling guarantees that by construction,
-    and it is also what keeps the scheme sound on NFS, where directory
-    rename is atomic in practice but not by contract.
-
-    The manifest is written *after* that swap and the stale one removed
-    *before* it, so the commit order is: table unverifiable, table
-    replaced, table verifiable. Every crash point therefore leaves the
-    table failing `require_complete` rather than silently
-    readable, which is the direction this is allowed to fail in. The
-    cost is that a successful write is briefly
-    complete-but-unverifiable, and the manifest is a few hundred bytes,
-    so that window is one small write long.
+    The atomic write itself belongs to `stage_directory` and
+    `commit_directory`, which a window cache commits through too;
+    where the directory is built, what makes the move into place
+    atomic, and what each crash point leaves behind are stated there.
 
     ``parameters`` is recorded in the manifest so a table carries the
     pileup arguments that produced it; see `require_complete` for
@@ -175,17 +165,11 @@ class TrackWriter(object):
     """
 
     def __init__(self, path, parameters=None):
-        # Sweep before the staging directory exists, and exactly once:
-        # `_sweep_stale` reaps every `{path}.staging.*` sibling, which
-        # would include ours if it ran afterwards.
-        _sweep_stale(path)
         self.path = path
         self.rows = 0
         self.parameters = dict(parameters or {})
-        self._marker = manifest_path(path)
         self._files = {}
-        self._staging = "{}{}{}".format(path, _STAGING_INFIX, uuid.uuid4().hex)
-        os.makedirs(self._staging)
+        self._staging = stage_directory(path)
 
     def __enter__(self):
         return self
@@ -253,51 +237,16 @@ class TrackWriter(object):
         if self._staging is None:
             raise RuntimeError("{} is already closed".format(self.path))
         staging, self._staging = self._staging, None
-
-        # Invalidate the old table before touching it, so a crash
-        # anywhere below leaves something that refuses to be read
-        # rather than a new directory wearing a previous write's
-        # manifest.
-        try:
-            os.remove(self._marker)
-        except FileNotFoundError:
-            pass
-
-        trash = None
-        if os.path.isdir(self.path):
-            trash = "{}{}{}".format(self.path, _TRASH_INFIX, uuid.uuid4().hex)
-            os.replace(self.path, trash)
-        elif os.path.exists(self.path):
-            os.remove(self.path)
-
-        try:
-            os.replace(staging, self.path)
-        except BaseException:
-            # Put the previous table back; a failed rebuild should not
-            # also destroy what was already there. It stays
-            # unverifiable, because its manifest is already gone and we
-            # cannot reconstruct one we did not write.
-            if trash is not None and not os.path.exists(self.path):
-                os.replace(trash, self.path)
-                trash = None
-            shutil.rmtree(staging, ignore_errors=True)
-            raise
-
-        manifest = {
-            "version": MANIFEST_VERSION,
-            "rows": int(self.rows),
-            "files": self._files,
-            "parameters": self.parameters,
-        }
-        # The manifest is the completeness marker, so it must land
-        # whole: a reader must never be able to parse a half-flushed
-        # JSON object.
-        with open(self._marker + ".tmp", "w") as handle:
-            json.dump(manifest, handle, indent=1, sort_keys=True)
-        os.replace(self._marker + ".tmp", self._marker)
-
-        if trash is not None:
-            shutil.rmtree(trash, ignore_errors=True)
+        commit_directory(
+            self.path,
+            staging,
+            {
+                "version": MANIFEST_VERSION,
+                "rows": int(self.rows),
+                "files": self._files,
+                "parameters": self.parameters,
+            },
+        )
 
     def abort(self):
         """Discard whatever was staged. A no-op once closed."""
@@ -796,6 +745,101 @@ def track_paths(name, unstranded):
     if unstranded:
         return [prefix + TRACK_SUFFIX]
     return [prefix + ".+" + TRACK_SUFFIX, prefix + ".-" + TRACK_SUFFIX]
+
+
+def stage_directory(path):
+    """A fresh staging sibling of ``path``, for one atomic write to fill.
+
+    The first half of the protocol `commit_directory` completes. The two
+    are separate calls rather than one because a caller does arbitrary
+    work in between and no two callers do the same work: a pileup writes
+    one Parquet file per contig as its aggregate arrives, a window cache
+    writes two frames and four arrays. What they share is where the
+    directory is built, and that is the half worth having once.
+
+    A sibling of ``path`` rather than a directory under ``tempfile``,
+    because ``os.replace`` is atomic only within one filesystem and a
+    sibling is the single placement that guarantees that by
+    construction. It is also what keeps the scheme sound on NFS, where
+    directory rename is atomic in practice but not by contract.
+
+    Sweeps the siblings an interrupted write left behind, before the new
+    one exists and so exactly once: the sweep reaps every
+    ``{path}.staging.*``, which would include this one if it ran after.
+
+    :param path: The path the staged directory will become, as a `str`.
+    :returns: The staging directory, created and empty.
+    """
+
+    _sweep_stale(path)
+    staging = "{}{}{}".format(path, _STAGING_INFIX, uuid.uuid4().hex)
+    os.makedirs(staging)
+    return staging
+
+
+def commit_directory(path, staging, manifest):
+    """Swap ``staging`` in as ``path`` and record it as complete.
+
+    The second half of `stage_directory`'s protocol, and the half that
+    decides what a crash leaves behind.
+
+    The order is: remove the record, replace the directory, write the
+    record. So the sequence a reader can observe is unverifiable,
+    replaced, verifiable, and every crash point leaves something that
+    fails `require_complete` rather than a new directory wearing the
+    previous write's record. Unverifiable is the one direction this is
+    allowed to fail in, because the caller can always build again and
+    cannot detect a directory that lies. The cost is that a successful
+    write is briefly complete-but-unverifiable, and a record is a few
+    hundred bytes, so that window is one small write long.
+
+    A swap that fails puts the previous directory back, because a failed
+    rebuild should not also destroy what was already there. It comes
+    back unverifiable -- its record is already gone, and this cannot
+    reconstruct one it did not write -- which is the same answer every
+    other crash point gives.
+
+    :param path: The final path, as a `str`. A directory already there
+        is moved aside and removed once the swap succeeds; a plain file
+        is removed outright.
+    :param staging: The directory to swap in, from `stage_directory`.
+        It is removed if the swap fails.
+    :param manifest: The completeness record, as a `dict`. Written to
+        `manifest_path` of ``path`` after the swap, through a ``.tmp``
+        sibling and one more ``os.replace``, because a reader must
+        never be able to parse a half-flushed record.
+    :raises OSError: if the swap fails. The previous directory is back
+        in place by then.
+    """
+
+    marker = manifest_path(path)
+    try:
+        os.remove(marker)
+    except FileNotFoundError:
+        pass
+
+    trash = None
+    if os.path.isdir(path):
+        trash = "{}{}{}".format(path, _TRASH_INFIX, uuid.uuid4().hex)
+        os.replace(path, trash)
+    elif os.path.exists(path):
+        os.remove(path)
+
+    try:
+        os.replace(staging, path)
+    except BaseException:
+        if trash is not None and not os.path.exists(path):
+            os.replace(trash, path)
+            trash = None
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    with open(marker + ".tmp", "w") as handle:
+        json.dump(manifest, handle, indent=1, sort_keys=True)
+    os.replace(marker + ".tmp", marker)
+
+    if trash is not None:
+        shutil.rmtree(trash, ignore_errors=True)
 
 
 def _chrom_filename(chrom):
