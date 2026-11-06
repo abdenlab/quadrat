@@ -99,18 +99,144 @@ class Corpus:
         return str(self.root / name)
 
 
-@pytest.fixture(autouse=True)
-def _per_test_cache_dir(tmp_path, monkeypatch):
-    """Point the cache at a directory this test alone can see.
+@pytest.fixture
+def machine(mocker, tmp_path):
+    """Pin the cores and the memory the planner reads, for one test.
 
-    Autouse, so this is the value in force for every test body and the
-    session directory the module docstring describes is only ever what
-    an import observes. One test cannot reach another's cache entries,
-    which is the cold-build guarantee at test rather than session
-    granularity.
+    The calls this patches are the planner's only window onto the
+    machine, and they are OS boundaries, which is the one thing §11 of
+    the test guide permits mocking. The alternative the ported tests
+    used was to patch the private `n_cpus` and `memory_budget`, which
+    made the helper the subject rather than the behaviour.
+
+    `plan.py` does `import os`, so `plan.os` is this module and
+    patching it here is what the planner sees. ``affinity=False`` makes
+    `os.sched_getaffinity` raise `AttributeError`, which is how a
+    platform without it presents -- `create=True` is needed the rest of
+    the time because Darwin has no such attribute to patch.
+
+    The allocation sources are pointed into ``tmp_path`` and the SLURM
+    variables cleared on every call, whether or not a test asks about
+    them. Without that, a pinned machine would answer differently
+    inside a container than on a developer's laptop -- which is the
+    whole point of the planner reading them, and exactly what a test
+    that pins a machine must not inherit.
+
+    :param cores: Cores `sched_getaffinity` and `cpu_count` report.
+    :param ram_bytes: Host physical memory, or ``None`` to make
+        `sysconf` raise as an unreadable `SC_PHYS_PAGES` does.
+    :param affinity: ``False`` to present a platform with no
+        `sched_getaffinity`.
+    :param cgroup: Contents of the cgroup v2 limit file, written only
+        when given -- an integer of bytes, or the literal ``"max"``.
+    :param cgroup_v1: Contents of the cgroup v1 limit file, same.
+    :param slurm: Mapping of SLURM variable to value, set after the
+        clearing.
     """
 
-    monkeypatch.setenv("QUADRAT_CACHE_DIR", str(tmp_path / "cache"))
+    def pin(
+        cores,
+        ram_bytes,
+        affinity=True,
+        cgroup=None,
+        cgroup_v1=None,
+        slurm=None,
+    ):
+        # Patched by dotted name rather than through an imported
+        # module object, which is what keeps the planner out of this
+        # module's import. The environment block above has to run
+        # before anything imports `quadrat` -- which is what
+        # `test_quadrat_cache_dir_should_be_set_before_the_package_is_imported`
+        # pins -- and a top-level import of the planner would import
+        # the package at conftest import time and break it. A
+        # function-local import would defer it too, and the constraint
+        # is an initialisation order rather than a circular dependency,
+        # which is not what that exception is for; `mocker.patch`
+        # resolves its target when the patch is applied, which is
+        # inside the test, so the deferral costs no import statement at
+        # all.
+        for attribute, name, contents in (
+            ("_CGROUP_V2_LIMIT", "memory.max", cgroup),
+            ("_CGROUP_V1_LIMIT", "memory.limit_in_bytes", cgroup_v1),
+        ):
+            target = tmp_path / name
+            if contents is not None:
+                target.write_text("{}\n".format(contents))
+            mocker.patch("quadrat.pileup.plan.{}".format(attribute), str(target))
+        mocker.patch.dict(os.environ)
+        for name in ("SLURM_MEM_PER_NODE", "SLURM_MEM_PER_CPU"):
+            os.environ.pop(name, None)
+        for name, value in (slurm or {}).items():
+            os.environ[name] = str(value)
+        if ram_bytes is None:
+            # What an unreadable `SC_PHYS_PAGES` looks like: the planner
+            # catches OSError and falls back to a guess, which is the
+            # one branch of it the suite never otherwise reaches.
+            mocker.patch.object(os, "sysconf", side_effect=OSError)
+        else:
+            mocker.patch.object(
+                os,
+                "sysconf",
+                lambda name: {
+                    "SC_PAGE_SIZE": 4096,
+                    "SC_PHYS_PAGES": ram_bytes // 4096,
+                }[name],
+            )
+        if affinity:
+            mocker.patch.object(
+                os, "sched_getaffinity", lambda pid: set(range(cores)), create=True
+            )
+        else:
+            mocker.patch.object(
+                os, "sched_getaffinity", side_effect=AttributeError, create=True
+            )
+        mocker.patch.object(os, "cpu_count", lambda: cores)
+
+    return pin
+
+
+@pytest.fixture
+def sized(mocker):
+    """Pin what `os.path.getsize` reports, for one test.
+
+    The other OS boundary the planner reads, patched the way `machine`
+    patches the first one. Nine tests in ``tests/test_run.py`` had
+    restated the same arrangement -- hold the real function, patch it
+    with a lambda answering a stub for the paths of interest and
+    delegating for the rest -- and two of the nine were byte-identical,
+    so a change to the pattern had to be made in nine places.
+
+    The real function is held before the patch and called for every
+    path the argument does not cover, because a corpus's own FASTA and
+    index are `stat`ed by the same code path as the alignments and a
+    blanket stub would size those too.
+
+    :param sizes: An integer, which every ``.bam`` path reports; or a
+        mapping of path to size, which only those paths report. Keys
+        are compared as strings, so a `pathlib.Path` and an equal
+        ``str`` are the same key.
+    """
+
+    real = os.path.getsize
+
+    def pin(sizes):
+        if isinstance(sizes, int):
+
+            def getsize(path):
+                return sizes if str(path).endswith(".bam") else real(path)
+
+        else:
+            stubbed = {str(path): size for path, size in sizes.items()}
+
+            def getsize(path):
+                # `in` rather than a falsy-default `get`, so a stub of
+                # zero bytes reports zero rather than falling through.
+                key = str(path)
+                return stubbed[key] if key in stubbed else real(key)
+
+        mocker.patch.object(os.path, "getsize", getsize)
+
+    return pin
 
 
 @pytest.fixture(scope="session")
@@ -148,6 +274,10 @@ def corpus_factory(tmp_path_factory):
     :param soft_mask: Reaches `builders.write_fasta` unchanged, which
         owns the interval semantics and the clipping guarantee.
     :param n_runs: Reaches `builders.write_fasta` unchanged.
+    :param reads: ``(name, chrom, pos, cigar, flag)`` tuples placing
+        every record explicitly, in place of the seeded random draw.
+        Each reaches `builders.aligned_read` as positional arguments,
+        and every alignment file gets the same records.
     :param header_contigs: Contigs to declare in the alignment header
         in place of ``chrom_sizes``, which may name one the reference
         does not have. It must cover every contig in ``chrom_sizes`` at
@@ -175,6 +305,7 @@ def corpus_factory(tmp_path_factory):
         soft_mask=(),
         n_runs=(),
         header_contigs=None,
+        reads=(),
         peaks=(),
         negatives=(),
         exclusion=(),
@@ -207,16 +338,29 @@ def corpus_factory(tmp_path_factory):
 
         if n_bams:
             header = builders.alignment_header(header_contigs or chrom_sizes)
-            corpus.bams = [
-                builders.write_random_bam(
-                    corpus.path("s{}.bam".format(index)),
-                    header,
-                    chrom_sizes,
-                    n_reads=n_reads,
-                    seed=seed + index,
-                )
-                for index in range(n_bams)
-            ]
+            if reads:
+                # Placed where the caller said rather than at a seeded
+                # draw, which is what a test asserting on one position
+                # needs. Every alignment gets the same records, since
+                # the geometry is the point and the file count is not.
+                records = [builders.aligned_read(header, *record) for record in reads]
+                corpus.bams = [
+                    builders.write_bam(
+                        corpus.path("s{}.bam".format(index)), records, header
+                    )
+                    for index in range(n_bams)
+                ]
+            else:
+                corpus.bams = [
+                    builders.write_random_bam(
+                        corpus.path("s{}.bam".format(index)),
+                        header,
+                        chrom_sizes,
+                        n_reads=n_reads,
+                        seed=seed + index,
+                    )
+                    for index in range(n_bams)
+                ]
 
         if peaks:
             corpus.peaks = builders.write_bed(corpus.path("peaks.bed"), peaks)
@@ -231,3 +375,17 @@ def corpus_factory(tmp_path_factory):
         return corpus
 
     return build
+
+
+@pytest.fixture(autouse=True)
+def _per_test_cache_dir(tmp_path, monkeypatch):
+    """Point the cache at a directory this test alone can see.
+
+    Autouse, so this is the value in force for every test body and the
+    session directory the module docstring describes is only ever what
+    an import observes. One test cannot reach another's cache entries,
+    which is the cold-build guarantee at test rather than session
+    granularity.
+    """
+
+    monkeypatch.setenv("QUADRAT_CACHE_DIR", str(tmp_path / "cache"))

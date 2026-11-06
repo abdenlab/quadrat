@@ -2099,7 +2099,6 @@ docs = [
     { name = "sphinx", version = "9.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
     { name = "sphinx-autobuild" },
     { name = "sphinx-book-theme" },
-    { name = "sphinx-design" },
 ]
 
 [package.metadata]
@@ -2129,7 +2128,6 @@ docs = [
     { name = "sphinx", specifier = ">=7.0" },
     { name = "sphinx-autobuild", specifier = ">=2024.0" },
     { name = "sphinx-book-theme", specifier = ">=1.1" },
-    { name = "sphinx-design", specifier = ">=0.6" },
 ]
 
 [[package]]
@@ -2611,20 +2609,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e9/8a/cb008736682b3974cae6925c54939792fe56f5a167e37984cb45d8a85d8a/sphinx_book_theme-1.4.0.tar.gz", hash = "sha256:fee3cd70573d9a8cd4ab380a3cb1f11139c24dcaa2cf47d06d7f924f1b44eaff", size = 406113, upload-time = "2026-07-19T21:23:54.183Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/00/5e/6c41ee74f0a4caef53f224c3e6c3869b577dade1a283767bdc874f11e51c/sphinx_book_theme-1.4.0-py3-none-any.whl", hash = "sha256:10fd57d667ee0b565928c3ce95562e281c5d1b94bd5a2aafc5cd41a5d498dcd0", size = 458862, upload-time = "2026-07-19T21:23:52.852Z" },
-]
-
-[[package]]
-name = "sphinx-design"
-version = "0.7.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "sphinx", version = "9.0.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "sphinx", version = "9.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.12.*'" },
-    { name = "sphinx", version = "9.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/13/7b/804f311da4663a4aecc6cf7abd83443f3d4ded970826d0c958edc77d4527/sphinx_design-0.7.0.tar.gz", hash = "sha256:d2a3f5b19c24b916adb52f97c5f00efab4009ca337812001109084a740ec9b7a", size = 2203582, upload-time = "2026-01-19T13:12:53.297Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/30/cf/45dd359f6ca0c3762ce0490f681da242f0530c49c81050c035c016bfdd3a/sphinx_design-0.7.0-py3-none-any.whl", hash = "sha256:f82bf179951d58f55dca78ab3706aeafa496b741a91b1911d371441127d64282", size = 2220350, upload-time = "2026-01-19T13:12:51.077Z" },
 ]
 
 [[package]]

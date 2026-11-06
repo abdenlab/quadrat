@@ -9,7 +9,9 @@ reads it back, locates the project, or runs a child process, none of
 which belongs to any one module.
 """
 
+import hashlib
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 from types import MappingProxyType
@@ -51,6 +53,44 @@ def load_build_hook(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def digest_track(table):
+    """Return the sha256 of every Parquet file in a track, keyed by name.
+
+    The manifest is excluded: it records absolute input paths, which
+    differ between runs into different directories, and it is not what
+    the model reads.
+    """
+
+    digests = {}
+    for name in sorted(os.listdir(table)):
+        with open(os.path.join(table, name), "rb") as handle:
+            digests[name] = hashlib.sha256(handle.read()).hexdigest()
+    return digests
+
+
+def budget(plan, ram_bytes, cores):
+    """Return the bytes the workers may share on a machine of this size.
+
+    The public restatement of what the planner divides, which is why
+    the tests that use it need no private symbol. Here rather than in
+    either test module because both restated it and parallel
+    near-duplicates drift independently: the two spellings of the
+    per-core term already differed -- ``default_partitions(1)`` against
+    a pinned core count -- and were equivalent only while
+    ``default_partitions(1)`` reduces to ``n_cpus()``.
+
+    The planner module is passed in rather than imported, as ``pysam``
+    is to `record_placements` below, and for a stricter reason: this
+    package is imported before ``tests/conftest.py`` runs the
+    environment block that has to be in place before anything imports
+    `quadrat`.
+    """
+
+    headroom = int(ram_bytes * plan.MEMORY_HEADROOM)
+    machine_cost = min(cores * plan.PEAK_BYTES_PER_CORE, headroom // 2)
+    return max(1, headroom - machine_cost)
 
 
 def record_placements(path, pysam, until_eof=False):

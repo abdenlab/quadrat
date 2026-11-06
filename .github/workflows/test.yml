@@ -47,6 +47,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Ahead of the sync, because `--locked` reports only that the
+      # lock needs updating and names neither the dependency that
+      # drifted nor the edit that drifted it -- and it does so in every
+      # job at once, so the cause has to be guessed five times. The
+      # failure this guards is an ordinary one: an edit to a dependency
+      # in pyproject.toml, committed without re-running `uv lock`.
+      #
+      # `--check` is the gate and `--dry-run` is the diagnosis. The two
+      # are needed together because `--check` prints the same sentence
+      # `--locked` does, while `--dry-run` names the drift -- `Remove
+      # sphinx-design v0.7.0` -- and then exits zero. Neither writes the
+      # lockfile.
+      - name: Check the lockfile
+        run: uv lock --check || { uv lock --dry-run; exit 1; }
+
       # The pileup extra resolves giql from a git revision, so the
       # install needs network here. See the comment on
       # `[tool.uv.sources]` in pyproject.toml.
@@ -82,6 +97,21 @@ jobs:
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: '3.11'
+
+      # Ahead of the sync, because `--locked` reports only that the
+      # lock needs updating and names neither the dependency that
+      # drifted nor the edit that drifted it -- and it does so in every
+      # job at once, so the cause has to be guessed five times. The
+      # failure this guards is an ordinary one: an edit to a dependency
+      # in pyproject.toml, committed without re-running `uv lock`.
+      #
+      # `--check` is the gate and `--dry-run` is the diagnosis. The two
+      # are needed together because `--check` prints the same sentence
+      # `--locked` does, while `--dry-run` names the drift -- `Remove
+      # sphinx-design v0.7.0` -- and then exits zero. Neither writes the
+      # lockfile.
+      - name: Check the lockfile
+        run: uv lock --check || { uv lock --dry-run; exit 1; }
 
       # No extras and no dev group, which is the install the README and
       # the package docstring call sufficient. It is a job of its own

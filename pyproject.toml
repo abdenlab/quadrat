@@ -32,6 +32,11 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.14.2",
     "pandas>=1.3.3",
+    # Declared although nothing in `src` imports it yet: the loader
+    # slice is what reaches for it, and `tangermeme` below pulls it in
+    # regardless, so dropping it would change nothing that installs
+    # and would have to be put back. Stated here rather than left to
+    # read as an unused dependency.
     "torch>=2.9.0",
     "tqdm>=4.64.1",
     "joblib>=1.0.0",
@@ -62,7 +67,6 @@ docs = [
     "sphinx>=7.0",
     "sphinx-autobuild>=2024.0",
     "sphinx-book-theme>=1.1",
-    "sphinx-design>=0.6",
 ]
 
 # BRANCH-ONLY. The datafusion-bio GIQL target is not on PyPI and lives on

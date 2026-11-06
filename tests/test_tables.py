@@ -1,0 +1,979 @@
+"""Tests for the track format's readers and the paths it is built from.
+
+The reader guards are relocated from the ported ``tests/test_pileup.py``
+with their assertions unchanged, split where one body held two
+behaviours. The rest is new.
+
+Every directory built by hand here is built through `manifest_path` and
+`track_chrom_path` rather than by spelling the layout out, so the
+format lives in one place. The helper these replaced hand-wrote
+``x.track.parquet.manifest.json``, which is the format asserted in the
+test that reads it.
+"""
+
+import json
+import os
+import pathlib
+
+import pytest
+
+import quadrat
+from quadrat import _engine, tables
+from quadrat._engine import fspath_or_none
+
+
+def manifest_for(table, rows, files):
+    """Write a manifest beside ``table`` and return the record written."""
+
+    record = {"version": tables.MANIFEST_VERSION, "rows": rows, "files": files}
+    pathlib.Path(tables.manifest_path(str(table))).write_text(json.dumps(record))
+    return record
+
+
+def chrom_file(table, chrom):
+    """Create an empty per-contig file and return its manifest key."""
+
+    path = tables.track_chrom_path(str(table), chrom)
+    pathlib.Path(path).write_bytes(b"")
+    return os.path.basename(path)
+
+
+def truncated_table(root, suffix=None):
+    """A track directory whose manifest lists a file that is not there."""
+
+    table = root / ("x" + (tables.TRACK_SUFFIX if suffix is None else suffix))
+    table.mkdir()
+    present = chrom_file(table, "chr1")
+    absent = os.path.basename(tables.track_chrom_path(str(table), "chr2"))
+    manifest_for(table, 2, {present: 1, absent: 1})
+    return table
+
+
+def listed_table(root, chroms, rows=None, suffix=None):
+    """A track directory whose manifest lists every file it holds."""
+
+    table = root / ("listed" + (tables.TRACK_SUFFIX if suffix is None else suffix))
+    table.mkdir()
+    files = {chrom_file(table, chrom): 1 for chrom in chroms}
+    manifest_for(table, len(files) if rows is None else rows, files)
+    return table
+
+
+def test_manifest_path_should_sit_beside_the_track_directory(tmp_path):
+    """Test where the completeness record is kept.
+
+    Given:
+        A path to a track directory.
+    When:
+        Its manifest path is derived.
+    Then:
+        It should sit beside the directory rather than inside it.
+
+    Beside is load-bearing: a track directory must hold Parquet and
+    nothing else, because polars refuses to scan a directory of mixed
+    extensions, and so does anything else pointed at the dataset.
+    """
+
+    # Arrange
+    table = str(tmp_path / ("x" + tables.TRACK_SUFFIX))
+
+    # Act
+    beside = tables.manifest_path(table)
+
+    # Assert
+    assert os.path.dirname(beside) == os.path.dirname(table)
+    assert not beside.startswith(table + os.sep)
+    assert beside.endswith(tables.MANIFEST_SUFFIX)
+
+
+def test_manifest_path_should_accept_a_path_object(tmp_path):
+    """Test that a path-like track is named the same way.
+
+    Given:
+        A track directory named by a `pathlib.Path`.
+    When:
+        Its manifest path is derived.
+    Then:
+        It should be the string the equivalent string form gives.
+    """
+
+    # Arrange
+    table = tmp_path / ("x" + tables.TRACK_SUFFIX)
+
+    # Act & assert
+    assert tables.manifest_path(table) == tables.manifest_path(str(table))
+
+
+def test_track_chrom_path_should_name_one_contigs_file_inside_the_directory(tmp_path):
+    """Test where one contig's rows are kept.
+
+    Given:
+        A track directory and an ordinary contig name.
+    When:
+        That contig's file path is derived.
+    Then:
+        It should be a Parquet file inside the directory, named for the
+        contig.
+    """
+
+    # Arrange
+    table = str(tmp_path / ("x" + tables.TRACK_SUFFIX))
+
+    # Act
+    path = tables.track_chrom_path(table, "chr1")
+
+    # Assert
+    assert path == os.path.join(table, "chr1.parquet")
+
+
+def test_track_chrom_path_should_escape_a_contig_name_that_is_not_safe(tmp_path):
+    """Test that an awkward contig name still yields one filename.
+
+    Given:
+        A contig name holding a slash, a colon and a space, as HLA and
+        patch contigs do.
+    When:
+        That contig's file path is derived.
+    Then:
+        It should escape them into a single valid filename inside the
+        directory, rather than a nested path or a name the filesystem
+        refuses.
+    """
+
+    # Arrange
+    table = str(tmp_path / ("x" + tables.TRACK_SUFFIX))
+    pathlib.Path(table).mkdir()
+
+    # Act
+    path = tables.track_chrom_path(table, "HLA-A*01:01/weird name")
+
+    # Assert
+    assert os.path.dirname(path) == table
+    assert "/" not in os.path.basename(path)[: -len(".parquet")]
+    pathlib.Path(path).write_bytes(b"")
+    assert os.path.isfile(path)
+
+
+def test_read_manifest_should_return_the_record_beside_a_track_directory(tmp_path):
+    """Test the record a readable manifest comes back as.
+
+    Given:
+        A track directory with a manifest beside it.
+    When:
+        The manifest is read.
+    Then:
+        It should return the parsed record.
+    """
+
+    # Arrange
+    table = truncated_table(tmp_path)
+
+    # Act & assert
+    assert tables.read_manifest(str(table))["rows"] == 2
+
+
+def test_read_manifest_should_find_a_manifest_beside_a_path_object(tmp_path):
+    """Test that a path-like track finds its own record.
+
+    Given:
+        A track directory named by a `pathlib.Path`.
+    When:
+        Its manifest is read.
+    Then:
+        It should return the record rather than report it absent.
+
+    `read_manifest` carried the same ``isinstance(str)`` probe the
+    completeness gate did, so it answered ``None`` -- "no manifest" --
+    for a manifest that exists and is perfectly readable.
+    """
+
+    # Arrange
+    table = truncated_table(tmp_path)
+
+    # Act & assert
+    assert tables.read_manifest(str(table)) == tables.read_manifest(pathlib.Path(table))
+    assert tables.read_manifest(pathlib.Path(table))["rows"] == 2
+
+
+def test_read_manifest_should_find_the_record_of_a_track_under_the_former_suffix(
+    tmp_path,
+):
+    """Test that a track written by cherimoya still finds its record.
+
+    Given:
+        A track directory carrying cherimoya's ``.cuts.parquet`` suffix.
+    When:
+        Its manifest is read.
+    Then:
+        It should return the record, `manifest_path` deriving the name
+        from the path it was given rather than from the current suffix.
+    """
+
+    # Arrange
+    legacy = truncated_table(tmp_path, suffix=".cuts.parquet")
+
+    # Act & assert
+    assert not str(legacy).endswith(tables.TRACK_SUFFIX)
+    assert tables.read_manifest(str(legacy))["rows"] == 2
+
+
+def test_require_complete_should_raise_when_the_path_does_not_exist(tmp_path):
+    """Test the refusal of a track that is not there.
+
+    Given:
+        A path naming no file or directory.
+    When:
+        Completeness is required.
+    Then:
+        It should raise rather than pass the path back.
+
+    A mistyped or since-deleted table is the input this gate exists to
+    refuse, and it used to get the widest pass of any: the guard asked
+    whether the path was a directory and returned it unchanged when it
+    was not.
+    """
+
+    # Act & assert
+    with pytest.raises(ValueError, match="no such file or directory"):
+        tables.require_complete(str(tmp_path / ("absent" + tables.TRACK_SUFFIX)))
+
+
+@pytest.mark.parametrize("source", [None, 42, object()])
+def test_require_complete_should_raise_when_given_something_that_is_not_a_track(
+    source,
+):
+    """Test the refusal of an object that is no kind of track.
+
+    Given:
+        A value that is neither a path nor an in-memory frame.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `TypeError` naming the type it got.
+
+    The docstring says there is deliberately no override and names two
+    pass-throughs. Returning anything else unchecked is a third.
+    """
+
+    # Act & assert
+    with pytest.raises(TypeError, match="require_complete verifies"):
+        tables.require_complete(source)
+
+
+def test_require_complete_should_refuse_a_non_track_without_the_pileup_engine(mocker):
+    """Test the refusal a base install reaches.
+
+    Given:
+        An argument that is no kind of track, and no importable polars.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `TypeError` about the argument rather than
+        `ImportError` about the engine.
+
+    The engine ships with the ``pileup`` extra, so a caller who only
+    reads tracks may not have it -- and the branch that recognises an
+    in-memory frame had to import polars to ask. Attempting that import
+    rather than assuming it is what keeps the documented refusal
+    reachable: without polars the argument cannot be a polars frame,
+    which is the whole of what the import was for.
+    """
+
+    # Arrange
+    mocker.patch.object(
+        _engine.importlib, "import_module", side_effect=ImportError("no polars")
+    )
+
+    # Act & assert
+    with pytest.raises(TypeError, match="require_complete verifies"):
+        tables.require_complete(42)
+
+
+def test_the_readers_should_name_the_pileup_extra_when_the_engine_is_absent(mocker):
+    """Test what a reader that genuinely needs the engine says.
+
+    Given:
+        A reader whose work needs polars, and no importable polars.
+    When:
+        It is called.
+    Then:
+        It should raise `ImportError` naming both the module and the
+        extra that installs it.
+
+    `import_on_first_use` is the one seam every deferred import goes
+    through, so this is also the test that the seam refuses rather than
+    letting a bare ``ModuleNotFoundError`` out of the middle of a
+    pileup.
+    """
+
+    # Arrange
+    mocker.patch.object(
+        _engine.importlib, "import_module", side_effect=ImportError("no polars")
+    )
+
+    # Act & assert
+    with pytest.raises(ImportError, match=r"polars is needed.*pileup"):
+        tables.track_contigs(42)
+
+
+def test_require_complete_should_raise_when_the_manifest_lists_an_absent_file(
+    tmp_path,
+):
+    """Test the refusal of a track that stopped partway.
+
+    Given:
+        A track directory whose manifest lists a file that is not
+        there.
+    When:
+        Completeness is required.
+    Then:
+        It should report the table as truncated.
+
+    A reader returns nothing for a contig whose file is absent, and that
+    is correct for a contig with no rows, so a writer killed partway
+    leaves a directory that reads as valid. The manifest, written last,
+    is the only thing that tells the two apart.
+    """
+
+    # Arrange
+    table = truncated_table(tmp_path)
+
+    # Act & assert
+    with pytest.raises(ValueError, match="truncated"):
+        tables.require_complete(str(table))
+
+
+def test_require_complete_should_raise_when_a_truncated_track_is_a_path_object(
+    tmp_path,
+):
+    """Test that a path-like track is verified rather than waved through.
+
+    Given:
+        A truncated track named by a `pathlib.Path`.
+    When:
+        Completeness is required.
+    Then:
+        It should raise, as it does for the same track named by a
+        string.
+
+    `pathlib.Path` is the path type a caller reaches for first, and the
+    ``isinstance(str)`` probe treated it as a non-path -- so the gate
+    answered "nothing to check" for exactly the shape most likely to
+    arrive.
+    """
+
+    # Arrange
+    table = truncated_table(tmp_path)
+
+    # Act & assert
+    with pytest.raises(ValueError, match="truncated"):
+        tables.require_complete(pathlib.Path(table))
+
+
+def test_require_complete_should_verify_a_track_under_the_former_suffix(tmp_path):
+    """Test that a track written by cherimoya is still verifiable.
+
+    Given:
+        A complete track directory carrying cherimoya's
+        ``.cuts.parquet`` suffix.
+    When:
+        Completeness is required.
+    Then:
+        It should verify it, the suffix being a write-side convention
+        that nothing reads back.
+
+    A reader is handed a path and globs inside it, so renaming what this
+    package *writes* cannot strand a table anyone already has. That
+    asymmetry is what the rename rests on.
+    """
+
+    # Arrange
+    legacy = tmp_path / ("x" + ".cuts.parquet")
+    legacy.mkdir()
+    manifest_for(legacy, 1, {chrom_file(legacy, "chr1"): 1})
+
+    # Act & assert
+    assert not str(legacy).endswith(tables.TRACK_SUFFIX)
+    assert tables.require_complete(str(legacy)) == str(legacy)
+
+
+def test_require_complete_should_raise_when_the_row_total_disagrees(tmp_path):
+    """Test the one internal consistency the record has.
+
+    Given:
+        A track whose manifest records a row total that disagrees with
+        its own per-file counts.
+    When:
+        Completeness is required.
+    Then:
+        It should report that the record does not add up.
+
+    The writer increments the total and records each file's height from
+    the same frame slice, so the two agree by construction. A
+    disagreement means the record did not come from one uninterrupted
+    write -- two manifests merged, a hand edit, or a writer that is not
+    this one.
+    """
+
+    # Arrange
+    table = listed_table(tmp_path, ["chr1", "chr2"], rows=99)
+
+    # Act & assert
+    with pytest.raises(ValueError, match="does not add up"):
+        tables.require_complete(str(table))
+
+
+def test_require_complete_should_raise_when_a_float_row_total_disagrees(tmp_path):
+    """Test that the consistency check is not skipped by a float total.
+
+    Given:
+        A track whose manifest records that same disagreeing total as a
+        float rather than an integer.
+    When:
+        Completeness is required.
+    Then:
+        It should raise exactly as it does for the integer, a record
+        that does not add up describing no finished write either way.
+
+    JSON has one numeric type, so a producer that writes ``2.0`` is
+    writing a row count. The guard tested for ``int``, so a float total
+    skipped the check entirely and a truncated table verified clean.
+    """
+
+    # Arrange
+    table = listed_table(tmp_path, ["chr1", "chr2"], rows=99.0)
+
+    # Act & assert
+    with pytest.raises(ValueError, match="does not add up"):
+        tables.require_complete(str(table))
+
+
+def test_require_complete_should_return_the_path_when_no_row_counts_are_recorded(
+    tmp_path,
+):
+    """Test the pass the ``int`` guard was actually written for.
+
+    Given:
+        A manifest listing its files with no row counts, as a window
+        cache sharing this schema does.
+    When:
+        Completeness is required.
+    Then:
+        It should return the path, there being nothing to add up.
+    """
+
+    # Arrange
+    table = tmp_path / ("cache" + tables.TRACK_SUFFIX)
+    table.mkdir()
+    manifest_for(table, None, {chrom_file(table, "chr1"): None})
+
+    # Act & assert
+    assert tables.require_complete(str(table)) == str(table)
+
+
+def test_require_complete_should_return_an_in_memory_frame_unchanged():
+    """Test the documented pass-through for a frame.
+
+    Given:
+        An in-memory polars frame, eager and lazy.
+    When:
+        Completeness is required.
+    Then:
+        It should return the frame unchanged, a frame having no partial
+        state to verify.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+    frame = polars.DataFrame({"chrom": ["chr1"], "pos": [1], "value": [1.0]})
+
+    # Act & assert
+    assert tables.require_complete(frame) is frame
+    assert tables.require_complete(frame.lazy()) is not None
+
+
+def test_require_complete_should_return_the_path_of_a_single_file_table(tmp_path):
+    """Test the documented pass-through for a plain file.
+
+    Given:
+        A path naming a single Parquet file rather than a directory.
+    When:
+        Completeness is required.
+    Then:
+        It should return the path, a truncated Parquet file failing on
+        its own footer rather than needing a manifest.
+    """
+
+    # Arrange
+    table = tmp_path / "one.parquet"
+    table.write_bytes(b"")
+
+    # Act & assert
+    assert tables.require_complete(str(table)) == str(table)
+
+
+def test_track_contigs_should_name_the_contigs_its_manifest_lists(tmp_path):
+    """Test which contigs a track reports.
+
+    Given:
+        A track directory whose manifest lists the files it holds.
+    When:
+        Its contigs are listed.
+    Then:
+        It should name those contigs and no others, answering from the
+        filenames rather than reading a single row.
+    """
+
+    # Arrange
+    table = listed_table(tmp_path, ["chr1", "chr2"])
+
+    # Act & assert
+    assert tables.track_contigs(str(table)) == {"chr1", "chr2"}
+
+
+@pytest.mark.parametrize("listed", [True, False])
+def test_track_contigs_should_list_the_contigs_of_a_track_under_the_former_suffix(
+    tmp_path, listed
+):
+    """Test the third reader criterion #5 names as former-name-safe.
+
+    Given:
+        A track directory written under cherimoya's ``.cuts.parquet``
+        name, once with a manifest listing its files and once with
+        none.
+    When:
+        Its contigs are listed.
+    Then:
+        It should name them from either arm.
+
+    The criterion makes the suffix rename safe by verification rather
+    than assertion and names three readers; two were pinned and this
+    was not. It is also the least obviously safe of the three: it is
+    the one that parses the filename rather than deriving a sibling
+    path, and the one whose answer branches on whether the manifest
+    lists files -- so both arms are covered rather than the one a
+    directory written by this package would take.
+    """
+
+    # Arrange
+    former = ".cuts.parquet"
+    if listed:
+        table = listed_table(tmp_path, ["chr1", "chr2"], suffix=former)
+    else:
+        table = tmp_path / ("bare" + former)
+        table.mkdir()
+        for chrom in ("chr1", "chr2"):
+            chrom_file(table, chrom)
+
+    # Act & assert
+    assert tables.track_contigs(str(table)) == {"chr1", "chr2"}
+
+
+def test_track_contigs_should_list_a_directory_named_by_a_path_object(tmp_path):
+    """Test that a path-like track is listed rather than refused.
+
+    Given:
+        A track directory named by a `pathlib.Path`.
+    When:
+        Its contigs are listed.
+    Then:
+        It should answer as it does for the same directory named by a
+        string.
+
+    This carried the same ``isinstance(str)`` probe the completeness
+    gate did, and the failure was worse than a wrong answer: the path
+    fell through to the frame reader, which complained about in-memory
+    frames from a function the caller never called.
+    """
+
+    # Arrange
+    table = listed_table(tmp_path, ["chr1", "chr2"])
+
+    # Act & assert
+    assert tables.track_contigs(pathlib.Path(table)) == tables.track_contigs(str(table))
+
+
+def test_require_complete_should_distinguish_a_corrupt_manifest_from_an_absent_one(
+    tmp_path,
+):
+    """Test that the refusal names the state the caller is actually in.
+
+    Given:
+        One track whose manifest is absent and one whose manifest is
+        present but not valid JSON.
+    When:
+        Completeness is required of each.
+    Then:
+        It should refuse both, and only the first should be told the
+        record is not there.
+
+    `read_manifest` collapses absent, unreadable and non-dict to
+    ``None``, which this function is entitled to treat alike. The
+    message is not: the two states have different fixes, and telling
+    the second caller their file is missing sends them looking for the
+    wrong thing.
+    """
+
+    # Arrange
+    absent = tmp_path / ("absent" + tables.TRACK_SUFFIX)
+    absent.mkdir()
+    chrom_file(absent, "chr1")
+    corrupt = tmp_path / ("corrupt" + tables.TRACK_SUFFIX)
+    corrupt.mkdir()
+    chrom_file(corrupt, "chr1")
+    pathlib.Path(tables.manifest_path(str(corrupt))).write_text("{not json")
+
+    # Act
+    with pytest.raises(ValueError) as absent_refusal:
+        tables.require_complete(str(absent))
+    with pytest.raises(ValueError) as corrupt_refusal:
+        tables.require_complete(str(corrupt))
+
+    # Assert
+    assert "has no" in str(absent_refusal.value)
+    assert "cannot be read as a manifest record" in str(corrupt_refusal.value)
+    assert "has no" not in str(corrupt_refusal.value)
+
+
+def test_require_complete_should_distinguish_a_manifest_that_is_not_an_object(tmp_path):
+    """Test the refusal for a record whose top-level value is a list.
+
+    Given:
+        A track whose manifest file holds a JSON array.
+    When:
+        Completeness is required.
+    Then:
+        It should refuse as a malformed record rather than as a missing
+        one.
+    """
+
+    # Arrange
+    table = tmp_path / ("array" + tables.TRACK_SUFFIX)
+    table.mkdir()
+    chrom_file(table, "chr1")
+    pathlib.Path(tables.manifest_path(str(table))).write_text('["chr1.parquet"]')
+
+    # Act & assert
+    with pytest.raises(ValueError, match="cannot be read as a manifest record"):
+        tables.require_complete(str(table))
+
+
+def test_require_complete_should_raise_value_error_when_files_is_not_a_mapping(
+    tmp_path,
+):
+    """Test that a malformed ``files`` is refused rather than crashing.
+
+    Given:
+        A manifest whose ``files`` is a list of filenames.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError`, which is what this function
+        documents, rather than the `AttributeError` that reaching
+        ``.values()`` on a list produces.
+
+    Criterion #5 makes this record an interoperability contract with
+    two named third-party writers, and a list is the shape to get wrong
+    first -- the keys alone look like the whole of the information. A
+    validator that crashes with a type error on a malformed record is
+    telling the writer nothing they can act on.
+    """
+
+    # Arrange
+    table = tmp_path / ("listy" + tables.TRACK_SUFFIX)
+    table.mkdir()
+    present = chrom_file(table, "chr1")
+    manifest_for(table, 1, [present])
+
+    # Act & assert
+    with pytest.raises(ValueError, match="`files` is list"):
+        tables.require_complete(str(table))
+
+
+def test_require_complete_should_raise_when_a_row_total_has_no_counts_to_support_it(
+    tmp_path,
+):
+    """Test that one absent count cannot excuse the whole row sum.
+
+    Given:
+        A manifest recording a row total while one of its two files
+        declares no count.
+    When:
+        Completeness is required.
+    Then:
+        It should refuse, naming the file that declares nothing.
+
+    A single unusable value used to disable the check for the whole
+    record, so a manifest claiming any total at all passed. That is
+    backwards: a record stating a total it has no per-file heights to
+    support is exactly a record that did not come from one
+    uninterrupted write, which is the only internal consistency it has.
+    """
+
+    # Arrange
+    table = tmp_path / ("partial" + tables.TRACK_SUFFIX)
+    table.mkdir()
+    first = chrom_file(table, "chr1")
+    second = chrom_file(table, "chr2")
+    manifest_for(table, 12345, {first: 1, second: None})
+
+    # Act & assert
+    with pytest.raises(ValueError, match="declare no count"):
+        tables.require_complete(str(table))
+
+
+def test_require_complete_should_accept_a_table_built_from_the_published_rules(
+    tmp_path,
+):
+    """Test that the documented contract is sufficient to conform to.
+
+    Given:
+        A track directory and manifest built using only the published
+        surface -- `MANIFEST_VERSION`, `manifest_path`,
+        `track_chrom_path` and the field list `read_manifest`
+        documents -- and nothing private.
+    When:
+        Completeness is required.
+    Then:
+        It should return the path.
+
+    Criterion #5 names two third-party writers for this format, so the
+    question this answers is the one the contract exists for: can a
+    writer that reads only the documentation produce a table this
+    accepts? Every name below is in ``quadrat.__all__``; the test fails
+    to import rather than to assert if one stops being published.
+    """
+
+    # Arrange
+    table = tmp_path / ("conforming" + quadrat.TRACK_SUFFIX)
+    table.mkdir()
+    heights = {"chr1": 3, "chr2": 2}
+    files = {}
+    for chrom, rows in heights.items():
+        path = quadrat.track_chrom_path(str(table), chrom)
+        pathlib.Path(path).write_bytes(b"")
+        files[os.path.basename(path)] = rows
+    record = {
+        "version": quadrat.MANIFEST_VERSION,
+        "rows": sum(files.values()),
+        "files": files,
+        "parameters": {"written_by": "a third party"},
+    }
+    pathlib.Path(quadrat.manifest_path(str(table))).write_text(json.dumps(record))
+
+    # Act & assert
+    assert quadrat.require_complete(str(table)) == str(table)
+    assert quadrat.track_contigs(str(table)) == set(heights)
+
+
+def test_track_directory_holds_parquet_and_nothing_else(tmp_path):
+    """Test the invariant the manifest sits outside the directory for.
+
+    Given:
+        A track written with several contigs and a manifest.
+    When:
+        The directory is listed.
+    Then:
+        Every entry should be a Parquet file.
+
+    polars refuses to scan a directory of mixed extensions, and so does
+    anything else pointed at the dataset, which is why the completeness
+    record is a sibling of the directory rather than a member of it. A
+    comment in `quadrat.tables` claimed this test existed before it
+    did; an earlier memory-mapped read index broke the invariant once.
+    """
+
+    # Arrange
+    table = tmp_path / ("held" + tables.TRACK_SUFFIX)
+    table.mkdir()
+    for chrom in ("chr1", "chr2", "chrUn_KI270302v1"):
+        chrom_file(table, chrom)
+    manifest_for(table, 0, {})
+
+    # Act
+    held = sorted(os.listdir(str(table)))
+
+    # Assert
+    assert held
+    assert all(name.endswith(".parquet") for name in held), held
+    assert os.path.exists(tables.manifest_path(str(table)))
+    assert not os.path.dirname(tables.manifest_path(str(table))).endswith(
+        tables.TRACK_SUFFIX
+    )
+
+
+# The acceptance sweep over the path shapes and the wrong types. One
+# test per property rather than one per function, because the property
+# *is* that the functions agree: a per-function test can pass while two
+# of them answer differently, which is the state these were written
+# against.
+PATH_READERS = (
+    "manifest_path",
+    "read_manifest",
+    "require_complete",
+    "track_chrom_path",
+    "track_paths",
+    "track_contigs",
+)
+
+
+def call_reader(name, source):
+    """Call one published table reader with ``source`` as its path."""
+
+    function = getattr(quadrat, name, None) or getattr(tables, name)
+    if name == "track_chrom_path":
+        return function(source, "chr1")
+    if name == "track_paths":
+        return function(source, True)
+    return function(source)
+
+
+@pytest.mark.parametrize("name", PATH_READERS)
+def test_the_table_readers_should_answer_alike_for_every_path_shape(name, tmp_path):
+    """Test that a published reader does not care how a path is spelled.
+
+    Given:
+        One verified track directory, named as a ``str``, a
+        `pathlib.Path` and a ``bytes``.
+    When:
+        Each published reader is called with each spelling.
+    Then:
+        It should answer identically for all three.
+
+    `pileup_alignments` claimed this ("Normalized at the boundary, as
+    every sibling that takes a path does ... each with a test pinning
+    it") and no test exercised ``bytes`` anywhere: a grep over the
+    suite for ``b"/``, ``b'/`` and ``os.fsencode`` returned nothing.
+    What it covered for was real -- `manifest_path` built
+    ``"b'/data/x.track.parquet'.manifest.json"`` out of a repr, and
+    `bam_contigs` read a ``bytes`` path as an unreadable header -- and
+    both are a published answer rather than a refusal, which is the
+    failure a caller cannot see.
+    """
+
+    # Arrange
+    table = listed_table(tmp_path, ("chr1", "chr2"))
+    spellings = (str(table), pathlib.Path(str(table)), os.fsencode(str(table)))
+
+    # Act
+    answers = [call_reader(name, source) for source in spellings]
+
+    # Assert
+    expected = call_reader(name, str(table))
+    for spelling, answer in zip(spellings, answers):
+        if name == "require_complete":
+            # It returns its argument, so compare the normalized form.
+            assert fspath_or_none(answer) == str(table), spelling
+        else:
+            assert answer == expected, spelling
+
+
+@pytest.mark.parametrize("name", PATH_READERS)
+def test_the_table_readers_should_refuse_a_wrong_type_alike(name):
+    """Test that one wrong type gets one answer across the surface.
+
+    Given:
+        An integer where a path belongs.
+    When:
+        Each published reader is called with it.
+    Then:
+        It should raise `TypeError` naming the parameter, so a caller
+        meets the same verdict wherever they are.
+
+    Four answers were in play. `manifest_path` returned
+    ``"42.manifest.json"`` -- a path, for an integer, which no caller
+    could tell from a real one. `read_manifest` returned ``None``, a
+    fifth meaning its four documented causes do not carry, and one a
+    reader acts on by treating an unverifiable table as one predating
+    manifests. `track_chrom_path` and `track_paths` raised from inside
+    a path builder, naming neither the function nor the argument. Only
+    `require_complete` named both.
+    """
+
+    # Act & assert
+    with pytest.raises(TypeError, match=name):
+        call_reader(name, 42)
+
+
+def test_track_contigs_should_refuse_a_non_track_in_its_own_words():
+    """Test that the refusal describes the call the caller made.
+
+    Given:
+        An integer where a track belongs.
+    When:
+        `track_contigs` is asked for its contigs.
+    Then:
+        The message should name `track_contigs` and the three shapes it
+        reads, and say nothing about reading signals.
+
+    The dispatch was shared with a helper written for #5's signal
+    reader, so a caller who asked which contigs a track holds was told
+    that "the GIQL engine reads signals from .track.parquet tables" --
+    about an operation they had not invoked. The helper's other half
+    was worse: its directory branch could not be reached from here,
+    because `track_contigs` takes that case before calling it.
+    """
+
+    # Act
+    with pytest.raises(TypeError) as caught:
+        quadrat.track_contigs(42)
+
+    # Assert
+    message = str(caught.value)
+    assert "track_contigs reads a track" in message
+    assert "signals" not in message
+
+
+def test_track_contigs_should_read_a_single_file_table(tmp_path):
+    """Test that the legacy single-file shape still answers.
+
+    Given:
+        A track written as one Parquet file rather than a directory.
+    When:
+        Its contigs are read.
+    Then:
+        It should report what the ``chrom`` column holds.
+
+    The branch survives the helper that used to hold it, and it is the
+    shape the reference page records as readable but unverifiable.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+    table = tmp_path / ("single" + tables.TRACK_SUFFIX)
+    polars.DataFrame(
+        {"chrom": ["chr1", "chr2"], "pos": [1, 2], "value": [1.0, 2.0]}
+    ).write_parquet(table)
+
+    # Act
+    contigs = quadrat.track_contigs(str(table))
+
+    # Assert
+    assert contigs == {"chr1", "chr2"}
+
+
+def test_track_contigs_should_read_both_frame_shapes():
+    """Test that an in-memory frame answers whether lazy or eager.
+
+    Given:
+        The same three columns as a ``DataFrame`` and as a
+        ``LazyFrame``.
+    When:
+        Their contigs are read.
+    Then:
+        Both should report the same contigs, which is what lets a
+        caller run BAM to tensors without touching disk.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+    frame = polars.DataFrame(
+        {"chrom": ["chr1", "chr2"], "pos": [1, 2], "value": [1.0, 2.0]}
+    )
+
+    # Act
+    eager = quadrat.track_contigs(frame)
+    lazy = quadrat.track_contigs(frame.lazy())
+
+    # Assert
+    assert eager == lazy == {"chr1", "chr2"}
