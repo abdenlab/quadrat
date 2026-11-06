@@ -45,6 +45,8 @@ __all__ = [
     "bam_contigs",
     "chrom_lengths",
     "manifest_path",
+    "pileup_alignments",
+    "pileup_many",
     "read_manifest",
     "require_complete",
     "track_chrom_path",
@@ -55,6 +57,7 @@ from importlib.metadata import version
 
 from quadrat._engine import EngineOptionWarning
 from quadrat.alignments import bam_contigs
+from quadrat.pileup import pileup_alignments, pileup_many
 from quadrat.reference import chrom_lengths
 from quadrat.tables import (
     MANIFEST_VERSION,
