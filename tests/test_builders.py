@@ -1325,3 +1325,120 @@ def test_write_random_bam_should_size_its_reads_from_the_read_length(
         reads = list(bam.fetch())
     assert [read.cigarstring for read in reads] == ["35M"] * 8
     assert [read.query_length for read in reads] == [35] * 8
+
+
+def test_write_track_should_write_one_parquet_file_per_contig(tmp_path):
+    """Test the layout a built track has.
+
+    Given:
+        Rows over two contigs.
+    When:
+        The builder writes them as a track.
+    Then:
+        It should produce a directory holding one Parquet file per
+        contig and nothing else, with the completeness record beside
+        the directory rather than inside it.
+
+    Holding Parquet and nothing else is the invariant the format rests
+    on: polars refuses to scan a directory of mixed extensions, and so
+    does anything else pointed at the dataset.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    root = str(tmp_path / "sample.track.parquet")
+
+    # Act
+    builders.write_track(root, [("chr1", 10, 1.0), ("chr2", 5, 2.0)])
+
+    # Assert
+    assert sorted(os.listdir(root)) == ["chr1.parquet", "chr2.parquet"]
+    assert os.path.exists(root + ".manifest.json")
+
+
+def test_write_track_should_sort_rows_it_was_given_out_of_order(tmp_path):
+    """Test that a hand-written row list needs no ordering.
+
+    Given:
+        Rows whose contigs interleave and whose positions descend.
+    When:
+        The builder writes them as a track.
+    Then:
+        It should still write one file per contig, with each file's
+        positions ascending, so a test may list the rows it means in
+        the order it means them.
+
+    An ungrouped, unsorted row list is the one thing a hand-written
+    literal reliably is, and the format requires both.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+    root = str(tmp_path / "jumbled.track.parquet")
+    rows = [("chr2", 50, 1.0), ("chr1", 30, 2.0), ("chr2", 10, 3.0), ("chr1", 20, 4.0)]
+
+    # Act
+    builders.write_track(root, rows)
+
+    # Assert
+    assert sorted(os.listdir(root)) == ["chr1.parquet", "chr2.parquet"]
+    for name, expected in (("chr1", [20, 30]), ("chr2", [10, 50])):
+        frame = polars.read_parquet(os.path.join(root, name + ".parquet"))
+        assert frame.get_column("pos").to_list() == expected
+
+
+def test_write_track_should_produce_a_track_the_package_verifies(tmp_path):
+    """Test that a built track is the artifact a pileup commits.
+
+    Given:
+        Rows written as a track by the builder.
+    When:
+        The package is asked to verify it complete.
+    Then:
+        It should pass, and report the contigs the rows named, so every
+        later assertion about reading a track is an assertion about the
+        same artifact the pileup produces.
+
+    The builder goes through the package's own writer for exactly this
+    reason: a suite that built the layout itself could drift from the
+    format and still agree with itself.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    import quadrat
+
+    root = str(tmp_path / "verified.track.parquet")
+
+    # Act
+    builders.write_track(root, [("chr1", 10, 1.0), ("chr1", 20, 2.0), ("chr2", 5, 3.0)])
+
+    # Assert
+    assert quadrat.require_complete(root) == root
+    assert quadrat.track_contigs(root) == {"chr1", "chr2"}
+    assert quadrat.read_manifest(root)["rows"] == 3
+
+
+def test_write_track_should_record_the_parameters_it_was_given(tmp_path):
+    """Test that a track carries the arguments it was built with.
+
+    Given:
+        A parameters mapping passed to the builder.
+    When:
+        The written track's record is read back.
+    Then:
+        It should carry that mapping, so a test can assert on what a
+        track claims about its own provenance.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    import quadrat
+
+    root = str(tmp_path / "noted.track.parquet")
+
+    # Act
+    builders.write_track(root, [("chr1", 10, 1.0)], parameters={"shift": 4})
+
+    # Assert
+    assert quadrat.read_manifest(root)["parameters"] == {"shift": 4}

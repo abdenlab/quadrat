@@ -260,50 +260,25 @@ def test_require_complete_should_raise_when_given_something_that_is_not_a_track(
         tables.require_complete(source)
 
 
-def test_require_complete_should_refuse_a_non_track_without_the_pileup_engine(mocker):
-    """Test the refusal a base install reaches.
-
-    Given:
-        An argument that is no kind of track, and no importable polars.
-    When:
-        Completeness is required.
-    Then:
-        It should raise `TypeError` about the argument rather than
-        `ImportError` about the engine.
-
-    The engine ships with the ``pileup`` extra, so a caller who only
-    reads tracks may not have it -- and the branch that recognises an
-    in-memory frame had to import polars to ask. Attempting that import
-    rather than assuming it is what keeps the documented refusal
-    reachable: without polars the argument cannot be a polars frame,
-    which is the whole of what the import was for.
-    """
-
-    # Arrange
-    mocker.patch.object(
-        _engine.importlib, "import_module", side_effect=ImportError("no polars")
-    )
-
-    # Act & assert
-    with pytest.raises(TypeError, match="require_complete verifies"):
-        tables.require_complete(42)
-
-
-def test_the_readers_should_name_the_pileup_extra_when_the_engine_is_absent(mocker):
-    """Test what a reader that genuinely needs the engine says.
+def test_the_readers_should_name_an_incomplete_install_when_polars_is_absent(mocker):
+    """Test what a reader says when a base dependency will not import.
 
     Given:
         A reader whose work needs polars, and no importable polars.
     When:
         It is called.
     Then:
-        It should raise `ImportError` naming both the module and the
-        extra that installs it.
+        It should raise `ImportError` saying the environment is
+        incomplete rather than naming an extra to install.
+
+    polars is a base dependency, because reading a track is what the
+    base install is for. So its absence is a broken environment rather
+    than a minimal one, and pointing the caller at the ``pileup`` extra
+    would send them to install something that no longer contains it.
 
     `import_on_first_use` is the one seam every deferred import goes
     through, so this is also the test that the seam refuses rather than
-    letting a bare ``ModuleNotFoundError`` out of the middle of a
-    pileup.
+    letting a bare ``ModuleNotFoundError`` out of the middle of a read.
     """
 
     # Arrange
@@ -312,7 +287,7 @@ def test_the_readers_should_name_the_pileup_extra_when_the_engine_is_absent(mock
     )
 
     # Act & assert
-    with pytest.raises(ImportError, match=r"polars is needed.*pileup"):
+    with pytest.raises(ImportError, match=r"polars is declared.*incomplete"):
         tables.track_contigs(42)
 
 

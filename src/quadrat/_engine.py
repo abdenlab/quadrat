@@ -28,6 +28,17 @@ FASTA_TABLE = "quadrat_fasta"
 SIZES_TABLE = "quadrat_chrom_sizes"
 
 
+#: The two sides of the window-grouping join: the windows a locus set
+#: asks for, and one channel's track rows. Fixed names rather than
+#: generated ones, because the join registers exactly one of each at a
+#: time -- it runs per contig and per channel, and a name per channel
+#: would leave as many providers bound as there are channels.
+WINDOWS_TABLE = "quadrat_windows"
+
+
+TRACK_TABLE = "quadrat_track"
+
+
 #: Prefix of the one table name that is generated rather than fixed:
 #: `register_alignments` numbers its tables from it. A constant here
 #: rather than a parameter default on that function, because the
@@ -40,9 +51,10 @@ BAM_TABLE_PREFIX = "quadrat_bam"
 
 #: Modules the ``pileup`` extra installs rather than the base install.
 #: Named here so a failed import can state the remedy instead of only
-#: the module -- `import_on_first_use` is reached for `joblib` too,
-#: which is a hard dependency and wants a different sentence.
-_PILEUP_EXTRA = ("giql", "polars", "polars_bio", "pyfaidx")
+#: the module -- `import_on_first_use` is reached for `polars`,
+#: `pyfaidx` and `joblib` too, which are hard dependencies and want a
+#: different sentence.
+_PILEUP_EXTRA = ("giql", "polars_bio")
 
 
 #: Held for the duration of one pileup. Not a queue: a second pileup in
@@ -142,6 +154,44 @@ def registered_fasta(path):
 
 
 @contextlib.contextmanager
+def registered_frames(frames):
+    """Bind ``frames`` by table name for the duration of the block.
+
+    What `registered_fasta` is for a file, for the in-memory frames a
+    query is handed: a mapping of table name to polars frame, bound on
+    the way in and dropped on the way out.
+
+    Dropped in a ``finally``, and that is the whole reason this exists
+    rather than two lines at each call site. The session is
+    process-global, as the module docstring above says, so a
+    registration that outlives its query stays bound for the life of
+    the process -- and the next caller of the same name reads the
+    previous one's rows rather than failing.
+
+    Yields the engine handle, so a caller needs one call rather than
+    two for what is one operation.
+
+    :param frames: A mapping of table name to polars frame. Iteration
+        order is the registration order, which matters only in that a
+        failure partway through still drops whatever landed.
+    """
+
+    pb = engine()
+    try:
+        for name, frame in frames.items():
+            pb.from_polars(name, frame)
+        yield pb
+    finally:
+        # Through the DataFusion context, for the reasons
+        # `quadrat.alignments.deregister_alignments` records: it does
+        # not go through the parser and does not raise on a name that
+        # is not bound, which is what makes this safe after a
+        # registration that refused partway through.
+        for name in frames:
+            pb.ctx.deregister_table(name)
+
+
+@contextlib.contextmanager
 def exclusive_pileup():
     """Hold this process's one pileup slot, or refuse to start.
 
@@ -183,11 +233,14 @@ def import_on_first_use(name):
     refusal below.
 
     Availability *is* guarded, unlike what this said while it was
-    called ``lazy``. ``pyproject.toml`` puts polars, polars-bio, giql
-    and pyfaidx in ``[project.optional-dependencies] pileup``, so a
-    base install reaches here with the module genuinely absent -- and a
-    bare ``ModuleNotFoundError`` raised from the middle of a pileup
-    names neither the extra nor the remedy.
+    called ``lazy``. ``pyproject.toml`` puts polars-bio and giql in
+    ``[project.optional-dependencies] pileup``, so a base install
+    reaches here with the module genuinely absent -- and a bare
+    ``ModuleNotFoundError`` raised from the middle of a pileup names
+    neither the extra nor the remedy. Everything else reached through
+    here is a hard dependency, so its absence means an incomplete
+    environment rather than a minimal one, and the second message
+    below says so.
 
     One accessor rather than one per library. Four one-line functions
     differing only in a module name would be a parallel surface,
@@ -199,14 +252,16 @@ def import_on_first_use(name):
     except ImportError as error:
         if name in _PILEUP_EXTRA:
             raise ImportError(
-                "{} is needed to pile up alignments and is not "
+                "{} is needed to build tracks from alignments or to "
+                "group tracks into a window cache, and is not "
                 "installed. It belongs to quadrat's `pileup` extra: "
                 "install it with `uv sync --all-extras` in a checkout, "
                 'or `pip install "quadrat[pileup]"` once the extra\'s '
                 "git-pinned dependency reaches an index -- the comment "
                 "on `[tool.uv.sources]` in pyproject.toml says when. A "
-                "base install reads tracks that already exist and "
-                "cannot write new ones.".format(name)
+                "base install reads tracks that already exist, one "
+                "window at a time; building them and grouping them "
+                "both need this.".format(name)
             ) from error
         raise ImportError(
             "{} is declared as a dependency of quadrat and is not "

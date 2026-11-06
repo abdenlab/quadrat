@@ -32,7 +32,7 @@ import warnings
 import numpy
 import pytest
 
-from quadrat import EngineOptionWarning, tables
+from quadrat import EngineOptionWarning, _engine, tables
 from quadrat import pileup as pileup_pkg
 from quadrat.pileup import track
 from tests import TWO_CONTIGS, builders, digest_track
@@ -1308,6 +1308,109 @@ def test_pileup_alignments_should_release_its_tables_when_it_finishes(
     assert not bound(pb, "quadrat_bam_0")
     assert not bound(pb, "quadrat_bam_1")
     assert not bound(pb, "quadrat_chrom_sizes")
+
+
+def test_engine_should_name_the_extra_when_polars_bio_is_absent(mocker):
+    """Test what the engine says when the extra is not installed.
+
+    Given:
+        No importable polars-bio.
+    When:
+        The engine handle is asked for.
+    Then:
+        It should raise `ImportError` naming both the module and the
+        extra that installs it, rather than letting a bare
+        ``ModuleNotFoundError`` out of the middle of a pileup.
+
+    polars-bio and giql are what the ``pileup`` extra installs, and
+    they are the only modules whose absence means a base install rather
+    than a broken one -- a base install reads tracks and cannot build
+    new ones.
+    """
+
+    # Arrange
+    mocker.patch.object(
+        _engine.importlib, "import_module", side_effect=ImportError("no polars_bio")
+    )
+
+    # Act & assert
+    with pytest.raises(ImportError, match=r"polars_bio is needed.*pileup"):
+        _engine.engine()
+
+
+def test_registered_frames_should_drop_the_tables_when_the_block_ends(reference_fasta):
+    """Test that a frame registration does not outlive its block.
+
+    Given:
+        Two frames bound by name.
+    When:
+        The block they were bound for ends.
+    Then:
+        Both names should be bound inside it and neither after, so a
+        query's registrations cannot be read by the next query.
+
+    The session is process-global, so a registration that outlives its
+    query stays bound for the life of the process -- and the next
+    caller of the same name reads the previous one's rows rather than
+    failing, which is the failure this scope exists to prevent.
+    """
+
+    # Arrange
+    pb = pytest.importorskip("polars_bio")
+    polars = pytest.importorskip("polars")
+    frames = {
+        _engine.WINDOWS_TABLE: polars.DataFrame({"idx": [0, 1]}),
+        _engine.TRACK_TABLE: polars.DataFrame({"pos": [10, 20]}),
+    }
+
+    # Act
+    with _engine.registered_frames(frames):
+        inside = [bound(pb, name) for name in frames]
+
+    # Assert
+    assert inside == [True, True]
+    assert [bound(pb, name) for name in frames] == [False, False]
+
+
+def test_registered_frames_should_drop_what_it_bound_when_a_later_frame_is_refused(
+    mocker, reference_fasta
+):
+    """Test that a registration refused partway through still unwinds.
+
+    Given:
+        Two frames, the second of which the engine refuses.
+    When:
+        The block is entered.
+    Then:
+        It should propagate the refusal with neither name left bound,
+        so a failure does not leave the first frame readable under a
+        name the next query will register.
+    """
+
+    # Arrange
+    pb = pytest.importorskip("polars_bio")
+    polars = pytest.importorskip("polars")
+    frames = {
+        _engine.WINDOWS_TABLE: polars.DataFrame({"idx": [0, 1]}),
+        _engine.TRACK_TABLE: polars.DataFrame({"pos": [10, 20]}),
+    }
+    real = pb.from_polars
+
+    def register(name, frame):
+        # The first lands for real, so the assertion below is about the
+        # unwind rather than about nothing having been registered.
+        if name == _engine.TRACK_TABLE:
+            raise OSError("the provider refused this frame")
+        return real(name, frame)
+
+    mocker.patch.object(pb, "from_polars", side_effect=register)
+
+    # Act & assert
+    with pytest.raises(OSError, match="refused this frame"):
+        with _engine.registered_frames(frames):
+            pytest.fail("the block should not have been entered")
+
+    assert not bound(pb, _engine.WINDOWS_TABLE)
 
 
 def foreign_alignment(path):

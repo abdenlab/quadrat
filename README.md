@@ -15,11 +15,13 @@ Under construction. The data path is being extracted from [cherimoya](https://gi
 Nothing is published yet. Once the data path lands, the two installs will be:
 
 ```bash
-pip install quadrat            # stream windows over tracks
-pip install "quadrat[pileup]"  # also build those tables from alignments
+pip install quadrat            # read tracks a window at a time
+pip install "quadrat[pileup]"  # also build them, and train over them
 ```
 
-The `pileup` extra adds the engine that builds those tables: [polars-bio](https://github.com/biodatageeks/polars-bio) and [giql](https://github.com/abdenlab/giql) among its dependencies. The base install is enough for a caller who already has tracks; `quadrat`'s package docstring states the import guarantee that makes it so.
+The `pileup` extra is the engine: [polars-bio](https://github.com/biodatageeks/polars-bio), which reads alignments, and [giql](https://github.com/abdenlab/giql), which transpiles the interval joins both halves of the data path are built on. It is needed to build tracks from alignments and to group tracks into a window cache, so a caller who means to train needs it.
+
+The base install reads a track that already exists: it verifies one, summarizes it, and answers a window of sequence or signal by coordinate. That is enough to inspect a corpus someone else piled up, and it is the install `quadrat`'s package docstring states the import guarantee about.
 
 The extra resolves with `uv` and not yet with pip, because one of its dependencies is pinned to a git revision that only `uv` reads — the comment on `[tool.uv.sources]` in `pyproject.toml` says why and when that changes.
 

@@ -225,6 +225,43 @@ def write_bed(path, rows):
     return path
 
 
+def write_track(path, rows, *, parameters=None):
+    """Write ``(chrom, pos, value)`` rows as one track directory.
+
+    The track equivalent of `write_bed`: a builder that takes the rows
+    a test means and leaves the layout to the code under test. It goes
+    through ``quadrat.tables.TrackWriter`` rather than spelling the
+    directory, the per-contig filenames and the manifest itself, so a
+    track the suite builds is the same artifact a pileup commits and a
+    change to the format cannot leave the two disagreeing.
+
+    Rows need not be sorted or grouped. The writer sorts a frame it was
+    handed ungrouped, which is the one thing a hand-written row list
+    reliably is.
+
+    Needs ``polars``, which is a base dependency, and the writer, which
+    is not imported until this is called: ``conftest`` assigns
+    ``QUADRAT_CACHE_DIR`` at its own import time and a module-level
+    ``quadrat`` import here would land before it.
+    """
+
+    import polars
+
+    from quadrat.tables import TrackWriter
+
+    frame = polars.DataFrame(
+        {
+            "chrom": [str(row[0]) for row in rows],
+            "pos": [int(row[1]) for row in rows],
+            "value": [float(row[2]) for row in rows],
+        },
+        schema={"chrom": polars.Utf8, "pos": polars.Int64, "value": polars.Float64},
+    )
+    with TrackWriter(str(path), parameters=parameters) as writer:
+        writer.write(frame)
+    return str(path)
+
+
 def intervals(chrom, start, stop, step, width):
     """Return ``(chrom, start, stop)`` rows every ``step`` bases over a range."""
 
