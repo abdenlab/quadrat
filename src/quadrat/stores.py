@@ -8,7 +8,7 @@ That shape is set by where these are used. A dataset is re-created in
 every loader worker, so anything a store keeps is kept once per worker;
 and the eager alternative -- pulling whole chromosomes through the
 engine and holding the residues -- costs about 248 MB for hg38 chr1
-alone, in each of them. See `_ProcessLocalHandles` for what a worker
+alone, in each of them. See `ProcessLocalHandles` for what a worker
 does to a live file handle, which is the sharper half of the same
 problem.
 
@@ -30,8 +30,9 @@ from quadrat.tables import TRACK_SUFFIX, require_complete, track_chrom_path
 
 # Defined ahead of the stores that use it, against the public-first
 # ordering, because a base class has to exist when the subclass
-# statement runs.
-class _ProcessLocalHandles(object):
+# statement runs. Un-underscored because `quadrat.cache` derives from
+# it too, and a name that crosses modules carries no underscore here.
+class ProcessLocalHandles(object):
     """Keep a reader's handles from outliving the process that opened them.
 
     A dataset is re-created in every loader worker -- pickled under
@@ -82,7 +83,7 @@ class _ProcessLocalHandles(object):
         self._local = None
 
 
-class SequenceStore(_ProcessLocalHandles):
+class SequenceStore(ProcessLocalHandles):
     """Read one-hot sequence windows from an indexed FASTA.
 
     One window per call, holding nothing between them. The reference
@@ -147,7 +148,7 @@ class SequenceStore(_ProcessLocalHandles):
         return fasta
 
 
-class TrackStore(_ProcessLocalHandles):
+class TrackStore(ProcessLocalHandles):
     """Read dense signal windows from a set of tracks, one per channel.
 
     Each source is one channel and the order is the channel axis, so

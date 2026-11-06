@@ -17,6 +17,11 @@ Ordered foundational to derived, so ``pytest -x`` stops at the most
 fundamental failure.
 """
 
+import gc
+import multiprocessing
+import os
+import pickle
+
 import numpy
 import pytest
 
@@ -36,6 +41,15 @@ CHANNEL_1 = [("chr1", 11, 5.0)]
 def corpus(corpus_factory):
     return corpus_factory(
         "cache", TWO_CONTIGS, tracks=[CHANNEL_0, CHANNEL_1], in_window=60, out_window=30
+    )
+
+
+@pytest.fixture(scope="module")
+def three_channel(corpus_factory):
+    return corpus_factory(
+        "cache-three",
+        TWO_CONTIGS,
+        tracks=[CHANNEL_0, CHANNEL_1, [("chr1", 13, 9.0)]],
     )
 
 
@@ -432,3 +446,468 @@ def test_window_group_sums_should_refuse_a_wrong_grouping_with_no_windows(tracks
     # Act & assert
     with pytest.raises(ValueError, match="group_sizes sums to 1"):
         cache.window_group_sums(frame([]), tracks, [1])
+
+
+class TestWindowSignalCache:
+    """The grouped cache, read by draw."""
+
+    @pytest.mark.parametrize("residency", ["memory", "scratch"])
+    def test_window_should_read_back_what_a_coordinate_read_returns(
+        self, tracks, residency
+    ):
+        """Test the cache against the reader, over every window.
+
+        Given:
+            A cache built for three windows, in each residency.
+        When:
+            Each window is read at no jitter.
+        Then:
+            It should equal what `TrackStore` reads over the same
+            interval, so the cache and a coordinate read describe one
+            signal whichever residency holds the arrays.
+        """
+
+        # Arrange
+        windows = frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 396, 404)])
+        store = stores.TrackStore(tracks)
+
+        # Act
+        built = cache.WindowSignalCache.build(windows, tracks, residency=residency)
+
+        # Assert
+        for index, (chrom, start, end) in enumerate(
+            zip(windows["chrom"], windows["sig_start"], windows["sig_end"])
+        ):
+            expected = store.window(chrom, start, end).numpy()
+            read = built.window(index, 0, int(end) - int(start)).numpy()
+            assert numpy.array_equal(read, expected), index
+
+    def test_window_should_answer_identically_from_either_residency(self, tracks):
+        """Test that residency is invisible in the answer.
+
+        Given:
+            Two caches over the same windows, one in memory and one
+            mapped from scratch files.
+        When:
+            The same draw is read from each.
+        Then:
+            They should agree exactly, because residency is a choice
+            about where the bytes live and not about what they say.
+        """
+
+        # Arrange
+        windows = frame([("chr1", 8, 16)])
+
+        # Act
+        held = cache.WindowSignalCache.build(windows, tracks, residency="memory")
+        mapped = cache.WindowSignalCache.build(windows, tracks, residency="scratch")
+
+        # Assert
+        assert held.window(0, 0, 8).tolist() == mapped.window(0, 0, 8).tolist()
+
+    def test_window_should_shift_the_draw_by_the_jitter(self, tracks):
+        """Test what the jitter offset does to a read.
+
+        Given:
+            A cache over one window with rows at known offsets.
+        When:
+            The window is read at a jitter of two.
+        Then:
+            Every row should move two columns toward the start, because
+            the jitter is the draw's displacement within the window
+            rather than a second coordinate to search by.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            frame([("chr1", 8, 16)]), tracks, residency="memory"
+        )
+
+        # Act
+        read = built.window(0, 2, 8).numpy()
+
+        # Assert
+        assert read[0].tolist() == [1.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        assert read[1].tolist() == [0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    def test_window_should_drop_a_row_the_jitter_moves_before_the_start(self, tracks):
+        """Test a draw jittered past the low edge.
+
+        Given:
+            A cache whose window holds a row two columns in.
+        When:
+            It is read at a jitter of three, moving that row before the
+            start.
+        Then:
+            That row should be dropped and the rest kept, so a draw
+            near a contig edge reads as zeros there rather than raising
+            or wrapping.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            frame([("chr1", 8, 16)]), tracks, residency="memory"
+        )
+
+        # Act
+        read = built.window(0, 3, 8).numpy()
+
+        # Assert
+        assert read[0].tolist() == [0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        assert read[1].tolist() == [5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    def test_window_should_drop_a_row_that_falls_past_the_length(self, tracks):
+        """Test a draw shorter than the window it was grouped over.
+
+        Given:
+            A cache grouped over an eight-base window.
+        When:
+            Three bases of it are read.
+        Then:
+            Only the rows inside those three should appear, so the
+            length asked for bounds the answer rather than the span the
+            grouping used.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            frame([("chr1", 8, 16)]), tracks, residency="memory"
+        )
+
+        # Act
+        read = built.window(0, 0, 3).numpy()
+
+        # Assert
+        assert tuple(read.shape) == (2, 3)
+        assert read[0].tolist() == [0.0, 0.0, 1.0]
+        assert read[1].sum() == 0
+
+    def test_window_should_mirror_the_draw_when_reverse_complemented(self, tracks):
+        """Test the mirrored read against gathering and flipping.
+
+        Given:
+            A cache over one window.
+        When:
+            The draw is read mirrored, and read plainly and flipped.
+        Then:
+            The two should agree, so applying the mirror during the
+            scatter is the same answer as the two passes over the dense
+            tensor it replaces.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            frame([("chr1", 8, 16)]), tracks, residency="memory"
+        )
+
+        # Act
+        mirrored = built.window(0, 0, 8, reverse_complement=True).numpy()
+
+        # Assert
+        plain = built.window(0, 0, 8).numpy()
+        assert numpy.array_equal(mirrored, numpy.flip(plain, axis=1))
+
+    def test_window_should_permute_the_channels_of_a_mirrored_draw(self, tracks):
+        """Test the channel permutation a mirror applies.
+
+        Given:
+            A cache over two channels and a permutation swapping them.
+        When:
+            The draw is read mirrored with that permutation.
+        Then:
+            It should equal flipping the plain read and then swapping
+            its rows, because a stranded pair exchanges roles under
+            reverse-complement while the positions mirror.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            frame([("chr1", 8, 16)]), tracks, residency="memory"
+        )
+        swap = numpy.array([1, 0])
+
+        # Act
+        mirrored = built.window(0, 0, 8, reverse_complement=True, perm=swap).numpy()
+
+        # Assert
+        plain = numpy.flip(built.window(0, 0, 8).numpy(), axis=1)
+        assert numpy.array_equal(mirrored, plain[swap])
+
+    def test_window_should_apply_a_permutation_that_is_not_an_involution(
+        self, three_channel
+    ):
+        """Test a permutation that is not its own inverse.
+
+        Given:
+            Three channels and a three-cycle permutation.
+        When:
+            The draw is read mirrored with it.
+        Then:
+            Each channel's row should land where the permutation sends
+            it rather than where its inverse would, which a swap of two
+            channels cannot distinguish.
+        """
+
+        # Arrange
+        pytest.importorskip("polars_bio")
+        built = cache.WindowSignalCache.build(
+            frame([("chr1", 8, 16)]), three_channel.tracks, residency="memory"
+        )
+        cycle = numpy.array([1, 2, 0])
+
+        # Act
+        mirrored = built.window(0, 0, 8, reverse_complement=True, perm=cycle).numpy()
+
+        # Assert
+        plain = numpy.flip(built.window(0, 0, 8).numpy(), axis=1)
+        assert numpy.array_equal(mirrored[cycle], plain)
+
+    def test_n_channels_should_report_what_the_arrays_cannot_recover(self, corpus):
+        """Test the channel count of a cache whose last channel is empty.
+
+        Given:
+            A cache whose final channel recorded nothing in any window.
+        When:
+            Its channel count is read and a window taken.
+        Then:
+            Both should include that channel, because a channel with no
+            rows leaves no trace in the channel index and a reader
+            would otherwise build a dense array one row short.
+        """
+
+        # Arrange
+        pytest.importorskip("polars_bio")
+
+        # Act
+        built = cache.WindowSignalCache.build(
+            frame([("chr2", 0, 8)]), corpus.tracks, residency="memory"
+        )
+
+        # Assert
+        assert built.n_channels == 2
+        assert tuple(built.window(0, 0, 8).shape) == (2, 8)
+
+    def test_nbytes_should_total_the_four_arrays(self, tracks):
+        """Test what a cache reports for its own size.
+
+        Given:
+            A cache over one window.
+        When:
+            Its byte count is taken.
+        Then:
+            It should be the sum over the four arrays, which is what
+            makes the sparse layout's cost measurable rather than
+            asserted.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            frame([("chr1", 8, 16)]), tracks, residency="memory"
+        )
+
+        # Act & assert
+        assert built.nbytes() == 2 * 8 + 3 * (4 + 4 + 2)
+
+    def test_window_should_answer_the_same_after_a_pickle_round_trip(self, tracks):
+        """Test the crossing a spawned worker makes.
+
+        Given:
+            A mapped cache that has already read a window, so its
+            arrays are open.
+        When:
+            It is pickled, restored, and asked again.
+        Then:
+            It should answer identically, which is the whole point of
+            the mapped residency: under spawn the arrays are not
+            inherited, and mapping them keeps the cost of reaching the
+            first batch flat in cache size instead of linear.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            frame([("chr1", 8, 16)]), tracks, residency="scratch"
+        )
+        expected = built.window(0, 0, 8).tolist()
+
+        # Act
+        restored = pickle.loads(pickle.dumps(built))
+
+        # Assert
+        assert restored.window(0, 0, 8).tolist() == expected
+
+    def test_from_arrays_should_keep_the_arrays_in_memory_under_fork(
+        self, mocker, tracks
+    ):
+        """Test the residency chosen when workers are forked.
+
+        Given:
+            A start method of ``fork`` and no residency asked for.
+        When:
+            A cache is built.
+        Then:
+            It should hold the arrays in memory, because a forked
+            worker already shares them copy-on-write and a mapping
+            would only add the page-fault indirection.
+        """
+
+        # Arrange
+        mocker.patch.object(multiprocessing, "get_start_method", return_value="fork")
+
+        # Act
+        built = cache.WindowSignalCache.build(frame([("chr1", 8, 16)]), tracks)
+
+        # Assert
+        assert built.scratch is None
+
+    def test_from_arrays_should_map_the_arrays_under_spawn(self, mocker, tracks):
+        """Test the residency chosen when workers are spawned.
+
+        Given:
+            A start method of ``spawn`` and no residency asked for.
+        When:
+            A cache is built.
+        Then:
+            It should write the arrays for mapping, because a spawned
+            worker inherits no sharing and would otherwise be sent one
+            pickled copy each.
+        """
+
+        # Arrange
+        mocker.patch.object(multiprocessing, "get_start_method", return_value="spawn")
+
+        # Act
+        built = cache.WindowSignalCache.build(frame([("chr1", 8, 16)]), tracks)
+
+        # Assert
+        assert built.scratch is not None
+
+    def test_from_arrays_should_map_the_arrays_when_no_start_method_answers(
+        self, mocker, tracks
+    ):
+        """Test the residency chosen where the start method is unavailable.
+
+        Given:
+            A start method that raises.
+        When:
+            A cache is built with no residency asked for.
+        Then:
+            It should write the arrays for mapping, which is correct
+            everywhere and only slower, rather than refusing to build.
+        """
+
+        # Arrange
+        mocker.patch.object(
+            multiprocessing,
+            "get_start_method",
+            side_effect=RuntimeError("no start method"),
+        )
+
+        # Act
+        built = cache.WindowSignalCache.build(frame([("chr1", 8, 16)]), tracks)
+
+        # Assert
+        assert built.scratch is not None
+
+    def test_from_arrays_should_refuse_an_unknown_residency(self, tracks):
+        """Test the refusal of a residency that is neither.
+
+        Given:
+            A residency this does not implement.
+        When:
+            A cache is built.
+        Then:
+            It should raise `ValueError` naming both choices and
+            ``None``, rather than silently taking one of them.
+        """
+
+        # Act & assert
+        with pytest.raises(ValueError, match="residency must be"):
+            cache.WindowSignalCache.build(
+                frame([("chr1", 8, 16)]), tracks, residency="mmap"
+            )
+
+    def test_build_should_remove_its_scratch_when_the_cache_is_dropped(self, tracks):
+        """Test that a cache cleans up the directory it made.
+
+        Given:
+            A mapped cache, which made its own scratch directory.
+        When:
+            The last reference to it is dropped.
+        Then:
+            The directory should be gone, because nothing else knows
+            about it and a training run that built a hundred would
+            otherwise fill the disk.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            frame([("chr1", 8, 16)]), tracks, residency="scratch"
+        )
+        root = built.scratch
+        assert os.path.isdir(root)
+
+        # Act
+        del built
+        gc.collect()
+
+        # Assert
+        assert not os.path.exists(root)
+
+    def test_adopt_should_leave_the_directory_when_the_cache_is_dropped(
+        self, tmp_path, tracks
+    ):
+        """Test that an adopted entry outlives the cache reading it.
+
+        Given:
+            Arrays on disk, adopted rather than built.
+        When:
+            The cache is dropped.
+        Then:
+            The directory should remain, because a persistent entry
+            outlives every cache that reads it and the first run to
+            finish would otherwise delete what every later run is
+            counting on.
+        """
+
+        # Arrange
+        grouped = cache.group_track(frame([("chr1", 8, 16)]), tracks)
+        root = str(tmp_path / "entry")
+        os.makedirs(root)
+        cache.write_cache_arrays(root, *grouped[:4])
+        adopted = cache.WindowSignalCache.adopt(root, grouped[4])
+        assert adopted.window(0, 0, 8).numpy().sum() > 0
+
+        # Act
+        del adopted
+        gc.collect()
+
+        # Assert
+        assert os.path.isdir(root)
+
+    def test_adopt_should_never_own_its_files_across_a_pickle(self, tmp_path, tracks):
+        """Test what a worker's copy of an adopted cache owns.
+
+        Given:
+            An adopted cache, pickled and restored as a worker's copy
+            would be.
+        When:
+            The restored copy is asked whether it owns its files.
+        Then:
+            It should not, because ownership travels with the pickle
+            and a worker that exited first would otherwise delete the
+            arrays every other worker is still reading.
+        """
+
+        # Arrange
+        grouped = cache.group_track(frame([("chr1", 8, 16)]), tracks)
+        root = str(tmp_path / "shared")
+        os.makedirs(root)
+        cache.write_cache_arrays(root, *grouped[:4])
+        adopted = cache.WindowSignalCache.adopt(root, grouped[4])
+
+        # Act
+        restored = pickle.loads(pickle.dumps(adopted))
+
+        # Assert
+        assert restored.owns_scratch is False
+        assert os.path.isdir(root)

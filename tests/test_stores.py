@@ -481,7 +481,7 @@ class TestTrackStore:
         This holds the pruning and the restore jointly, not either one:
         each is sufficient by itself, so removing one leaves this
         passing and removing both fails it. See
-        ``_ProcessLocalHandles``.
+        ``ProcessLocalHandles``.
         """
 
         # Arrange
