@@ -40,11 +40,13 @@ pileup runs.
 __all__ = [
     "EngineOptionWarning",
     "__version__",
+    "chrom_lengths",
 ]
 
 from importlib.metadata import version
 
 from quadrat._engine import EngineOptionWarning
+from quadrat.reference import chrom_lengths
 
 # public
 __version__ = version("quadrat")
