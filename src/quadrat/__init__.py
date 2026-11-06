@@ -37,9 +37,14 @@ transpiles its aggregate with giql, and loads what it needs when a
 pileup runs.
 """
 
+__all__ = [
+    "EngineOptionWarning",
+    "__version__",
+]
+
 from importlib.metadata import version
 
-__all__ = ["__version__"]
+from quadrat._engine import EngineOptionWarning
 
 # public
 __version__ = version("quadrat")
