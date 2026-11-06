@@ -38,10 +38,17 @@ pileup runs.
 """
 
 __all__ = [
+    "MANIFEST_VERSION",
     "EngineOptionWarning",
+    "TRACK_SUFFIX",
     "__version__",
     "bam_contigs",
     "chrom_lengths",
+    "manifest_path",
+    "read_manifest",
+    "require_complete",
+    "track_chrom_path",
+    "track_contigs",
 ]
 
 from importlib.metadata import version
@@ -49,6 +56,15 @@ from importlib.metadata import version
 from quadrat._engine import EngineOptionWarning
 from quadrat.alignments import bam_contigs
 from quadrat.reference import chrom_lengths
+from quadrat.tables import (
+    MANIFEST_VERSION,
+    TRACK_SUFFIX,
+    manifest_path,
+    read_manifest,
+    require_complete,
+    track_chrom_path,
+    track_contigs,
+)
 
 # public
 __version__ = version("quadrat")
