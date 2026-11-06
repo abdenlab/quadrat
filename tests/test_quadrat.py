@@ -202,7 +202,7 @@ class TestDistribution:
             The package is imported and the loaded modules inspected.
         Then:
             It should have loaded none of polars, polars-bio, giql or
-            pyfaidx, so a caller who already has cut-site tables never
+            pyfaidx, so a caller who already has tracks never
             pays for the engine that builds them.
         """
 
