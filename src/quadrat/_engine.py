@@ -28,6 +28,17 @@ FASTA_TABLE = "quadrat_fasta"
 SIZES_TABLE = "quadrat_chrom_sizes"
 
 
+#: The two sides of the window-grouping join: the windows a locus set
+#: asks for, and one channel's track rows. Fixed names rather than
+#: generated ones, because the join registers exactly one of each at a
+#: time -- it runs per contig and per channel, and a name per channel
+#: would leave as many providers bound as there are channels.
+WINDOWS_TABLE = "quadrat_windows"
+
+
+TRACK_TABLE = "quadrat_track"
+
+
 #: Prefix of the one table name that is generated rather than fixed:
 #: `register_alignments` numbers its tables from it. A constant here
 #: rather than a parameter default on that function, because the
@@ -139,6 +150,44 @@ def registered_fasta(path):
         # the same here and stated there: it does not go through the
         # parser and does not raise on a name that is not bound.
         pb.ctx.deregister_table(FASTA_TABLE)
+
+
+@contextlib.contextmanager
+def registered_frames(frames):
+    """Bind ``frames`` by table name for the duration of the block.
+
+    What `registered_fasta` is for a file, for the in-memory frames a
+    query is handed: a mapping of table name to polars frame, bound on
+    the way in and dropped on the way out.
+
+    Dropped in a ``finally``, and that is the whole reason this exists
+    rather than two lines at each call site. The session is
+    process-global, as the module docstring above says, so a
+    registration that outlives its query stays bound for the life of
+    the process -- and the next caller of the same name reads the
+    previous one's rows rather than failing.
+
+    Yields the engine handle, so a caller needs one call rather than
+    two for what is one operation.
+
+    :param frames: A mapping of table name to polars frame. Iteration
+        order is the registration order, which matters only in that a
+        failure partway through still drops whatever landed.
+    """
+
+    pb = engine()
+    try:
+        for name, frame in frames.items():
+            pb.from_polars(name, frame)
+        yield pb
+    finally:
+        # Through the DataFusion context, for the reasons
+        # `quadrat.alignments.deregister_alignments` records: it does
+        # not go through the parser and does not raise on a name that
+        # is not bound, which is what makes this safe after a
+        # registration that refused partway through.
+        for name in frames:
+            pb.ctx.deregister_table(name)
 
 
 @contextlib.contextmanager

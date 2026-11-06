@@ -32,6 +32,7 @@ from quadrat._engine import (
     exclusive_pileup,
     fspath_or_none,
     import_on_first_use,
+    registered_frames,
 )
 from quadrat.alignments import (
     bam_contigs,
@@ -288,18 +289,16 @@ def pileup_alignments(
         pb = engine()
         lengths = chrom_lengths(sequences)
         tables = register_alignments(alignments)
-        stack.callback(deregister_alignments, tables + [SIZES_TABLE])
+        stack.callback(deregister_alignments, tables)
 
-        pb.from_polars(
-            SIZES_TABLE,
-            polars.DataFrame(
-                {
-                    "chrom": list(lengths.keys()),
-                    "length": list(lengths.values()),
-                },
-                schema={"chrom": polars.Utf8, "length": polars.Int64},
-            ),
+        sizes = polars.DataFrame(
+            {
+                "chrom": list(lengths.keys()),
+                "length": list(lengths.values()),
+            },
+            schema={"chrom": polars.Utf8, "length": polars.Int64},
         )
+        stack.enter_context(registered_frames({SIZES_TABLE: sizes}))
 
         if target_partitions is None:
             # The cores this process may use, not the machine's, so a
