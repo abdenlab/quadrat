@@ -18,10 +18,13 @@ geometry, and rebuilds from them in under a second for a locus set of
 order 10^5 windows. The tracks are the only thing worth keeping.
 """
 
+import hashlib
+import json
 import multiprocessing
 import os
 import shutil
 import tempfile
+import time
 import weakref
 
 import numpy
@@ -30,10 +33,32 @@ import torch
 from quadrat._engine import (
     TRACK_TABLE,
     WINDOWS_TABLE,
+    fspath_or_none,
     import_on_first_use,
     registered_frames,
 )
 from quadrat.stores import ProcessLocalHandles, chrom_track, track_frame
+from quadrat.tables import (
+    MANIFEST_VERSION,
+    commit_directory,
+    read_manifest,
+    require_complete,
+    stage_directory,
+)
+
+#: Bumped when the layout of an entry changes, or when anything that
+#: shapes the cached bytes without being part of the key does. An
+#: entry built under a different value is a miss rather than an error,
+#: so bumping it retires every entry without touching any of them.
+CACHE_VERSION = 1
+
+
+#: Where entries go when no directory is named. Read on every call
+#: rather than once, so a process that sets it after importing this
+#: package is not left pointed at the real user cache -- which is also
+#: what the suite's own guard depends on.
+_CACHE_DIR_ENV = "QUADRAT_CACHE_DIR"
+
 
 #: The four arrays a grouped result is written as, in the order
 #: `group_track` returns them. Named once because the tuple is the file
@@ -265,6 +290,290 @@ class WindowSignalCache(ProcessLocalHandles):
         return arrays
 
 
+def default_cache_dir():
+    """Where persisted entries go when the caller names no directory.
+
+    Resolved from the environment on every call. ``QUADRAT_CACHE_DIR``
+    wins, then the XDG convention, then a home-relative default -- so
+    caching needs no configuration and relocating it needs one
+    variable.
+    """
+
+    named = os.environ.get(_CACHE_DIR_ENV)
+    if named:
+        return os.path.join(os.path.expanduser(named), "windows")
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    root = (
+        os.path.expanduser(xdg)
+        if xdg
+        else os.path.join(os.path.expanduser("~"), ".cache")
+    )
+    return os.path.join(root, "quadrat", "windows")
+
+
+def window_cache_key(
+    signals,
+    sequences,
+    peaks,
+    negatives,
+    chroms=None,
+    in_window=2114,
+    out_window=1000,
+    max_jitter=500,
+    summits=False,
+    exclusion_lists=None,
+    min_counts=None,
+    max_counts=None,
+    signal_groups=None,
+    controls=None,
+    control_groups=None,
+):
+    """A content hash of everything that decides what an entry holds.
+
+    Taken from the inputs and never from anything derived, so that a
+    hit costs no computation to recognise.
+
+    What is deliberately *not* in it is as much the point: the batch
+    size, the worker count, the shuffle and its seed, the negative
+    ratio and the reverse-complement flag all change what a run draws
+    and none of them change what the cache holds, so runs differing
+    only in those share one entry.
+
+    A stale hit would train on the wrong data and say nothing, which is
+    worse than rebuilding every time. So this is over-specified on
+    purpose: every locus file is hashed by content, and the order of
+    ``signals`` and ``controls`` is part of the identity because it is
+    the channel axis.
+
+    :param signals: The signal tracks, in channel order.
+    :param sequences: The reference, as a `str`, `bytes` or
+        `os.PathLike`.
+    :param peaks: The peak locus file, or an iterable of them.
+    :param negatives: The background locus file, or an iterable.
+    :param chroms: The contig subset, or ``None`` for all.
+    :param controls: The control tracks, in channel order, or ``None``.
+    :returns: The key, as a hex `str`.
+    :raises TypeError: if ``sequences`` is not a path.
+
+    .. rubric:: Implementation notes
+
+    A track is hashed by its record and a stat of every Parquet rather
+    than by its bytes: a track runs to gigabytes and hashing it would
+    cost more than the work being cached. The record already carries
+    the row count of every file and the pileup arguments that produced
+    them, so a regenerated track almost always changes it, and the
+    sizes and modification times catch one rewritten to the same shape.
+
+    The reference is hashed through its index, not its sequence --
+    tens of kilobytes against gigabytes -- and `chrom_lengths` reads
+    the index too, so it is the part that decides anything here.
+
+    The domain tag names this package. Upstream's entries and these are
+    not interchangeable, which is the deliberate opposite of the track
+    format's interoperability: a track costs minutes to rebuild and is
+    shared on purpose, an entry rebuilds in under a second, so sharing
+    buys nothing and risks serving bytes grouped by other code.
+    """
+
+    reference = fspath_or_none(sequences)
+    if reference is None:
+        raise TypeError(
+            "window_cache_key hashes the reference it was given: "
+            "sequences must be a str, bytes or os.PathLike, got "
+            "{}.".format(type(sequences).__name__)
+        )
+
+    digest = hashlib.sha256()
+    digest.update(b"quadrat-window-cache\x00")
+    digest.update(str(CACHE_VERSION).encode())
+
+    for label, loci in (("peaks", peaks), ("negatives", negatives)):
+        digest.update(label.encode())
+        named = fspath_or_none(loci)
+        for path in [named] if named is not None else list(loci or ()):
+            digest.update(os.path.abspath(path).encode())
+            _hash_file(digest, path)
+
+    digest.update(b"sequences")
+    digest.update(os.path.abspath(reference).encode())
+    # The index rather than `reference` itself, and through the
+    # normalized path: upstream built this name with `str(sequences)`,
+    # so a `bytes` reference hashed the index of a path spelled from a
+    # repr, which is absent -- and two different genomes then collided.
+    _hash_file(digest, reference + ".fai")
+
+    digest.update(
+        json.dumps(
+            {
+                "chroms": list(chroms) if chroms is not None else None,
+                "in_window": int(in_window),
+                "out_window": int(out_window),
+                "max_jitter": int(max_jitter),
+                "summits": bool(summits),
+                "min_counts": min_counts,
+                "max_counts": max_counts,
+                "signal_groups": list(signal_groups) if signal_groups else None,
+                "control_groups": list(control_groups) if control_groups else None,
+            },
+            sort_keys=True,
+        ).encode()
+    )
+
+    digest.update(b"exclusion")
+    for path in list(exclusion_lists or ()):
+        digest.update(os.path.abspath(path).encode())
+        _hash_file(digest, path)
+
+    for label, tracks in (("signals", signals), ("controls", controls)):
+        digest.update(label.encode())
+        for path in list(tracks or ()):
+            _hash_track(digest, path)
+
+    return digest.hexdigest()
+
+
+def read_window_cache(cache_dir, key):
+    """One persisted entry, or ``None`` where there is no verifiable one.
+
+    Anything unreadable, unverifiable, or built under another version
+    is reported as a miss, so the caller rebuilds rather than trusts
+    it. A miss is not an error: the entry is derived and rebuilding is
+    the correct answer to every doubt about it.
+
+    :param cache_dir: The directory holding entries.
+    :param key: The key, from `window_cache_key`.
+    :returns: ``(peak_windows, negative_windows, signal_cache,
+        control_cache)``, the last ``None`` where the entry carries no
+        controls; or ``None`` for a miss.
+    """
+
+    polars = import_on_first_use("polars")
+    root = os.path.join(cache_dir, key)
+
+    try:
+        # The record's shape, the listed files' presence and the schema
+        # version are `require_complete`'s to check, and it was written
+        # to accept an entry's record: no row total, and files listed
+        # with no count. Its refusal is converted rather than raised,
+        # because this answers a miss where it answers an error -- and
+        # every message it emits talks about a track and tells the
+        # caller to pile up the alignments again, which is the wrong
+        # instruction for an entry and must not reach anyone.
+        #
+        # `PolarsError` is in the catch and not implied by the other
+        # two: a truncated Parquet raises `ComputeError`, which derives
+        # straight from `Exception`, so the obvious tuple lets a
+        # corrupt window table out of here as an exception rather than
+        # answering the miss this function promises.
+        require_complete(root)
+        manifest = read_manifest(root)
+        if manifest.get("cache_version") != CACHE_VERSION:
+            return None
+        # The key the entry claims, against the one asked for, so a
+        # directory that was moved or renamed is a miss rather than a
+        # silently wrong hit.
+        if manifest.get("key") != key:
+            return None
+        peaks = polars.read_parquet(os.path.join(root, "peaks.parquet"))
+        negatives = polars.read_parquet(os.path.join(root, "negatives.parquet"))
+    except (OSError, ValueError, polars.exceptions.PolarsError):
+        return None
+
+    signal = WindowSignalCache.adopt(
+        os.path.join(root, "signal"),
+        manifest["signal_channels"],
+        meta=manifest.get("signal_meta"),
+    )
+    control = (
+        None
+        if manifest.get("control_channels") is None
+        else WindowSignalCache.adopt(
+            os.path.join(root, "control"),
+            manifest["control_channels"],
+            meta=manifest.get("control_meta"),
+        )
+    )
+    return peaks, negatives, signal, control
+
+
+def write_window_cache(
+    cache_dir, key, peak_windows, negative_windows, signal_arrays, control_arrays=None
+):
+    """Commit one entry, atomically. Answers its root, or ``None``.
+
+    Every failure is swallowed, which is the contract rather than an
+    oversight: a cache that cannot be written is a slower run, and an
+    unwritable directory must not take a training job down.
+
+    :param cache_dir: The directory to hold the entry. Created if
+        absent.
+    :param key: The key, from `window_cache_key`.
+    :param peak_windows: The peak window frame, as polars.
+    :param negative_windows: The background window frame, as polars.
+    :param signal_arrays: The five values `group_track` returns.
+    :param control_arrays: The same for the controls, or ``None``.
+    :returns: The entry root, or ``None`` if anything failed.
+
+    .. rubric:: Implementation notes
+
+    Commits through `stage_directory` and `commit_directory`, the same
+    pair a track is written with, so an entry and a track fail in the
+    same direction and the ordering argument has one home.
+
+    The window frames are written with polars rather than pandas,
+    which is what upstream used. pandas reaches Parquet through
+    pyarrow, and pyarrow arrives in this tree only under the ``pileup``
+    extra -- so on a base install an entry could be neither written nor
+    read, and because this swallows its failures that would have been
+    a silent permanent miss rather than an error.
+    """
+
+    root = os.path.join(cache_dir, key)
+    staging = None
+    try:
+        # Before staging, because the sweep globs and the directory
+        # creation both run against this parent.
+        os.makedirs(cache_dir, exist_ok=True)
+        staging = stage_directory(root)
+        os.makedirs(os.path.join(staging, "signal"))
+
+        peak_windows.write_parquet(os.path.join(staging, "peaks.parquet"))
+        negative_windows.write_parquet(os.path.join(staging, "negatives.parquet"))
+        write_cache_arrays(os.path.join(staging, "signal"), *signal_arrays[:4])
+        files = ["peaks.parquet", "negatives.parquet"]
+        files += [os.path.join("signal", name + ".npy") for name in _ARRAY_NAMES]
+        if control_arrays is not None:
+            os.makedirs(os.path.join(staging, "control"))
+            write_cache_arrays(os.path.join(staging, "control"), *control_arrays[:4])
+            files += [os.path.join("control", name + ".npy") for name in _ARRAY_NAMES]
+
+        commit_directory(
+            root,
+            staging,
+            {
+                # No row total, and every file listed with no count.
+                # That is the shape `require_complete` accepts for an
+                # entry: an absent total is what excuses absent counts,
+                # and a total of zero would be refused.
+                "version": MANIFEST_VERSION,
+                "files": {name: None for name in files},
+                "cache_version": CACHE_VERSION,
+                "key": key,
+                "signal_channels": int(signal_arrays[4]),
+                "control_channels": (
+                    None if control_arrays is None else int(control_arrays[4])
+                ),
+                "n_windows": int(len(peak_windows) + len(negative_windows)),
+                "created": time.time(),
+            },
+        )
+        return root
+    except Exception:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        return None
+
+
 def write_cache_arrays(root, offsets, pos, val, chan):
     """Write the four grouped arrays into ``root``, by their fixed names."""
 
@@ -491,6 +800,43 @@ def window_group_sums(windows, tracks, group_sizes):
             totals[rows, group_of[channel]] += cumulative[hi] - cumulative[lo]
 
     return torch.from_numpy(totals.astype(numpy.float32))
+
+
+def _hash_file(digest, path):
+    """Fold a file's bytes into ``digest``, or the fact of its absence."""
+
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        digest.update(b"<absent>")
+
+
+def _hash_track(digest, path):
+    """Fold a track's identity into ``digest``, without reading its rows.
+
+    Why the record and a stat rather than the bytes is `window_cache_key`'s
+    to say; this is the mechanism.
+    """
+
+    digest.update(os.path.abspath(path).encode())
+    manifest = read_manifest(path)
+    digest.update(
+        json.dumps(manifest, sort_keys=True).encode()
+        if manifest is not None
+        else b"<no manifest>"
+    )
+    try:
+        entries = sorted(os.listdir(path))
+    except OSError:
+        digest.update(b"<unreadable>")
+        return
+    for name in entries:
+        if not name.endswith(".parquet"):
+            continue
+        info = os.stat(os.path.join(path, name))
+        digest.update("{}:{}:{}".format(name, info.st_size, info.st_mtime_ns).encode())
 
 
 def _resolve_residency(residency=None):

@@ -18,15 +18,18 @@ fundamental failure.
 """
 
 import gc
+import inspect
+import json
 import multiprocessing
 import os
 import pickle
+import shutil
 
 import numpy
 import pytest
 
 from quadrat import cache, stores
-from tests import TWO_CONTIGS
+from tests import TWO_CONTIGS, builders
 
 # Channel 0 puts two rows inside one window and one on a second
 # contig; channel 1 interleaves with channel 0 inside that window and
@@ -911,3 +914,553 @@ class TestWindowSignalCache:
         # Assert
         assert restored.owns_scratch is False
         assert os.path.isdir(root)
+
+
+def inputs(root, *, peaks=(("chr1", 8, 16),), track_rows=None):
+    """One full input set for a key: a track, a reference and two locus files.
+
+    The reference is indexed, because the key hashes the index rather
+    than the sequence: without one, every spelling of the path hashes
+    as absent and a test comparing two spellings would agree for the
+    wrong reason.
+    """
+
+    pytest.importorskip("polars")
+    pytest.importorskip("pysam")
+    root = str(root)
+    return {
+        "signals": [
+            builders.write_track(
+                os.path.join(root, "s0.track.parquet"),
+                CHANNEL_0 if track_rows is None else track_rows,
+            )
+        ],
+        "sequences": builders.write_fasta(
+            os.path.join(root, "genome.fa"), {"chr1": 600, "chr2": 500}, index=True
+        ),
+        "peaks": builders.write_bed(os.path.join(root, "peaks.bed"), peaks),
+        "negatives": builders.write_bed(
+            os.path.join(root, "negatives.bed"), [("chr1", 100, 108)]
+        ),
+    }
+
+
+def test_default_cache_dir_should_follow_the_environment_on_every_call(monkeypatch):
+    """Test that the cache directory is read per call, not once.
+
+    Given:
+        A cache directory named in the environment, then renamed.
+    When:
+        The default is asked for after each.
+    Then:
+        It should follow, so a process that sets the variable after
+        importing this package is not left pointed at the real user
+        cache.
+
+    The suite's own guard rests on this: it assigns the variable before
+    anything imports the package, and a reader that resolved once at
+    import would have already answered.
+    """
+
+    # Arrange
+    monkeypatch.setenv("QUADRAT_CACHE_DIR", "/tmp/first")
+
+    # Act
+    first = cache.default_cache_dir()
+    monkeypatch.setenv("QUADRAT_CACHE_DIR", "/tmp/second")
+    second = cache.default_cache_dir()
+
+    # Assert
+    assert first == os.path.join("/tmp/first", "windows")
+    assert second == os.path.join("/tmp/second", "windows")
+
+
+def test_default_cache_dir_should_fall_back_to_the_xdg_convention(monkeypatch):
+    """Test where entries go with no variable of our own set.
+
+    Given:
+        No ``QUADRAT_CACHE_DIR`` and an ``XDG_CACHE_HOME``.
+    When:
+        The default is asked for.
+    Then:
+        It should sit under the XDG directory, named for this package,
+        so caching works with no configuration and relocating the
+        whole user cache relocates this too.
+    """
+
+    # Arrange
+    monkeypatch.delenv("QUADRAT_CACHE_DIR", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", "/tmp/xdg")
+
+    # Act & assert
+    assert cache.default_cache_dir() == os.path.join("/tmp/xdg", "quadrat", "windows")
+
+
+def test_window_cache_key_should_answer_the_same_key_for_the_same_inputs(tmp_path):
+    """Test that the key is a function of the inputs alone.
+
+    Given:
+        One input set.
+    When:
+        Its key is taken twice.
+    Then:
+        The two should agree, because a key that moved between calls
+        would make every run a cold build.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+
+    # Act & assert
+    assert cache.window_cache_key(**given) == cache.window_cache_key(**given)
+
+
+def test_window_cache_key_should_answer_the_same_key_for_every_path_shape(tmp_path):
+    """Test that the reference's spelling does not move the key.
+
+    Given:
+        One reference named as a `str` and as `bytes`.
+    When:
+        A key is taken with each.
+    Then:
+        They should agree, so a caller holding either shape Python
+        calls a path gets the same entry.
+
+    Upstream built the index's name with `str`, so a `bytes` reference
+    hashed the index of a path spelled from a repr -- which is absent,
+    and two different genomes therefore collided on it.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    encoded = dict(given, sequences=os.fsencode(given["sequences"]))
+
+    # Act & assert
+    assert cache.window_cache_key(**given) == cache.window_cache_key(**encoded)
+
+
+def test_window_cache_key_should_notice_a_reference_with_another_index(tmp_path):
+    """Test the key's sensitivity to the reference, through its index.
+
+    Given:
+        One input set whose reference index is replaced with another
+        genome's.
+    When:
+        Keys are taken before and after.
+    Then:
+        They should differ, because the index is what `chrom_lengths`
+        reads and so what decides the window geometry a reference
+        admits.
+
+    The index rather than the sequence: tens of kilobytes against
+    gigabytes, and the part that decides anything the cache holds.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    before = cache.window_cache_key(**given)
+
+    # Act
+    other = builders.write_fasta(str(tmp_path / "other.fa"), {"chr1": 700}, index=True)
+    shutil.copyfile(other + ".fai", given["sequences"] + ".fai")
+
+    # Assert
+    assert cache.window_cache_key(**given) != before
+
+
+def test_window_cache_key_should_refuse_a_reference_that_is_not_a_path(tmp_path):
+    """Test the refusal of a reference the key cannot hash.
+
+    Given:
+        A reference that is no kind of path.
+    When:
+        A key is taken.
+    Then:
+        It should raise `TypeError` naming the parameter, rather than
+        hashing a repr and answering a key that looks usable.
+    """
+
+    # Arrange
+    given = dict(inputs(tmp_path), sequences=42)
+
+    # Act & assert
+    with pytest.raises(TypeError, match="window_cache_key hashes"):
+        cache.window_cache_key(**given)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"in_window": 2000},
+        {"out_window": 900},
+        {"max_jitter": 400},
+        {"summits": True},
+        {"chroms": ["chr1"]},
+        {"signal_groups": [1]},
+    ],
+)
+def test_window_cache_key_should_notice_anything_that_moves_the_windows(
+    tmp_path, override
+):
+    """Test the key's sensitivity to the geometry.
+
+    Given:
+        One input set and one changed window argument.
+    When:
+        Keys are taken with and without it.
+    Then:
+        They should differ, because every one of these changes which
+        positions an entry holds and a shared key would serve the
+        wrong ones.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+
+    # Act & assert
+    assert cache.window_cache_key(**given) != cache.window_cache_key(
+        **dict(given, **override)
+    )
+
+
+def test_window_cache_key_should_notice_a_rewritten_track(tmp_path):
+    """Test the key's sensitivity to a track's contents.
+
+    Given:
+        An input set whose track is rewritten with different rows.
+    When:
+        Keys are taken before and after.
+    Then:
+        They should differ, so a re-piled corpus is not read through an
+        entry grouped from the previous one.
+
+    A track is hashed by its record and a stat of every file rather
+    than by its bytes, which is why this is worth pinning: the record
+    carries the row counts and the pileup arguments, so a regenerated
+    track almost always moves it.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    before = cache.window_cache_key(**given)
+
+    # Act
+    builders.write_track(given["signals"][0], [("chr1", 99, 1.0)])
+
+    # Assert
+    assert cache.window_cache_key(**given) != before
+
+
+def test_window_cache_key_should_notice_a_rewritten_locus_file(tmp_path):
+    """Test the key's sensitivity to a locus file's contents.
+
+    Given:
+        An input set whose peak file is rewritten in place.
+    When:
+        Keys are taken before and after.
+    Then:
+        They should differ, because the loci decide which windows exist
+        at all and the path alone would not have moved.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    before = cache.window_cache_key(**given)
+
+    # Act
+    builders.write_bed(given["peaks"], [("chr2", 20, 28)])
+
+    # Assert
+    assert cache.window_cache_key(**given) != before
+
+
+def test_window_cache_key_should_notice_the_channel_order(tmp_path):
+    """Test that reordering the channels changes the key.
+
+    Given:
+        Two tracks, in one order and then the other.
+    When:
+        Keys are taken for each.
+    Then:
+        They should differ, because the order is the channel axis and
+        an entry grouped in one order describes a different signal read
+        in the other.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    second = builders.write_track(str(tmp_path / "s1.track.parquet"), CHANNEL_1)
+    forward = dict(given, signals=[given["signals"][0], second])
+    reversed_order = dict(given, signals=[second, given["signals"][0]])
+
+    # Act & assert
+    assert cache.window_cache_key(**forward) != cache.window_cache_key(**reversed_order)
+
+
+def test_window_cache_key_should_take_no_argument_that_cannot_change_an_entry():
+    """Test what the key deliberately does not depend on.
+
+    Given:
+        The key's own parameter list.
+    When:
+        It is inspected.
+    Then:
+        It should name none of the batch size, worker count, shuffle,
+        seed, negative ratio or reverse-complement flag, because each
+        changes what a run draws and none changes what the cache holds.
+
+    Runs differing only in those share one entry, which is the point of
+    hashing the inputs rather than the run.
+    """
+
+    # Arrange
+    taken = set(inspect.signature(cache.window_cache_key).parameters)
+
+    # Act & assert
+    assert (
+        taken
+        & {
+            "batch_size",
+            "num_workers",
+            "shuffle",
+            "random_state",
+            "negative_ratio",
+            "reverse_complement",
+            "pin_memory",
+        }
+        == set()
+    )
+
+
+def test_write_window_cache_should_commit_an_entry_the_package_verifies(
+    tmp_path, tracks
+):
+    """Test that an entry is verifiable by the package's own verifier.
+
+    Given:
+        A grouped window set written as an entry.
+    When:
+        The package is asked to verify the entry complete.
+    Then:
+        It should pass, because the verifier was written to accept this
+        record: no row total, and every file listed with no count.
+
+    An absent total is what excuses the absent counts. A total of zero
+    would be refused, which is the reading this pins against.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    import quadrat
+
+    windows = frame([("chr1", 8, 16)])
+    grouped = cache.group_track(windows, tracks)
+
+    # Act
+    root = cache.write_window_cache(str(tmp_path), "deadbeef", windows, windows, grouped)
+
+    # Assert
+    assert root is not None
+    assert quadrat.require_complete(root) == root
+
+
+def test_read_window_cache_should_answer_what_was_written(tmp_path, tracks):
+    """Test the round trip, which is the whole contract.
+
+    Given:
+        An entry written from a grouped window set.
+    When:
+        It is read back.
+    Then:
+        Both window frames and the signal cache should match what was
+        committed, so a hit is indistinguishable from the cold build it
+        replaces.
+    """
+
+    # Arrange
+    windows = frame([("chr1", 8, 16), ("chr2", 0, 8)])
+    grouped = cache.group_track(windows, tracks)
+    built = cache.WindowSignalCache.from_arrays(grouped, residency="memory")
+    cache.write_window_cache(str(tmp_path), "key0", windows, windows, grouped)
+
+    # Act
+    peaks, negatives, signal, control = cache.read_window_cache(str(tmp_path), "key0")
+
+    # Assert
+    assert peaks.to_dicts() == windows.to_dicts()
+    assert negatives.to_dicts() == windows.to_dicts()
+    assert control is None
+    assert signal.window(0, 0, 8).tolist() == built.window(0, 0, 8).tolist()
+
+
+def test_read_window_cache_should_answer_the_controls_when_an_entry_carries_them(
+    tmp_path, tracks
+):
+    """Test an entry written with a control set.
+
+    Given:
+        An entry carrying both signal and control arrays.
+    When:
+        It is read back.
+    Then:
+        Both caches should come back, each reporting its own channel
+        count, because a control is grouped over the wider input window
+        and is a separate cache rather than more channels of the first.
+    """
+
+    # Arrange
+    windows = frame([("chr1", 8, 16)])
+    signal_arrays = cache.group_track(windows, tracks)
+    control_arrays = cache.group_track(windows, tracks[:1])
+    cache.write_window_cache(
+        str(tmp_path), "key1", windows, windows, signal_arrays, control_arrays
+    )
+
+    # Act
+    _, _, signal, control = cache.read_window_cache(str(tmp_path), "key1")
+
+    # Assert
+    assert (signal.n_channels, control.n_channels) == (2, 1)
+
+
+def test_read_window_cache_should_miss_a_directory_that_holds_no_entry(tmp_path):
+    """Test the read of a key that was never written.
+
+    Given:
+        An empty cache directory.
+    When:
+        Any key is read.
+    Then:
+        It should answer ``None``, so a cold cache is a miss rather
+        than an error the caller has to catch.
+    """
+
+    # Act & assert
+    assert cache.read_window_cache(str(tmp_path), "absent") is None
+
+
+@pytest.mark.parametrize(
+    "damage", ["remove_array", "remove_manifest", "wrong_cache_version", "wrong_key"]
+)
+def test_read_window_cache_should_miss_an_entry_it_cannot_trust(
+    tmp_path, tracks, damage
+):
+    """Test every way an entry is refused rather than read.
+
+    Given:
+        A committed entry, damaged one way: an array file removed, the
+        record removed, the record claiming another cache version, or
+        the record claiming another key.
+    When:
+        It is read.
+    Then:
+        It should answer ``None`` in every case, because a stale hit
+        would train on the wrong data and say nothing, which is worse
+        than rebuilding every time.
+    """
+
+    # Arrange
+    windows = frame([("chr1", 8, 16)])
+    grouped = cache.group_track(windows, tracks)
+    root = cache.write_window_cache(str(tmp_path), "key2", windows, windows, grouped)
+    marker = root + ".manifest.json"
+    if damage == "remove_array":
+        os.remove(os.path.join(root, "signal", "pos.npy"))
+    elif damage == "remove_manifest":
+        os.remove(marker)
+    else:
+        with open(marker) as handle:
+            record = json.load(handle)
+        record["cache_version" if damage == "wrong_cache_version" else "key"] = 99
+        with open(marker, "w") as handle:
+            json.dump(record, handle)
+
+    # Act & assert
+    assert cache.read_window_cache(str(tmp_path), "key2") is None
+
+
+def test_read_window_cache_should_miss_an_entry_whose_window_table_is_truncated(
+    tmp_path, tracks
+):
+    """Test an entry whose Parquet is present but unreadable.
+
+    Given:
+        A committed entry whose peak table has been truncated to
+        nothing.
+    When:
+        It is read.
+    Then:
+        It should answer ``None``, because the file being listed and
+        present is all the record can promise and the read is what
+        finds out otherwise.
+    """
+
+    # Arrange
+    windows = frame([("chr1", 8, 16)])
+    grouped = cache.group_track(windows, tracks)
+    root = cache.write_window_cache(str(tmp_path), "key3", windows, windows, grouped)
+    with open(os.path.join(root, "peaks.parquet"), "wb") as handle:
+        handle.write(b"not parquet")
+
+    # Act & assert
+    assert cache.read_window_cache(str(tmp_path), "key3") is None
+
+
+def test_write_window_cache_should_answer_none_when_it_cannot_write(tmp_path, tracks):
+    """Test what an unwritable cache directory does to a run.
+
+    Given:
+        A cache directory that cannot be written to.
+    When:
+        An entry is committed.
+    Then:
+        It should answer ``None`` rather than raise, because a cache
+        that cannot be written is a slower run and must not take a
+        training job down.
+    """
+
+    # Arrange
+    windows = frame([("chr1", 8, 16)])
+    grouped = cache.group_track(windows, tracks)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    os.chmod(str(locked), 0o500)
+
+    # Act
+    try:
+        answer = cache.write_window_cache(
+            str(locked / "under"), "key4", windows, windows, grouped
+        )
+    finally:
+        os.chmod(str(locked), 0o700)
+
+    # Assert
+    assert answer is None
+
+
+def test_write_window_cache_should_leave_no_staging_behind_when_it_fails(
+    tmp_path, tracks
+):
+    """Test that a failed commit leaves the directory clean.
+
+    Given:
+        A commit that fails part way through.
+    When:
+        It returns.
+    Then:
+        The cache directory should hold no staging sibling, so a run
+        that fails repeatedly does not fill the disk with half-written
+        entries.
+    """
+
+    # Arrange
+    windows = frame([("chr1", 8, 16)])
+    grouped = cache.group_track(windows, tracks)
+    broken = (grouped[0], grouped[1], grouped[2], grouped[3], object())
+
+    # Act
+    answer = cache.write_window_cache(str(tmp_path), "key5", windows, windows, broken)
+
+    # Assert
+    assert answer is None
+    assert [name for name in os.listdir(str(tmp_path)) if ".staging." in name] == []
