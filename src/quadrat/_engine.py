@@ -252,14 +252,16 @@ def import_on_first_use(name):
     except ImportError as error:
         if name in _PILEUP_EXTRA:
             raise ImportError(
-                "{} is needed to pile up alignments and is not "
+                "{} is needed to build tracks from alignments or to "
+                "group tracks into a window cache, and is not "
                 "installed. It belongs to quadrat's `pileup` extra: "
                 "install it with `uv sync --all-extras` in a checkout, "
                 'or `pip install "quadrat[pileup]"` once the extra\'s '
                 "git-pinned dependency reaches an index -- the comment "
                 "on `[tool.uv.sources]` in pyproject.toml says when. A "
-                "base install reads tracks that already exist and "
-                "cannot write new ones.".format(name)
+                "base install reads tracks that already exist, one "
+                "window at a time; building them and grouping them "
+                "both need this.".format(name)
             ) from error
         raise ImportError(
             "{} is declared as a dependency of quadrat and is not "

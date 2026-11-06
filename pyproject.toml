@@ -52,10 +52,12 @@ dependencies = [
     "pyfaidx>=0.9",
 ]
 
-# The engine that *builds* tracks, and nothing else. polars-bio reads
-# the alignments and giql transpiles the aggregate; neither is needed
-# to read a track that already exists, which is the line this extra
-# draws. polars and pyfaidx were here until the per-window readers
+# The engine. polars-bio reads the alignments; giql transpiles the
+# interval joins, which both the pileup's aggregate and the window
+# cache's grouping are built on. The line this extra draws is between
+# reading a track that already exists, which the base install does one
+# window at a time, and producing or grouping one, which needs an
+# engine. polars and pyfaidx were here until the per-window readers
 # landed and made them a base-install requirement.
 [project.optional-dependencies]
 pileup = [

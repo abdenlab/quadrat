@@ -25,7 +25,7 @@ import torch
 from tangermeme.utils import one_hot_encode
 
 from quadrat._engine import fspath_or_none, import_on_first_use
-from quadrat.tables import require_complete, track_chrom_path
+from quadrat.tables import TRACK_SUFFIX, require_complete, track_chrom_path
 
 
 # Defined ahead of the stores that use it, against the public-first
@@ -271,4 +271,67 @@ def chrom_plan(source, chrom):
         polars.scan_parquet(source)
         .filter(polars.col("chrom") == str(chrom))
         .select("pos", "value")
+    )
+
+
+def chrom_track(source, chrom):
+    """One track's sorted ``(pos, value)`` arrays for one contig, or ``None``.
+
+    What `chrom_plan` describes, collected and sorted. ``None`` means
+    the contig has nothing in this track, for the reasons stated there.
+
+    Sorted because both callers search it: the grouping takes the rows
+    inside a window with two ``searchsorted`` calls, and the group sums
+    take a prefix sum over it. The format writes each contig's file
+    sorted already, so this is a no-op on a track this package wrote
+    and a real sort only on a single-file table it did not.
+
+    :param source: The track, as a `str`.
+    :param chrom: The contig to read.
+    :returns: A ``(positions, values)`` pair of numpy arrays, or
+        ``None`` where the contig has no rows.
+    """
+
+    plan = chrom_plan(source, chrom)
+    if plan is None:
+        return None
+    table = plan.sort("pos").collect()
+    if table.height == 0:
+        return None
+    return table["pos"].to_numpy(), table["value"].to_numpy()
+
+
+def track_frame(source):
+    """One track as a single frame covering every contig it holds.
+
+    The whole-table counterpart of `chrom_plan`, for the callers that
+    filter on ``chrom`` themselves and want every contig visible at
+    once. A directory is globbed back together and verified complete; a
+    single-file table is scanned as it is; an in-memory polars frame is
+    taken as given, which is what lets a caller go from alignments to
+    tensors without a track on disk.
+
+    :param source: A track directory, a single Parquet file, or a
+        polars ``DataFrame`` or ``LazyFrame`` carrying ``chrom``,
+        ``pos`` and ``value``.
+    :returns: A polars ``LazyFrame``.
+    :raises TypeError: if ``source`` is none of those shapes.
+    :raises ValueError: if a track directory does not verify complete.
+    """
+
+    polars = import_on_first_use("polars")
+    path = fspath_or_none(source)
+    if path is not None:
+        if os.path.isdir(path):
+            require_complete(path)
+            return polars.scan_parquet(os.path.join(path, "*.parquet"))
+        return polars.scan_parquet(path)
+    if isinstance(source, polars.LazyFrame):
+        return source
+    if isinstance(source, polars.DataFrame):
+        return source.lazy()
+    raise TypeError(
+        "track_frame reads a track: a {} directory, a single Parquet "
+        "file, or an in-memory polars frame with chrom, pos and value "
+        "columns. Got {}.".format(TRACK_SUFFIX, type(source).__name__)
     )
