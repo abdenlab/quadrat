@@ -19,8 +19,7 @@ import pathlib
 import pytest
 
 import quadrat
-from quadrat import _engine, tables
-from quadrat._engine import fspath_or_none
+from quadrat import tables
 
 
 def manifest_for(table, rows, files):
@@ -259,64 +258,6 @@ def test_require_complete_should_raise_when_given_something_that_is_not_a_track(
     # Act & assert
     with pytest.raises(TypeError, match="require_complete verifies"):
         tables.require_complete(source)
-
-
-def test_require_complete_should_refuse_a_non_track_without_the_pileup_engine(mocker):
-    """Test the refusal a base install reaches.
-
-    Given:
-        An argument that is no kind of track, and no importable polars.
-    When:
-        Completeness is required.
-    Then:
-        It should raise `TypeError` about the argument rather than
-        `ImportError` about the engine.
-
-    The engine ships with the ``pileup`` extra, so a caller who only
-    reads tracks may not have it -- and the branch that recognises an
-    in-memory frame had to import polars to ask. Attempting that import
-    rather than assuming it is what keeps the documented refusal
-    reachable: without polars the argument cannot be a polars frame,
-    which is the whole of what the import was for.
-    """
-
-    # Arrange
-    mocker.patch.object(
-        _engine.importlib, "import_module", side_effect=ImportError("no polars")
-    )
-
-    # Act & assert
-    with pytest.raises(TypeError, match="require_complete verifies"):
-        tables.require_complete(42)
-
-
-def test_track_contigs_should_name_an_incomplete_install_when_polars_is_absent(mocker):
-    """Test what a reader says when a base dependency will not import.
-
-    Given:
-        A reader whose work needs polars, and no importable polars.
-    When:
-        It is called.
-    Then:
-        It should raise `ImportError` saying the environment is
-        incomplete rather than naming an extra to install.
-
-    polars is a base dependency, because reading a track is what the
-    base install is for. So its absence is a broken environment rather
-    than a minimal one, and pointing the caller at the ``pileup`` extra
-    would send them to install something that does not contain it.
-
-    Every deferred import goes through one seam, so this is also the
-    test that the seam refuses rather than letting a bare
-    ``ModuleNotFoundError`` out of the middle of a read.
-    """
-
-    # Arrange
-    mocker.patch.object(importlib, "import_module", side_effect=ImportError("no polars"))
-
-    # Act & assert
-    with pytest.raises(ImportError, match=r"polars is declared.*incomplete"):
-        tables.track_contigs(42)
 
 
 def test_require_complete_should_raise_when_the_manifest_lists_an_absent_file(
@@ -866,7 +807,7 @@ def test_the_table_readers_should_answer_alike_for_every_path_shape(name, tmp_pa
     for spelling, answer in zip(spellings, answers):
         if name == "require_complete":
             # It returns its argument, so compare the normalized form.
-            assert fspath_or_none(answer) == str(table), spelling
+            assert os.fsdecode(answer) == str(table), spelling
         else:
             assert answer == expected, spelling
 
@@ -927,6 +868,35 @@ def test_track_contigs_should_refuse_a_non_track_in_its_own_words():
     assert "signals" not in message
 
 
+def test_track_contigs_should_name_an_incomplete_install_when_polars_is_absent(mocker):
+    """Test what a reader says when a base dependency will not import.
+
+    Given:
+        A reader whose work needs polars, and no importable polars.
+    When:
+        It is called.
+    Then:
+        It should raise `ImportError` saying the environment is
+        incomplete rather than naming an extra to install.
+
+    polars is a base dependency, because reading a track is what the
+    base install is for. So its absence is a broken environment rather
+    than a minimal one, and pointing the caller at the ``pileup`` extra
+    would send them to install something that does not contain it.
+
+    Every deferred import goes through one seam, so this is also the
+    test that the seam refuses rather than letting a bare
+    ``ModuleNotFoundError`` out of the middle of a read.
+    """
+
+    # Arrange
+    mocker.patch.object(importlib, "import_module", side_effect=ImportError("no polars"))
+
+    # Act & assert
+    with pytest.raises(ImportError, match=r"polars is declared.*incomplete"):
+        tables.track_contigs(42)
+
+
 def test_track_contigs_should_read_a_single_file_table(tmp_path):
     """Test that the legacy single-file shape still answers.
 
@@ -980,3 +950,326 @@ def test_track_contigs_should_read_both_frame_shapes():
 
     # Assert
     assert eager == lazy == {"chr1", "chr2"}
+
+
+def staged_track(path, rows=(("chr1", 1, 2.0),)):
+    """Commit a one-contig track at ``path`` through the shared protocol."""
+
+    staging = tables.stage_directory(path)
+    with open(os.path.join(staging, "chr1.parquet"), "w") as handle:
+        handle.write("x")
+    tables.commit_directory(
+        path,
+        staging,
+        {"version": tables.MANIFEST_VERSION, "files": {"chr1.parquet": None}},
+    )
+    return path
+
+
+def siblings(directory, name):
+    """Return the entries in ``directory`` other than ``name`` and its manifest."""
+
+    return sorted(
+        entry
+        for entry in os.listdir(str(directory))
+        if entry != name and entry != name + tables.MANIFEST_SUFFIX
+    )
+
+
+def test_stage_directory_should_sweep_a_staging_sibling_a_killed_writer_left(tmp_path):
+    """Test what a new write does about an interrupted one's staging directory.
+
+    Given:
+        A staging sibling of the size of a whole channel, as a writer
+        killed before its rename leaves.
+    When:
+        A new write is staged on the same path.
+    Then:
+        The sibling should be gone, because a crash loop would
+        otherwise fill the disk a channel at a time.
+    """
+
+    # Arrange
+    path = str(tmp_path / "t.track.parquet")
+    stale = path + ".staging.deadbeef"
+    os.makedirs(stale)
+
+    # Act
+    tables.stage_directory(path)
+
+    # Assert
+    assert not os.path.exists(stale)
+
+
+def test_stage_directory_should_sweep_a_discard_sibling_a_killed_commit_left(tmp_path):
+    """Test what a new write does about an interrupted commit's discard directory.
+
+    Given:
+        A discard sibling, as a commit killed between its two renames
+        leaves.
+    When:
+        A new write is staged on the same path.
+    Then:
+        The sibling should be gone, for the same reason as a staging
+        one: nothing ever reads it and it is the size of a channel.
+    """
+
+    # Arrange
+    path = str(tmp_path / "t.track.parquet")
+    stale = path + ".trash.deadbeef"
+    os.makedirs(stale)
+
+    # Act
+    tables.stage_directory(path)
+
+    # Assert
+    assert not os.path.exists(stale)
+
+
+def test_stage_directory_should_sweep_a_manifest_temporary_a_killed_commit_left(
+    tmp_path,
+):
+    """Test what a new write does about an interrupted commit's record file.
+
+    Given:
+        The manifest's temporary file, as a commit killed between
+        writing it and renaming it onto the record leaves.
+    When:
+        A new write is staged on the same path.
+    Then:
+        It should be gone. It is small, and for a track it is one stray
+        file -- but a window cache commits through here under a cache
+        directory, one per failed key, and the write that leaves it
+        swallows its own failure, so nothing else would ever report or
+        reap them.
+    """
+
+    # Arrange
+    path = str(tmp_path / "t.track.parquet")
+    stale = path + tables.MANIFEST_SUFFIX + ".tmp"
+    with open(stale, "w") as handle:
+        handle.write("{")
+
+    # Act
+    tables.stage_directory(path)
+
+    # Assert
+    assert not os.path.exists(stale)
+
+
+def test_stage_directory_should_not_sweep_the_directory_it_just_made(tmp_path):
+    """Test the order of the sweep against the staging directory's creation.
+
+    Given:
+        A path with no siblings.
+    When:
+        A write is staged.
+    Then:
+        The staging directory should exist afterwards, because the
+        sweep runs before it is made and would otherwise reap it.
+    """
+
+    # Act
+    staging = tables.stage_directory(str(tmp_path / "t.track.parquet"))
+
+    # Assert
+    assert os.path.isdir(staging)
+
+
+def test_stage_directory_should_sweep_only_its_own_siblings(tmp_path):
+    """Test a path whose name carries glob metacharacters.
+
+    Given:
+        Two tracks whose names differ only in characters a glob reads
+        as wildcards, each with a staging sibling.
+    When:
+        A write is staged on the first.
+    Then:
+        Only the first's sibling should be swept, because a track name
+        is a caller's path and a cache entry's name is a hex digest
+        under a directory the caller chose -- an unescaped glob would
+        reap another write's staging directory or miss its own.
+    """
+
+    # Arrange
+    mine = str(tmp_path / "t[1].track.parquet")
+    theirs = str(tmp_path / "t1.track.parquet")
+    os.makedirs(mine + ".staging.aaaa")
+    os.makedirs(theirs + ".staging.bbbb")
+
+    # Act
+    tables.stage_directory(mine)
+
+    # Assert
+    assert not os.path.exists(mine + ".staging.aaaa")
+    assert os.path.isdir(theirs + ".staging.bbbb")
+
+
+def test_commit_directory_should_leave_a_verifiable_track_and_no_siblings(tmp_path):
+    """Test what a successful commit leaves behind.
+
+    Given:
+        A staged directory and its record.
+    When:
+        It is committed.
+    Then:
+        The track should verify and nothing should sit beside it,
+        because the discard copy is reaped only after the record lands.
+    """
+
+    # Arrange
+    path = str(tmp_path / "t.track.parquet")
+
+    # Act
+    staged_track(path)
+
+    # Assert
+    assert quadrat.require_complete(path) == path
+    assert siblings(tmp_path, "t.track.parquet") == []
+
+
+def test_commit_directory_should_replace_a_track_already_there(tmp_path):
+    """Test a commit onto a path that already holds a track.
+
+    Given:
+        A committed track, and a second write staged on the same path.
+    When:
+        The second is committed.
+    Then:
+        The path should hold the second write and verify, with no
+        discard or staging sibling left, so a rebuild in place is one
+        step for every reader of it.
+    """
+
+    # Arrange
+    path = str(tmp_path / "t.track.parquet")
+    staged_track(path)
+
+    # Act
+    staging = tables.stage_directory(path)
+    with open(os.path.join(staging, "chr2.parquet"), "w") as handle:
+        handle.write("y")
+    tables.commit_directory(
+        path,
+        staging,
+        {"version": tables.MANIFEST_VERSION, "files": {"chr2.parquet": None}},
+    )
+
+    # Assert
+    assert quadrat.require_complete(path) == path
+    assert os.listdir(path) == ["chr2.parquet"]
+    assert siblings(tmp_path, "t.track.parquet") == []
+
+
+def test_commit_directory_should_restore_the_previous_track_when_the_swap_fails(
+    tmp_path, mocker
+):
+    """Test a rebuild that cannot complete over a track that already exists.
+
+    Given:
+        A committed track, and a second write whose swap into place
+        fails after the previous directory has been moved aside.
+    When:
+        The commit runs.
+    Then:
+        It should raise, and the previous track's files should be back
+        where they were, with no staging or discard sibling left --
+        because a rebuild that fails must leave what was there rather
+        than destroy it, and a track costs minutes to rebuild. The
+        restored track should not verify, because its record was
+        removed before the swap and the commit cannot reconstruct one it
+        did not write.
+    """
+
+    # Arrange
+    path = str(tmp_path / "t.track.parquet")
+    staged_track(path)
+    staging = tables.stage_directory(path)
+    with open(os.path.join(staging, "chr2.parquet"), "w") as handle:
+        handle.write("y")
+    real = os.replace
+
+    def failing(src, dst):
+        if str(src) == staging:
+            raise OSError("no swap")
+        return real(src, dst)
+
+    mocker.patch.object(tables.os, "replace", side_effect=failing)
+
+    # Act
+    with pytest.raises(OSError, match="no swap"):
+        tables.commit_directory(
+            path,
+            staging,
+            {"version": tables.MANIFEST_VERSION, "files": {"chr2.parquet": None}},
+        )
+
+    # Assert
+    assert os.listdir(path) == ["chr1.parquet"]
+    assert siblings(tmp_path, "t.track.parquet") == []
+    with pytest.raises(ValueError, match="cannot be verified complete"):
+        quadrat.require_complete(path)
+
+
+def test_commit_directory_should_leave_an_unverifiable_track_when_the_record_fails(
+    tmp_path,
+):
+    """Test a commit whose record cannot be written after the swap.
+
+    Given:
+        A staged directory and a record holding a value JSON cannot
+        serialise.
+    When:
+        It is committed.
+    Then:
+        It should raise with the new directory already in place and no
+        record, so the track fails verification rather than reading as
+        complete -- which is the one direction a half-finished commit
+        is allowed to fail in.
+    """
+
+    # Arrange
+    path = str(tmp_path / "t.track.parquet")
+    staging = tables.stage_directory(path)
+    with open(os.path.join(staging, "chr1.parquet"), "w") as handle:
+        handle.write("x")
+
+    # Act
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        tables.commit_directory(
+            path,
+            staging,
+            {"version": tables.MANIFEST_VERSION, "files": {"chr1.parquet": object()}},
+        )
+
+    # Assert
+    assert os.listdir(path) == ["chr1.parquet"]
+    assert not os.path.exists(tables.manifest_path(path))
+    with pytest.raises(ValueError, match="cannot be verified complete"):
+        quadrat.require_complete(path)
+
+
+def test_commit_directory_should_replace_a_plain_file_sitting_where_it_goes(tmp_path):
+    """Test a commit onto a path holding a file rather than a directory.
+
+    Given:
+        A plain file where the track directory goes, as a single-file
+        table of the shape the readers also accept.
+    When:
+        A directory is committed there.
+    Then:
+        The file should be gone and the track should verify, because
+        the path names a track and not a shape.
+    """
+
+    # Arrange
+    path = str(tmp_path / "t.track.parquet")
+    with open(path, "w") as handle:
+        handle.write("single file")
+
+    # Act
+    staged_track(path)
+
+    # Assert
+    assert os.path.isdir(path)
+    assert quadrat.require_complete(path) == path
