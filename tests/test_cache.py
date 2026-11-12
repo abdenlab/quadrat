@@ -37,6 +37,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import pathlib
 import pickle
 import shutil
 import sys
@@ -51,7 +52,14 @@ from hypothesis import strategies as st
 
 import quadrat
 from quadrat import cache, stores
-from tests import FILE_BACKED, TWO_CONTIGS, builders, quadrat_tables, run_child
+from tests import (
+    FILE_BACKED,
+    TWO_CONTIGS,
+    builders,
+    quadrat_tables,
+    run_child,
+    window_frame,
+)
 
 # Channel 0 puts two rows inside one window and one on a second
 # contig; channel 1 interleaves with channel 0 inside that window and
@@ -138,34 +146,6 @@ def shaped_track(shape, path, rows):
     return eager if shape == "eager" else eager.lazy()
 
 
-def frame(rows, columns=("sig_start", "sig_end")):
-    """Return a window frame built from ``(chrom, start, end)`` rows."""
-
-    polars = pytest.importorskip("polars")
-    lo, hi = columns
-    return polars.DataFrame(
-        {
-            "chrom": [str(row[0]) for row in rows],
-            lo: [int(row[1]) for row in rows],
-            hi: [int(row[2]) for row in rows],
-        },
-        schema={"chrom": polars.Utf8, lo: polars.Int64, hi: polars.Int64},
-    )
-
-
-def held_track(rows):
-    """Return ``(chrom, pos, value)`` rows as an in-memory track, in the order given."""
-
-    return polars.DataFrame(
-        {
-            "chrom": [str(row[0]) for row in rows],
-            "pos": [int(row[1]) for row in rows],
-            "value": [float(row[2]) for row in rows],
-        },
-        schema={"chrom": polars.Utf8, "pos": polars.Int64, "value": polars.Float64},
-    )
-
-
 def densify(grouped, windows, columns=("sig_start", "sig_end")):
     """Return the dense array per window that a grouped result describes."""
 
@@ -188,6 +168,18 @@ window_sets = st.lists(
     ),
     min_size=0,
     max_size=8,
+)
+
+
+# Windows over a few contigs in any interleaving, as rows a window
+# frame is built from: any count including none.
+contig_window_rows = st.lists(
+    st.tuples(
+        st.sampled_from(["chr1", "chr2", "chr10", "chrX"]),
+        st.integers(min_value=0, max_value=600),
+        st.integers(min_value=0, max_value=600),
+    ),
+    max_size=40,
 )
 
 
@@ -254,6 +246,252 @@ def inputs(root, *, peaks=(("chr1", 8, 16),), track_rows=None):
     }
 
 
+def test_require_windows_should_accept_a_polars_frame():
+    """Test the windows check on the one type it admits.
+
+    Given:
+        A polars frame of windows.
+    When:
+        It is required to be one.
+    Then:
+        It should raise nothing.
+    """
+
+    # Act & assert
+    assert cache.require_windows("reader", window_frame([("chr1", 8, 16)])) is None
+
+
+def test_require_windows_should_raise_type_error_naming_the_caller_and_the_type():
+    """Test the windows check on a frame of another library.
+
+    Given:
+        A pandas frame of windows and the name of the function it was
+        given to.
+    When:
+        It is required to be a polars frame.
+    Then:
+        It should raise `TypeError` naming that function and the type
+        it got.
+    """
+
+    # Arrange
+    pandas = pytest.importorskip("pandas")
+    windows = pandas.DataFrame({"chrom": ["chr1"], "sig_start": [8], "sig_end": [16]})
+
+    # Act & assert
+    with pytest.raises(
+        TypeError, match=r"^reader takes a polars DataFrame of windows\. Got DataFrame\."
+    ):
+        cache.require_windows("reader", windows)
+
+
+@pytest.mark.parametrize(
+    "collection", [list, tuple, iter], ids=["list", "tuple", "iter"]
+)
+def test_track_list_should_answer_an_ordered_iterable_as_a_list_in_order(collection):
+    """Test what an ordered collection of tracks is normalised to.
+
+    Given:
+        Two track paths in a list, a tuple or an iterator.
+    When:
+        They are normalised.
+    Then:
+        It should answer a list holding both, in the order given.
+    """
+
+    # Act
+    tracks = cache.track_list("reader", "tracks", collection(["a.parquet", "b.parquet"]))
+
+    # Assert
+    assert tracks == ["a.parquet", "b.parquet"]
+
+
+@pytest.mark.parametrize(
+    "single",
+    [
+        "a.parquet",
+        b"a.parquet",
+        pathlib.Path("a.parquet"),
+        builders.track_rows_frame([]),
+        builders.track_rows_frame([]).lazy(),
+    ],
+    ids=["str", "bytes", "path", "frame", "lazy"],
+)
+def test_track_list_should_raise_type_error_for_a_single_track(single):
+    """Test the refusal of one track given where a collection is taken.
+
+    Given:
+        One track, as a path of any shape or as a polars frame, eager
+        or lazy, with the function and argument it was given to.
+    When:
+        It is normalised.
+    Then:
+        It should raise `TypeError` naming the function and the
+        argument and saying to pass a one-element list.
+    """
+
+    # Act & assert
+    with pytest.raises(
+        TypeError,
+        match=r"^reader reads one track per channel: `signals` must be a "
+        r"sequence of tracks, not a single one\. Pass a one-element list",
+    ):
+        cache.track_list("reader", "signals", single)
+
+
+def test_track_list_should_raise_type_error_for_a_pandas_frame():
+    """Test the refusal of a frame of another library given as the tracks.
+
+    Given:
+        A pandas frame carrying a track's three columns.
+    When:
+        It is normalised.
+    Then:
+        It should raise `TypeError` naming the function, the argument
+        and the frame, rather than answer its column names as tracks.
+    """
+
+    # Arrange
+    pandas = pytest.importorskip("pandas")
+    held = pandas.DataFrame({"chrom": ["chr1"], "pos": [5], "value": [1.0]})
+
+    # Act & assert
+    with pytest.raises(
+        TypeError,
+        match=r"^reader reads one track per channel: `signals` must be a "
+        r"sequence of tracks, and a pandas DataFrame is neither",
+    ):
+        cache.track_list("reader", "signals", held)
+
+
+@pytest.mark.parametrize(
+    "unordered",
+    [
+        {"a.parquet", "b.parquet"},
+        frozenset(["a.parquet", "b.parquet"]),
+        {"a.parquet": 0, "b.parquet": 1},
+    ],
+    ids=["set", "frozenset", "dict"],
+)
+def test_track_list_should_raise_type_error_for_an_unordered_collection(unordered):
+    """Test the refusal of tracks in a collection that states no order.
+
+    Given:
+        Two track paths in a set, a frozenset, or as the keys of a
+        mapping.
+    When:
+        They are normalised.
+    Then:
+        It should raise `TypeError` naming the function, the argument
+        and the type, and saying the order of the tracks is the
+        channel axis.
+    """
+
+    # Act & assert
+    with pytest.raises(
+        TypeError,
+        match=r"^reader reads one track per channel, and the order of "
+        r"`signals` is the channel axis: a (set|frozenset|dict) states no "
+        r"order",
+    ):
+        cache.track_list("reader", "signals", unordered)
+
+
+def test_window_columns_should_group_interleaved_rows_by_contig_name():
+    """Test the decomposition of a window set whose contigs alternate.
+
+    Given:
+        Five windows on ``chr2``, ``chr1``, ``chr2``, ``chr10`` and
+        ``chr1``, in that row order.
+    When:
+        The window set is decomposed.
+    Then:
+        It should answer the bounds of every window as ``int64`` in row
+        order, and pair ``chr1`` with rows 1 and 4, ``chr10`` with row
+        3 and ``chr2`` with rows 0 and 2, in that order.
+    """
+
+    # Arrange
+    windows = window_frame(
+        [
+            ("chr2", 0, 10),
+            ("chr1", 20, 30),
+            ("chr2", 40, 50),
+            ("chr10", 60, 70),
+            ("chr1", 80, 90),
+        ]
+    )
+
+    # Act
+    starts, ends, groups = cache.window_columns(windows, ("sig_start", "sig_end"))
+
+    # Assert
+    assert starts.dtype == numpy.int64 and ends.dtype == numpy.int64
+    assert starts.tolist() == [0, 20, 40, 60, 80]
+    assert ends.tolist() == [10, 30, 50, 70, 90]
+    assert [(str(chrom), rows.tolist()) for chrom, rows in groups] == [
+        ("chr1", [1, 4]),
+        ("chr10", [3]),
+        ("chr2", [0, 2]),
+    ]
+
+
+def test_window_columns_should_answer_no_groups_for_no_windows():
+    """Test the decomposition of a window set with no window in it.
+
+    Given:
+        A window frame with no rows.
+    When:
+        The window set is decomposed.
+    Then:
+        It should answer empty ``int64`` bounds and no groups.
+    """
+
+    # Arrange
+    windows = window_frame([])
+
+    # Act
+    starts, ends, groups = cache.window_columns(windows, ("sig_start", "sig_end"))
+
+    # Assert
+    assert starts.dtype == numpy.int64 and ends.dtype == numpy.int64
+    assert (len(starts), len(ends)) == (0, 0)
+    assert groups == []
+
+
+@settings(max_examples=100, deadline=None)
+@given(rows=contig_window_rows)
+def test_window_columns_should_partition_the_rows_by_contig_for_any_window_set(rows):
+    """Test the grouping's invariants over any window set.
+
+    Given:
+        Any number of windows, including none, over a few contigs in
+        any interleaving.
+    When:
+        The window set is decomposed.
+    Then:
+        Every group should hold ascending row indices of windows on its
+        own contig, the groups should run in ascending order of contig
+        name, each contig should appear once, and together the groups
+        should hold every row exactly once.
+    """
+
+    # Arrange
+    windows = window_frame(rows)
+
+    # Act
+    _, _, groups = cache.window_columns(windows, ("sig_start", "sig_end"))
+
+    # Assert
+    names = [str(chrom) for chrom, _ in groups]
+    assert names == sorted(set(names))
+    for chrom, indices in groups:
+        assert indices.tolist() == sorted(indices.tolist())
+        assert all(rows[index][0] == str(chrom) for index in indices)
+    held = [int(index) for _, indices in groups for index in indices]
+    assert sorted(held) == list(range(len(rows)))
+
+
 def test_group_track_should_index_its_offsets_by_window_alone(tracks):
     """Test the shape and dtype of the grouped layout.
 
@@ -278,7 +516,7 @@ def test_group_track_should_index_its_offsets_by_window_alone(tracks):
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 395, 405)])
+    windows = window_frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 395, 405)])
 
     # Act
     offsets, pos, val, chan, n_channels = cache.group_track(windows, tracks)
@@ -311,7 +549,7 @@ def test_group_track_should_densify_to_what_a_coordinate_read_returns(tracks):
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 395, 405)])
+    windows = window_frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 395, 405)])
     store = stores.TrackStore(tracks)
 
     # Act
@@ -339,7 +577,7 @@ def test_group_track_should_offset_positions_from_the_windows_own_start(tracks):
     """
 
     # Arrange
-    windows = frame([("chr1", 396, 404)])
+    windows = window_frame([("chr1", 396, 404)])
 
     # Act
     offsets, pos, val, chan, _ = cache.group_track(windows, tracks)
@@ -365,7 +603,7 @@ def test_group_track_should_keep_only_what_the_windows_cover(tracks):
     """
 
     # Arrange
-    windows = frame([("chr1", 11, 13)])
+    windows = window_frame([("chr1", 11, 13)])
 
     # Act
     offsets, pos, val, chan, _ = cache.group_track(windows, tracks)
@@ -392,7 +630,7 @@ def test_group_track_should_cover_a_window_closed_at_its_start_and_open_at_its_e
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
 
     # Act
     offsets, pos, val, chan, _ = cache.group_track(windows, edge_tracks)
@@ -427,11 +665,15 @@ def test_group_track_should_answer_the_same_arrays_however_the_rows_are_ordered(
         [("chr1", 10, 5.0), ("chr1", 12, 6.0), ("chr1", 14, 9.0)],
         [("chr1", 12, 8.0), ("chr1", 10, 7.0), ("chr1", 11, 0.5)],
     ]
-    windows = frame([("chr1", 8, 16), ("chr1", 9, 17)])
+    windows = window_frame([("chr1", 8, 16), ("chr1", 9, 17)])
 
     # Act
-    forward = cache.group_track(windows, [held_track(rows) for rows in channels])
-    backward = cache.group_track(windows, [held_track(rows[::-1]) for rows in channels])
+    forward = cache.group_track(
+        windows, [builders.track_rows_frame(rows) for rows in channels]
+    )
+    backward = cache.group_track(
+        windows, [builders.track_rows_frame(rows[::-1]) for rows in channels]
+    )
 
     # Assert
     for name, one, other in zip(("offsets", "pos", "val", "chan"), forward, backward):
@@ -478,13 +720,17 @@ def test_group_track_should_answer_the_same_arrays_for_any_order_of_the_rows(
 
     # Arrange
     pytest.importorskip("polars_bio")
-    windows = frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
+    windows = window_frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
     drawn = [[("chr1", pos, value) for pos, value in rows] for rows in channels]
     permuted = [data.draw(st.permutations(rows)) for rows in drawn]
 
     # Act
-    forward = cache.group_track(windows, [held_track(rows) for rows in drawn])
-    shuffled = cache.group_track(windows, [held_track(rows) for rows in permuted])
+    forward = cache.group_track(
+        windows, [builders.track_rows_frame(rows) for rows in drawn]
+    )
+    shuffled = cache.group_track(
+        windows, [builders.track_rows_frame(rows) for rows in permuted]
+    )
 
     # Assert
     for name, one, other in zip(("offsets", "pos", "val", "chan"), forward, shuffled):
@@ -507,7 +753,7 @@ def test_group_track_should_store_a_position_once_per_window_that_covers_it(trac
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16), ("chr1", 9, 17)])
+    windows = window_frame([("chr1", 8, 16), ("chr1", 9, 17)])
 
     # Act
     offsets, pos, val, chan, _ = cache.group_track(windows, tracks)
@@ -548,7 +794,7 @@ def test_group_track_should_hold_an_empty_run_for_a_zero_length_window(tracks):
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16), ("chr1", 12, 12), ("chr1", 11, 13)])
+    windows = window_frame([("chr1", 8, 16), ("chr1", 12, 12), ("chr1", 11, 13)])
 
     # Act
     offsets, _, _, _, _ = cache.group_track(windows, tracks)
@@ -574,7 +820,7 @@ def test_group_track_should_hold_an_empty_run_for_a_contig_no_track_has(tracks):
     """
 
     # Arrange
-    windows = frame([("chr3", 0, 8), ("chr1", 8, 16)])
+    windows = window_frame([("chr3", 0, 8), ("chr1", 8, 16)])
 
     # Act
     offsets, _, _, _, _ = cache.group_track(windows, tracks)
@@ -598,7 +844,7 @@ def test_group_track_should_read_a_track_it_is_handed_in_memory(tracks):
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     held = stores.track_frame(tracks[0]).collect()
 
     # Act
@@ -662,7 +908,7 @@ def test_group_track_should_count_a_trailing_channel_that_recorded_nothing(corpu
 
     # Arrange
     pytest.importorskip("polars_bio")
-    windows = frame([("chr2", 0, 8)])
+    windows = window_frame([("chr2", 0, 8)])
 
     # Act
     grouped = cache.group_track(windows, corpus.tracks)
@@ -686,7 +932,7 @@ def test_group_track_should_answer_empty_arrays_for_no_windows(tracks):
     """
 
     # Act
-    offsets, pos, val, chan, n_channels = cache.group_track(frame([]), tracks)
+    offsets, pos, val, chan, n_channels = cache.group_track(window_frame([]), tracks)
 
     # Assert
     assert offsets.tolist() == [0]
@@ -722,7 +968,7 @@ def test_group_track_should_group_a_contig_only_some_channels_record(tmp_path):
         ),
         shaped_track("directory", tmp_path / "t2", [("chr1", 900, 9.0)]),
     ]
-    windows = frame([("chr1", 8, 16), ("chr2", 0, 8)])
+    windows = window_frame([("chr1", 8, 16), ("chr2", 0, 8)])
 
     # Act
     offsets, pos, val, chan, n_channels = cache.group_track(windows, tracks)
@@ -764,7 +1010,7 @@ def test_group_track_should_hold_the_layout_invariants_for_any_window_set(tracks
     """
 
     # Arrange
-    windows = frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
+    windows = window_frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
 
     # Act
     offsets, pos, val, chan, n_channels = cache.group_track(windows, tracks)
@@ -795,7 +1041,7 @@ def test_group_track_should_densify_to_the_reader_for_any_window_set(tracks, spa
     """
 
     # Arrange
-    windows = frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
+    windows = window_frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
     store = stores.TrackStore(tracks)
 
     # Act
@@ -833,7 +1079,7 @@ def test_group_track_should_refuse_more_channels_than_the_index_holds():
     with pytest.raises(
         ValueError, match=r"more channels than .* 32768 against a limit of 32767"
     ):
-        cache.group_track(frame([("chr1", 8, 16)]), too_many)
+        cache.group_track(window_frame([("chr1", 8, 16)]), too_many)
 
 
 def test_group_track_should_allow_as_many_channels_as_the_index_holds():
@@ -859,7 +1105,7 @@ def test_group_track_should_allow_as_many_channels_as_the_index_holds():
 
     # Act & assert
     with pytest.raises(FileNotFoundError, match="unread"):
-        cache.group_track(frame([("chr1", 8, 16)]), at_the_limit)
+        cache.group_track(window_frame([("chr1", 8, 16)]), at_the_limit)
 
 
 def test_group_track_should_refuse_a_windows_frame_it_cannot_persist(tracks):
@@ -891,6 +1137,35 @@ def test_group_track_should_refuse_a_windows_frame_it_cannot_persist(tracks):
         cache.group_track(windows, tracks)
 
 
+@pytest.mark.parametrize(
+    "single",
+    [str, os.fsencode, pathlib.Path, polars.read_parquet, polars.scan_parquet],
+    ids=["str", "bytes", "path", "frame", "lazy"],
+)
+def test_group_track_should_raise_type_error_when_given_a_single_track(tmp_path, single):
+    """Test the grouping's answer for one track where a collection is taken.
+
+    Given:
+        A single-file track, given alone as a path of any shape or as
+        a frame, eager or lazy, rather than in a list.
+    When:
+        A window set is grouped over it.
+    Then:
+        It should raise `TypeError` naming the function and saying to
+        pass a one-element list, rather than walk the track as a
+        collection of tracks.
+    """
+
+    # Arrange
+    flat = builders.write_flat_track(str(tmp_path / "flat.parquet"), CHANNEL_0)
+
+    # Act & assert
+    with pytest.raises(
+        TypeError, match="group_track reads one track per channel.*one-element list"
+    ):
+        cache.group_track(window_frame([("chr1", 8, 16)]), single(flat))
+
+
 def test_group_track_should_refuse_a_track_it_cannot_verify_complete(tmp_path):
     """Test the grouping's answer for a track that does not verify.
 
@@ -918,7 +1193,7 @@ def test_group_track_should_refuse_a_track_it_cannot_verify_complete(tmp_path):
 
     # Act & assert
     with pytest.raises(ValueError, match="cannot be verified complete"):
-        cache.group_track(frame([("chr1", 8, 16)]), [root])
+        cache.group_track(window_frame([("chr1", 8, 16)]), [root])
 
 
 def test_group_track_should_release_the_tables_it_registers(tracks):
@@ -944,7 +1219,7 @@ def test_group_track_should_release_the_tables_it_registers(tracks):
 
     # Arrange
     pb = pytest.importorskip("polars_bio")
-    windows = frame([("chr1", 8, 16), ("chr2", 0, 8)])
+    windows = window_frame([("chr1", 8, 16), ("chr2", 0, 8)])
     before = quadrat_tables(pb)
 
     # Act
@@ -973,7 +1248,7 @@ def test_group_track_should_release_the_tables_it_registered_when_a_later_one_is
 
     # Arrange
     pb = pytest.importorskip("polars_bio")
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     before = quadrat_tables(pb)
     register = pb.from_polars
     calls = []
@@ -1056,7 +1331,7 @@ def test_window_group_sums_should_total_each_group_over_its_channels(tracks):
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16), ("chr2", 0, 8)])
+    windows = window_frame([("chr1", 8, 16), ("chr2", 0, 8)])
 
     # Act
     totals = cache.window_group_sums(windows, tracks, [2])
@@ -1078,7 +1353,7 @@ def test_window_group_sums_should_keep_the_groups_apart(tracks):
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
 
     # Act
     totals = cache.window_group_sums(windows, tracks, [1, 1])
@@ -1104,7 +1379,7 @@ def test_window_group_sums_should_total_a_window_closed_at_its_start_and_open_at
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
 
     # Act
     totals = cache.window_group_sums(windows, edge_tracks, [1])
@@ -1129,7 +1404,7 @@ def test_window_group_sums_should_answer_an_empty_total_for_no_windows(tracks):
     """
 
     # Act
-    totals = cache.window_group_sums(frame([]), tracks, [2])
+    totals = cache.window_group_sums(window_frame([]), tracks, [2])
 
     # Assert
     assert tuple(totals.shape) == (0, 1)
@@ -1155,7 +1430,7 @@ def test_window_group_sums_should_pool_a_group_that_starts_past_channel_zero(
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
 
     # Act
     totals = cache.window_group_sums(windows, three_channel.tracks, [1, 2])
@@ -1185,7 +1460,7 @@ def test_window_group_sums_should_agree_with_the_grouped_runs_it_totals(tmp_path
         shaped_track(shape, tmp_path / "t0", CHANNEL_0),
         shaped_track(shape, tmp_path / "t1", CHANNEL_1),
     ]
-    windows = frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 395, 405)])
+    windows = window_frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 395, 405)])
     offsets, _, val, _, _ = cache.group_track(windows, tracks)
 
     # Act
@@ -1213,8 +1488,8 @@ def test_window_group_sums_should_total_a_window_the_same_however_it_was_batched
     """
 
     # Arrange
-    alone = frame([("chr1", 8, 16)])
-    batched = frame([("chr2", 0, 8), ("chr1", 8, 16), ("chr1", 395, 405)])
+    alone = window_frame([("chr1", 8, 16)])
+    batched = window_frame([("chr2", 0, 8), ("chr1", 8, 16), ("chr1", 395, 405)])
 
     # Act
     one = cache.window_group_sums(alone, tracks, [2])
@@ -1240,7 +1515,7 @@ def test_window_group_sums_should_total_a_position_recorded_twice(duplicate_trac
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
 
     # Act
     totals = cache.window_group_sums(windows, duplicate_tracks, [1])
@@ -1266,7 +1541,7 @@ def test_window_group_sums_should_refuse_a_grouping_that_misses_a_channel(tracks
     with pytest.raises(
         ValueError, match="channel_group_sizes sums to 1 and there are 2 tracks"
     ):
-        cache.window_group_sums(frame([("chr1", 8, 16)]), tracks, [1])
+        cache.window_group_sums(window_frame([("chr1", 8, 16)]), tracks, [1])
 
 
 def test_window_group_sums_should_refuse_a_wrong_grouping_with_no_windows(tracks):
@@ -1287,7 +1562,28 @@ def test_window_group_sums_should_refuse_a_wrong_grouping_with_no_windows(tracks
 
     # Act & assert
     with pytest.raises(ValueError, match="channel_group_sizes sums to 1"):
-        cache.window_group_sums(frame([]), tracks, [1])
+        cache.window_group_sums(window_frame([]), tracks, [1])
+
+
+def test_window_group_sums_should_raise_type_error_when_given_a_single_track(tracks):
+    """Test the group totals' answer for one track where a collection is taken.
+
+    Given:
+        A single track path rather than a list of them.
+    When:
+        Its windows are totalled.
+    Then:
+        It should raise `TypeError` naming the function and saying to
+        pass a one-element list, rather than read each character of
+        the path as a track.
+    """
+
+    # Act & assert
+    with pytest.raises(
+        TypeError,
+        match="window_group_sums reads one track per channel.*one-element list",
+    ):
+        cache.window_group_sums(window_frame([("chr1", 8, 16)]), tracks[0], [1])
 
 
 def test_window_group_sums_should_refuse_a_track_it_cannot_verify_complete(tmp_path):
@@ -1315,7 +1611,7 @@ def test_window_group_sums_should_refuse_a_track_it_cannot_verify_complete(tmp_p
 
     # Act & assert
     with pytest.raises(ValueError, match="cannot be verified complete"):
-        cache.window_group_sums(frame([("chr1", 8, 16)]), [root], [1])
+        cache.window_group_sums(window_frame([("chr1", 8, 16)]), [root], [1])
 
 
 def test_array_meta_should_count_windows_from_the_offsets_and_sites_from_the_rows():
@@ -1392,7 +1688,7 @@ def test_write_cache_arrays_should_write_the_four_the_layout_names(tmp_path, tra
     """
 
     # Arrange
-    grouped = cache.group_track(frame([("chr1", 8, 16)]), tracks)
+    grouped = cache.group_track(window_frame([("chr1", 8, 16)]), tracks)
     root = str(tmp_path / "arrays")
     os.makedirs(root)
 
@@ -1475,7 +1771,7 @@ class TestWindowSignalCache:
 
         # Arrange
         monkeypatch.setenv("QUADRAT_SCRATCH_DIR", str(tmp_path))
-        grouped = cache.group_track(frame([("chr1", 8, 16)]), tracks)
+        grouped = cache.group_track(window_frame([("chr1", 8, 16)]), tracks)
 
         # Act
         made = cache.WindowSignalCache.from_arrays(grouped, residency="mapped")
@@ -1500,7 +1796,7 @@ class TestWindowSignalCache:
 
         # Arrange
         monkeypatch.setenv("QUADRAT_SCRATCH_DIR", "")
-        grouped = cache.group_track(frame([("chr1", 8, 16)]), tracks)
+        grouped = cache.group_track(window_frame([("chr1", 8, 16)]), tracks)
 
         # Act
         made = cache.WindowSignalCache.from_arrays(grouped, residency="mapped")
@@ -1635,7 +1931,7 @@ class TestWindowSignalCache:
 
         # Act
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]),
+            window_frame([("chr1", 8, 16)]),
             tracks,
             residency="mapped",
             scratch_dir=str(chosen),
@@ -1666,7 +1962,7 @@ class TestWindowSignalCache:
 
         # Act
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="mapped"
+            window_frame([("chr1", 8, 16)]), tracks, residency="mapped"
         )
 
         # Assert
@@ -1689,7 +1985,7 @@ class TestWindowSignalCache:
         mocker.patch.object(multiprocessing, "get_start_method", return_value="fork")
 
         # Act
-        built = cache.WindowSignalCache.build(frame([("chr1", 8, 16)]), tracks)
+        built = cache.WindowSignalCache.build(window_frame([("chr1", 8, 16)]), tracks)
 
         # Assert
         assert built.mapped_dir is None
@@ -1715,7 +2011,7 @@ class TestWindowSignalCache:
         mocker.patch.object(multiprocessing, "get_start_method", return_value=method)
 
         # Act
-        built = cache.WindowSignalCache.build(frame([("chr1", 8, 16)]), tracks)
+        built = cache.WindowSignalCache.build(window_frame([("chr1", 8, 16)]), tracks)
 
         # Assert
         assert built.mapped_dir is not None
@@ -1754,10 +2050,30 @@ class TestWindowSignalCache:
         )
 
         # Act
-        built = cache.WindowSignalCache.build(frame([("chr1", 8, 16)]), tracks)
+        built = cache.WindowSignalCache.build(window_frame([("chr1", 8, 16)]), tracks)
 
         # Assert
         assert (built.mapped_dir is not None) is mapped
+
+    def test_build_should_raise_type_error_when_given_a_single_track(self, tracks):
+        """Test the build's answer for one track where a collection is taken.
+
+        Given:
+            A single track path rather than a list of them.
+        When:
+            A cache is built over it.
+        Then:
+            It should raise `TypeError` naming the build and saying to
+            pass a one-element list.
+        """
+
+        # Act & assert
+        with pytest.raises(
+            TypeError,
+            match=r"WindowSignalCache\.build reads one track per channel.*"
+            "one-element list",
+        ):
+            cache.WindowSignalCache.build(window_frame([("chr1", 8, 16)]), tracks[0])
 
     def test_build_should_refuse_an_unknown_residency(self, tracks):
         """Test the refusal of a residency that is neither.
@@ -1776,7 +2092,7 @@ class TestWindowSignalCache:
             ValueError, match=r"residency must be one of 'memory', 'mapped' or None"
         ):
             cache.WindowSignalCache.build(
-                frame([("chr1", 8, 16)]), tracks, residency="mmap"
+                window_frame([("chr1", 8, 16)]), tracks, residency="mmap"
             )
 
     @pytest.mark.packaging
@@ -1856,7 +2172,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="mapped"
+            window_frame([("chr1", 8, 16)]), tracks, residency="mapped"
         )
         root = built.mapped_dir
         expected = built.window(0, 0, 8).numpy()
@@ -1893,7 +2209,7 @@ class TestWindowSignalCache:
         # Act
         with pytest.raises(OSError, match="disk full"):
             cache.WindowSignalCache.build(
-                frame([("chr1", 8, 16)]),
+                window_frame([("chr1", 8, 16)]),
                 tracks,
                 residency="mapped",
                 scratch_dir=str(tmp_path),
@@ -1919,7 +2235,7 @@ class TestWindowSignalCache:
         """
 
         # Arrange
-        grouped = cache.group_track(frame([("chr1", 8, 16)]), tracks)
+        grouped = cache.group_track(window_frame([("chr1", 8, 16)]), tracks)
         root = str(tmp_path / "entry")
         os.makedirs(root)
         cache.write_cache_arrays(root, *grouped[:4])
@@ -1952,7 +2268,7 @@ class TestWindowSignalCache:
         """
 
         # Arrange
-        grouped = cache.group_track(frame([("chr1", 8, 16)]), tracks)
+        grouped = cache.group_track(window_frame([("chr1", 8, 16)]), tracks)
         root = str(tmp_path / "shared")
         os.makedirs(root)
         cache.write_cache_arrays(root, *grouped[:4])
@@ -1988,7 +2304,7 @@ class TestWindowSignalCache:
 
         # Act
         built = cache.WindowSignalCache.build(
-            frame([("chr2", 0, 8)]), corpus.tracks, residency="memory"
+            window_frame([("chr2", 0, 8)]), corpus.tracks, residency="memory"
         )
 
         # Assert
@@ -2010,7 +2326,7 @@ class TestWindowSignalCache:
         """
 
         # Arrange
-        windows = frame([("chr1", 8, 16), ("chr2", 0, 8)])
+        windows = window_frame([("chr1", 8, 16), ("chr2", 0, 8)])
         grouped = cache.group_track(windows, tracks)
 
         # Act
@@ -2038,7 +2354,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act & assert
@@ -2061,7 +2377,7 @@ class TestWindowSignalCache:
         """
 
         # Arrange
-        windows = frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 396, 404)])
+        windows = window_frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 396, 404)])
         store = stores.TrackStore(tracks)
 
         # Act
@@ -2103,7 +2419,7 @@ class TestWindowSignalCache:
             for chrom, pos, _ in channel
         ]
         starts = sorted({(chrom, max(0, pos - span // 2)) for chrom, pos in rows})
-        windows = frame([(chrom, start, start + span) for chrom, start in starts])
+        windows = window_frame([(chrom, start, start + span) for chrom, start in starts])
         store = stores.TrackStore(tracks)
         built = cache.WindowSignalCache.build(windows, tracks, residency=residency)
 
@@ -2137,7 +2453,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), duplicate_tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), duplicate_tracks, residency="memory"
         )
 
         # Act
@@ -2161,7 +2477,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act
@@ -2187,7 +2503,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act
@@ -2212,7 +2528,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act
@@ -2238,7 +2554,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act
@@ -2267,7 +2583,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act
@@ -2292,7 +2608,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act
@@ -2317,7 +2633,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
         swap = numpy.array([1, 0])
 
@@ -2346,7 +2662,7 @@ class TestWindowSignalCache:
         # Arrange
         pytest.importorskip("polars_bio")
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), three_channel.tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), three_channel.tracks, residency="memory"
         )
         cycle = numpy.array([1, 2, 0])
 
@@ -2381,7 +2697,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act & assert
@@ -2403,7 +2719,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
         swap = numpy.array([1, 0])
 
@@ -2429,7 +2745,7 @@ class TestWindowSignalCache:
         """
 
         # Arrange
-        windows = frame([("chr1", 8, 16), ("chr1", 500, 520)])
+        windows = window_frame([("chr1", 8, 16), ("chr1", 500, 520)])
         built = cache.WindowSignalCache.build(windows, tracks, residency="memory")
 
         # Act
@@ -2458,7 +2774,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act & assert
@@ -2481,7 +2797,7 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="mapped"
+            window_frame([("chr1", 8, 16)]), tracks, residency="mapped"
         )
         first = built.window(0, 0, 8)
         expected = first.numpy().copy()
@@ -2512,7 +2828,7 @@ class TestWindowSignalCache:
         """
 
         # Arrange
-        windows = frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
+        windows = window_frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
         built = cache.WindowSignalCache.build(windows, tracks, residency=residency)
         lengths = [
             max(1, int(end) - int(start))
@@ -2550,10 +2866,10 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="mapped"
+            window_frame([("chr1", 8, 16)]), tracks, residency="mapped"
         )
         built.window(0, 0, 8)
-        other = cache.group_track(frame([("chr1", 10, 18)]), tracks)
+        other = cache.group_track(window_frame([("chr1", 10, 18)]), tracks)
         expected = cache.WindowSignalCache.from_arrays(other, residency="memory")
         staged = str(tmp_path / "other")
         os.makedirs(staged)
@@ -2587,10 +2903,10 @@ class TestWindowSignalCache:
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="mapped"
+            window_frame([("chr1", 8, 16)]), tracks, residency="mapped"
         )
         built.window(0, 0, 8)
-        other = cache.group_track(frame([("chr1", 10, 18)]), tracks)
+        other = cache.group_track(window_frame([("chr1", 10, 18)]), tracks)
         expected = cache.WindowSignalCache.from_arrays(other, residency="memory")
         staged = str(tmp_path / "other")
         os.makedirs(staged)
@@ -2634,7 +2950,7 @@ class TestWindowSignalCache:
 
         # Arrange
         held = cache.WindowSignalCache.build(
-            frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
         )
 
         # Act
@@ -2670,7 +2986,7 @@ class TestWindowSignalCache:
         """
 
         # Arrange
-        windows = frame([("chr1", 8, 16)])
+        windows = window_frame([("chr1", 8, 16)])
         held = cache.WindowSignalCache.build(windows, tracks, residency="memory")
         mapped = cache.WindowSignalCache.build(windows, tracks, residency="mapped")
 
@@ -3504,7 +3820,7 @@ def test_write_window_cache_should_commit_an_entry_the_package_verifies(
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     grouped = cache.group_track(windows, tracks)
 
     # Act
@@ -3549,7 +3865,7 @@ def test_write_window_cache_should_create_a_cache_directory_that_is_not_there(
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     grouped = cache.group_track(windows, tracks)
     deep = str(tmp_path / "a" / "b" / "c")
 
@@ -3578,8 +3894,8 @@ def test_write_window_cache_should_replace_an_entry_already_at_that_key(
     """
 
     # Arrange
-    first = frame([("chr1", 8, 16)])
-    second = frame([("chr1", 8, 16), ("chr2", 0, 8)])
+    first = window_frame([("chr1", 8, 16)])
+    second = window_frame([("chr1", 8, 16), ("chr2", 0, 8)])
     cache.write_window_cache(
         str(tmp_path), "same", first, first, cache.group_track(first, tracks)
     )
@@ -3614,7 +3930,7 @@ def test_write_window_cache_should_sweep_a_staging_directory_a_killed_write_left
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     grouped = cache.group_track(windows, tracks)
     stale = str(tmp_path / "swept.staging.deadbeef")
     os.makedirs(stale)
@@ -3645,7 +3961,7 @@ def test_write_window_cache_should_answer_none_when_it_cannot_write(tmp_path, tr
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     grouped = cache.group_track(windows, tracks)
     locked = tmp_path / "locked"
     locked.mkdir()
@@ -3679,7 +3995,7 @@ def test_write_window_cache_should_leave_no_staging_behind_when_it_fails(
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     grouped = cache.group_track(windows, tracks)
     broken = (grouped[0], grouped[1], grouped[2], grouped[3], object())
 
@@ -3707,7 +4023,7 @@ def test_read_window_cache_should_answer_what_was_written(tmp_path, tracks, resi
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 396, 404)])
+    windows = window_frame([("chr1", 8, 16), ("chr2", 0, 8), ("chr1", 396, 404)])
     grouped = cache.group_track(windows, tracks)
     built = cache.WindowSignalCache.from_arrays(grouped, residency="memory")
     cache.write_window_cache(str(tmp_path), "key0", windows, windows, grouped)
@@ -3751,7 +4067,7 @@ def test_read_window_cache_should_answer_what_was_written_for_any_window_set(
 
     # Arrange
     root = str(tmp_path_factory.mktemp("round-trip"))
-    windows = frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
+    windows = window_frame([("chr1", min(a, b), max(a, b)) for a, b in spans])
     grouped = cache.group_track(windows, tracks)
     built = cache.WindowSignalCache.from_arrays(grouped, residency="memory")
     cache.write_window_cache(root, "any", windows, windows, grouped)
@@ -3785,7 +4101,7 @@ def test_read_window_cache_should_hold_a_hit_where_a_cold_build_would(
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     cache.write_window_cache(
         str(tmp_path), "default", windows, windows, cache.group_track(windows, tracks)
     )
@@ -3815,7 +4131,7 @@ def test_read_window_cache_should_answer_the_controls_when_an_entry_carries_them
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     signal_arrays = cache.group_track(windows, tracks)
     control_arrays = cache.group_track(windows, tracks[:1])
     cache.write_window_cache(
@@ -3843,7 +4159,7 @@ def test_read_window_cache_should_answer_the_counts_the_entry_recorded(tmp_path,
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     grouped = cache.group_track(windows, tracks)
     cache.write_window_cache(str(tmp_path), "counts", windows, windows, grouped)
 
@@ -3921,7 +4237,7 @@ def test_read_window_cache_should_miss_an_entry_it_cannot_trust(
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     grouped = cache.group_track(windows, tracks)
     root = cache.write_window_cache(str(tmp_path), "key2", windows, windows, grouped)
     marker = root + ".manifest.json"
@@ -3987,7 +4303,7 @@ def test_read_window_cache_should_miss_an_entry_whose_window_table_is_truncated(
     """
 
     # Arrange
-    windows = frame([("chr1", 8, 16)])
+    windows = window_frame([("chr1", 8, 16)])
     grouped = cache.group_track(windows, tracks)
     root = cache.write_window_cache(str(tmp_path), "key3", windows, windows, grouped)
     with open(os.path.join(root, "peaks.parquet"), "wb") as handle:

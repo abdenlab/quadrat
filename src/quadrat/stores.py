@@ -85,8 +85,9 @@ class SequenceStore(ProcessLocalHandles):
     One window per call, holding nothing between them. A reference
     with no faidx index beside it has one built, as ``<path>.fai``, by
     the first read, which needs the reference's directory to be
-    writable and raises `OSError` where it is not. Build the index in
-    advance to avoid that write.
+    writable and raises `OSError` where it is not, naming the reference
+    and the command that indexes it. Build the index in advance to
+    avoid that write. Nothing is ever read by scanning the reference.
 
     :param path: The FASTA, as a `str`, `bytes` or `os.PathLike`.
     :param alphabet: The residues that get a row, in row order.
@@ -133,6 +134,9 @@ class SequenceStore(ProcessLocalHandles):
     def window(self, chrom, start, end):
         """One-hot encode ``[start, end)`` of ``chrom``.
 
+        Residues are upper-cased before they are encoded, so
+        soft-masked sequence reads as the bases it is.
+
         A span reaching past either end of the contig is read as far as
         the contig goes and zero-padded to the width asked for, so the
         shape depends on the span and not on where the span sits. A
@@ -145,7 +149,9 @@ class SequenceStore(ProcessLocalHandles):
             start)`` and dtype ``int8``, with an all-zero column
             wherever the residue is one of ``ignore`` or the position
             is outside the contig.
-        :raises ValueError: if ``end`` is before ``start``.
+        :raises ValueError: if ``end`` is before ``start``, or if a
+            residue read, once upper-cased, is in neither ``alphabet``
+            nor ``ignore``.
 
         .. rubric:: Implementation notes
 
@@ -185,14 +191,51 @@ class SequenceStore(ProcessLocalHandles):
         padded[:, lo - start : hi - start] = encoded
         return padded
 
+    def contig_lengths(self):
+        """Return the length of every contig, as the reference's index states it.
+
+        No residue is read. This counts as a first read where the
+        reference has no index.
+
+        :returns: A `dict` of contig name to length in bases, in the
+            reference's own order.
+        :raises OSError: if the reference cannot be read, or has no
+            index and none can be written beside it.
+        """
+
+        fasta = self._fasta()
+        return {name: len(fasta[name]) for name in fasta.keys()}
+
     def _fasta(self):
-        """This process's open reference, opened on first use."""
+        """This process's open reference, opened on first use.
+
+        .. rubric:: Implementation notes
+
+        ``pyfaidx`` reports an index it could not write as a bare
+        `OSError` about its own ``rebuild`` options, which names
+        nothing a caller of this package passed. A reference that
+        cannot be read at all is its `pyfaidx.FastaNotFoundError`,
+        which already names the path and is left as it is.
+        """
 
         local = self._handles()
         fasta = local.get("fasta")
         if fasta is None:
             pyfaidx = import_on_first_use("pyfaidx")
-            fasta = local["fasta"] = pyfaidx.Fasta(self.path)
+            try:
+                fasta = pyfaidx.Fasta(self.path)
+            except pyfaidx.FastaNotFoundError:
+                raise
+            except OSError as error:
+                raise OSError(
+                    "{0} has no usable faidx index and none could be written "
+                    "beside it ({1}). Sequence is read through the index and "
+                    "never by scanning the reference. Build {0}.fai with "
+                    "`samtools faidx {0}` as a user who can write there, or "
+                    "copy the reference to a directory that can be "
+                    "written.".format(self.path, error)
+                ) from error
+            local["fasta"] = fasta
         return fasta
 
 
@@ -391,7 +434,16 @@ def track_frame(source):
         ``pos`` and ``value``.
     :returns: A `polars.LazyFrame`.
     :raises TypeError: if ``source`` is none of those shapes.
+    :raises FileNotFoundError: if ``source`` is a path at which nothing
+        exists.
     :raises ValueError: if a track directory does not verify complete.
+
+    .. rubric:: Implementation notes
+
+    A missing path is refused here because the scan would not refuse
+    it: a scan is a plan, and a plan over a file that is not there
+    raises only when it is collected, which a caller with no window to
+    read never does.
     """
 
     polars = import_on_first_use("polars")
@@ -400,6 +452,10 @@ def track_frame(source):
         if os.path.isdir(path):
             require_complete(path)
             return polars.scan_parquet(os.path.join(path, "*.parquet"))
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                "{} is not a track; there is no such file or directory.".format(path)
+            )
         return polars.scan_parquet(path)
     if isinstance(source, polars.LazyFrame):
         return source
