@@ -5,8 +5,9 @@ drift, and the geometries immutably so a corpus built from one cannot
 alter the geometry a later corpus is built from.
 
 `builders` writes the suite's synthetic data; what lives here is what
-reads it back, locates the project, or runs a child process, none of
-which belongs to any one module.
+reads it back, states what a reader should answer for it, locates the
+project, or runs a child process, none of which belongs to any one
+module.
 """
 
 import hashlib
@@ -16,8 +17,17 @@ import subprocess
 from pathlib import Path
 from types import MappingProxyType
 
+import numpy
 import pytest
 from hypothesis import HealthCheck, settings
+
+try:
+    import polars
+except ImportError:
+    # Left unbound rather than re-raised, as `builders` leaves `pysam`:
+    # the modules that build a window frame import polars themselves,
+    # and report its absence in their own way.
+    polars = None
 
 # Two contigs is the default: the smallest geometry in which a contig
 # boundary exists at all. Three is what a non-uniform contig split
@@ -90,6 +100,62 @@ def digest_track(table):
         with open(os.path.join(table, name), "rb") as handle:
             digests[name] = hashlib.sha256(handle.read()).hexdigest()
     return digests
+
+
+def parse_fasta(path):
+    """Return contig name to sequence, read back from a FASTA on disk.
+
+    Parsed from the file's own lines rather than through a FASTA
+    library, so it is independent of every reader under test.
+    """
+
+    sequences = {}
+    name = None
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith(">"):
+                name = line[1:].strip()
+                sequences[name] = []
+            else:
+                sequences[name].append(line.strip())
+    return {name: "".join(parts) for name, parts in sequences.items()}
+
+
+def window_frame(rows, columns=("sig_start", "sig_end")):
+    """Return a window frame of ``(chrom, start, end)`` rows under two bound columns.
+
+    Each field is converted, so a row may carry a numeric contig name
+    or numpy integers.
+    """
+
+    lo_column, hi_column = columns
+    return polars.DataFrame(
+        {
+            "chrom": [str(row[0]) for row in rows],
+            lo_column: [int(row[1]) for row in rows],
+            hi_column: [int(row[2]) for row in rows],
+        },
+        schema={
+            "chrom": polars.Utf8,
+            lo_column: polars.Int64,
+            hi_column: polars.Int64,
+        },
+    )
+
+
+def one_hot(residues, alphabet="ACGT"):
+    """Return the one-hot matrix a residue string implies, built rather than read.
+
+    An ``int8`` array of one row per residue of ``alphabet`` and one
+    column per residue given. Case is ignored, and a residue outside
+    the alphabet is an all-zero column.
+    """
+
+    out = numpy.zeros((len(alphabet), len(residues)), dtype=numpy.int8)
+    for column, base in enumerate(residues.upper()):
+        if base in alphabet:
+            out[alphabet.index(base), column] = 1
+    return out
 
 
 def budget(plan, ram_bytes, cores):

@@ -34,7 +34,7 @@ import tempfile
 
 import pytest
 
-from tests import builders
+from tests import TWO_CONTIGS, builders
 
 # Progress bars in a captured suite are noise that also slows it down.
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -447,6 +447,29 @@ def corpus_factory(tmp_path_factory):
         return corpus
 
     return build
+
+
+@pytest.fixture
+def unindexable_fasta(tmp_path):
+    """Return a reference with no index, in a directory nothing can be written to.
+
+    The one state in which a reader cannot build the index it lacks.
+    Skips the requesting test where the permission does not bite, as
+    for a superuser or on a filesystem that keeps no modes. The
+    directory is made writable again afterwards, so pytest can remove
+    it.
+    """
+
+    root = tmp_path / "read-only"
+    root.mkdir()
+    path = builders.write_fasta(str(root / "genome.fa"), TWO_CONTIGS)
+    root.chmod(0o555)
+    try:
+        if os.access(str(root), os.W_OK):
+            pytest.skip("a read-only directory is still writable to this user")
+        yield path
+    finally:
+        root.chmod(0o755)
 
 
 @pytest.fixture(autouse=True)

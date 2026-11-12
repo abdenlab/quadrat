@@ -5,12 +5,21 @@ is a plain function taking an output path and the geometry to render at
 it, so one builder serves every fixture that needs that shape of input
 rather than each fixture carrying its own copy.
 
-`pysam` is imported under a guard, so this module imports without it.
+`pysam` and `polars` are imported under a guard, so this module
+imports without either.
 """
 
 import gzip
 import os
 import random
+
+try:
+    import polars
+except ImportError:
+    # Left unbound rather than re-raised, because ``conftest`` imports
+    # this module for every test module and the tests that build a
+    # track skip without polars rather than fail to collect.
+    polars = None
 
 try:
     import pysam
@@ -210,7 +219,12 @@ def write_random_bam(path, header, chrom_sizes, *, n_reads=40, seed=0, read_leng
 
 
 def write_bed(path, rows):
-    """Write ``(chrom, start, stop)`` rows, gzipped when ``path`` says so.
+    """Write BED rows, gzipped when ``path`` says so, and return the path.
+
+    A row is ``(chrom, start, stop)`` followed by any further fields,
+    and every field it carries is written, so a six-column peak file
+    and a ten-column one with summits come from the same builder as a
+    three-column exclusion list. Rows need not agree on a width.
 
     Exclusion lists are conventionally gzipped and locus files
     conventionally are not, and both readers have to cope, so the
@@ -220,9 +234,47 @@ def write_bed(path, rows):
     opener = gzip.open if str(path).endswith(".gz") else open
     with opener(path, "wt") as handle:
         for row in rows:
-            chrom, start, stop = row[:3]
-            handle.write("{}\t{}\t{}\n".format(chrom, start, stop))
+            handle.write("\t".join(str(field) for field in row) + "\n")
     return path
+
+
+def track_rows_frame(rows):
+    """Return ``(chrom, pos, value)`` rows as an in-memory track, in the order given.
+
+    The one place the suite turns rows into a track's three columns,
+    at the dtypes the format declares, so a track written to disk and
+    one handed over in memory are built from the same frame. Each field
+    is converted, so a row may carry a numeric contig name or an
+    integer value.
+    """
+
+    return polars.DataFrame(
+        {
+            "chrom": [str(row[0]) for row in rows],
+            "pos": [int(row[1]) for row in rows],
+            "value": [float(row[2]) for row in rows],
+        },
+        schema={"chrom": polars.Utf8, "pos": polars.Int64, "value": polars.Float64},
+    )
+
+
+def scattered_rows(chrom_sizes, seed):
+    """Return ``(chrom, pos, value)`` rows over about a third of each contig.
+
+    The positions are distinct, sorted by contig and position, and the
+    values whole numbers from 1 to 4, so a window's total is exact in
+    ``float32``. The same ``seed`` answers the same rows.
+    """
+
+    rng = random.Random(seed)
+    positions = sorted(
+        {
+            (chrom, rng.randrange(0, size))
+            for chrom, size in chrom_sizes.items()
+            for _ in range(size // 3)
+        }
+    )
+    return [(chrom, pos, float(rng.randint(1, 4))) for chrom, pos in positions]
 
 
 def write_track(path, rows, *, parameters=None):
@@ -239,26 +291,15 @@ def write_track(path, rows, *, parameters=None):
     handed ungrouped, which is the one thing a hand-written row list
     reliably is.
 
-    Needs ``polars``, which is a base dependency, and the writer, which
-    is not imported until this is called: ``conftest`` assigns
-    ``QUADRAT_CACHE_DIR`` at its own import time and a module-level
-    ``quadrat`` import here would land before it.
+    The writer is not imported until this is called: ``conftest``
+    assigns ``QUADRAT_CACHE_DIR`` at its own import time and a
+    module-level ``quadrat`` import here would land before it.
     """
-
-    import polars
 
     from quadrat.tables import TrackWriter
 
-    frame = polars.DataFrame(
-        {
-            "chrom": [str(row[0]) for row in rows],
-            "pos": [int(row[1]) for row in rows],
-            "value": [float(row[2]) for row in rows],
-        },
-        schema={"chrom": polars.Utf8, "pos": polars.Int64, "value": polars.Float64},
-    )
     with TrackWriter(str(path), parameters=parameters) as writer:
-        writer.write(frame)
+        writer.write(track_rows_frame(rows))
     return str(path)
 
 
@@ -274,24 +315,9 @@ def write_flat_track(path, rows):
     is deliberate: the directory layout is sorted by construction and
     this one is not, so it is the shape that catches a reader assuming
     an order the layout does not promise.
-
-    Needs ``polars``, imported here rather than at module level as
-    `pysam` is guarded above: ``conftest`` imports this module for
-    every test module, and the tests that need polars skip without it
-    rather than fail, so an import at module level would turn one
-    absent dependency into a collection error for the whole suite.
     """
 
-    import polars
-
-    polars.DataFrame(
-        {
-            "chrom": [str(row[0]) for row in rows],
-            "pos": [int(row[1]) for row in rows],
-            "value": [float(row[2]) for row in rows],
-        },
-        schema={"chrom": polars.Utf8, "pos": polars.Int64, "value": polars.Float64},
-    ).write_parquet(str(path))
+    track_rows_frame(rows).write_parquet(str(path))
     return str(path)
 
 
