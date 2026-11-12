@@ -19,7 +19,7 @@ pip install quadrat            # verify and inspect tracks
 pip install "quadrat[pileup]"  # also build them from alignments
 ```
 
-The `pileup` extra is the engine: [polars-bio](https://github.com/biodatageeks/polars-bio), which reads alignments, and [giql](https://github.com/abdenlab/giql), which transpiles interval joins. It is needed to build tracks from alignments.
+The `pileup` extra is the engine: [polars-bio](https://github.com/biodatageeks/polars-bio), which reads alignments, and [giql](https://github.com/abdenlab/giql), which transpiles interval joins. Whatever reads alignments or joins intervals needs it, and building tracks from alignments does both; reading a track that already exists does neither.
 
 The base install is for a track that already exists: it verifies one, lists the contigs it holds, and reads the record it was written with. That is enough to inspect a corpus someone else piled up, and it is the install `quadrat`'s package docstring states the import guarantee about.
 
