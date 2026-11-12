@@ -36,11 +36,18 @@ The vocabulary used throughout:
     a locus yields many draws under jitter and reverse-complement
     augmentation.
 
+``peak`` and ``negative``
+    The two locus sets a window cache is built over, kept apart
+    because they are sampled differently rather than because they are
+    read differently: a peak is called, a negative is drawn from what
+    the exclusion lists leave.
+
 Nothing the ``pileup`` extra installs is imported at package import
-time, so a caller who already has tracks pays for none of it.
-The engine behind that extra reads alignments through polars-bio and
-transpiles its aggregate with giql, and loads what it needs when a
-pileup runs.
+time, so a caller who only reads tracks by coordinate pays for none of
+it. The engine behind that extra reads alignments through polars-bio
+and transpiles its interval joins with giql, and loads what it needs
+when a pileup runs or a window cache is built. Both of those need it;
+reading a track that already exists does not.
 """
 
 __all__ = [
