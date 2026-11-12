@@ -15,6 +15,12 @@ reads the contamination as signal. `exclusive_pileup` is the
 guard. Concurrency is still available through
 `pileup_many`'s ``process`` backend, where each
 worker is a process with a session of its own.
+
+Concurrent window grouping in one process is unsupported for the same
+reason. `quadrat.cache.group_track` registers its frames under the two
+fixed names `WINDOWS_TABLE` and `TRACK_TABLE` without the guard a
+pileup takes, so two groupings at once would bind and drop each
+other's frames.
 """
 
 import contextlib
@@ -26,6 +32,20 @@ FASTA_TABLE = "quadrat_fasta"
 
 
 SIZES_TABLE = "quadrat_chrom_sizes"
+
+
+#: The windows side of the window-grouping join: one contig's windows.
+#: A fixed name rather than a generated one, because within one call
+#: the join runs once per contig and binds exactly one frame under each
+#: side's name at a time. The module docstring says why two calls at
+#: once in one process are unsupported.
+WINDOWS_TABLE = "quadrat_windows"
+
+
+#: The track side of the window-grouping join: every channel's rows on
+#: one contig in a single frame, with the channel carried as a column
+#: the join projects rather than as a registration of its own.
+TRACK_TABLE = "quadrat_track"
 
 
 #: Prefix of the one table name that is generated rather than fixed:
@@ -51,6 +71,15 @@ _PILEUP_EXTRA = ("giql", "polars_bio")
 _pileup_lock = threading.Lock()
 
 
+#: Which third-party process-global state `engine` has already set, in
+#: this process. A plain set rather than SCREAMING_CASE because the
+#: binding is constant and the referent is not: `engine` fills it on
+#: first use. It exists because `engine` runs on every query rather
+#: than once, and one of the things it does is not idempotent the way
+#: the rest of it is -- see the write-lock paragraph in its rubric.
+_installed = set()
+
+
 # public
 class EngineOptionWarning(UserWarning):
     """Emitted when the query engine refuses a setting quadrat asked for.
@@ -74,27 +103,22 @@ class EngineOptionWarning(UserWarning):
 def fspath_or_none(value):
     """``value`` as a filesystem path string, or ``None`` if it is not one.
 
-    One definition of "is this a path" for the package. Five sites had
-    their own -- the three readers in `quadrat.tables`, the two guards
-    in `quadrat.reference` and `quadrat.alignments`, and the two pileup
-    entry points -- each spelling the probe and the conversion itself,
-    and `quadrat.pileup.track`'s own comment documents the five as a
-    set. What legitimately differs between them is the refusal, which
-    stays with each site: a reader answers ``None`` where nothing is
-    checkable, `chrom_lengths` raises `TypeError`, `register_alignments`
-    raises `ValueError` naming the suffix rule, and the entry points
-    leave a non-path alone so the layer below refuses it in its own
-    words. What does not differ is this.
+    One definition of "is this a path" for the package. What
+    legitimately differs between the places that ask is the refusal,
+    which stays with each of them: a reader answers ``None`` where
+    nothing is checkable, a guard raises the error its own contract
+    names, and an entry point leaves a non-path alone so the layer
+    below refuses it in its own words. What does not differ is this.
 
     ``os.fsdecode`` rather than ``os.fspath``, and that is the whole of
     the `bytes` question. A `bytes` path is a path everywhere else in
-    Python, both entry points admitted one, and nothing downstream
-    honoured it: ``os.fspath`` hands `bytes` straight through, so the
-    value reached a ``str``-only provider, a ``str`` concatenation, or
-    `str`, which built ``"b'/data/x.track.parquet'.manifest.json"`` out
-    of a repr and called it a path. ``os.fsdecode`` answers a `str` for
-    all three accepted shapes, and applies ``os.fspath`` first, so one
-    call covers them.
+    Python, and ``os.fspath`` hands `bytes` straight through, so the
+    value would reach a ``str``-only provider, a ``str``
+    concatenation, or `str`, which builds
+    ``"b'/data/x.track.parquet'.manifest.json"`` out of a repr and
+    calls it a path. ``os.fsdecode`` answers a `str` for all three
+    accepted shapes, and applies ``os.fspath`` first, so one call
+    covers them.
 
     ``None`` rather than raising, and the name says so: ``os.fspath``
     raises for a non-path, and a caller here is usually about to decide
@@ -139,6 +163,46 @@ def registered_fasta(path):
         # the same here and stated there: it does not go through the
         # parser and does not raise on a name that is not bound.
         pb.ctx.deregister_table(FASTA_TABLE)
+
+
+@contextlib.contextmanager
+def registered_frames(frames):
+    """Bind ``frames`` by table name for the duration of the block.
+
+    What `registered_fasta` is for a file, for the in-memory frames a
+    query is handed: a mapping of table name to polars frame, bound on
+    the way in and dropped on the way out, however the block exits.
+
+    Yields the engine handle, so a caller needs one call rather than
+    two for what is one operation.
+
+    :param frames: A mapping of table name to polars frame. Iteration
+        order is the registration order, which matters only in that a
+        failure partway through still drops whatever landed.
+
+    .. rubric:: Implementation notes
+
+    Dropped in a ``finally``, and that is the whole reason this exists
+    rather than two lines at each call site. The session is
+    process-global, as the module docstring above says, so a
+    registration that outlives its query stays bound for the life of
+    the process -- and the next caller of the same name reads the
+    previous one's rows rather than failing.
+    """
+
+    pb = engine()
+    try:
+        for name, frame in frames.items():
+            pb.from_polars(name, frame)
+        yield pb
+    finally:
+        # Through the DataFusion context, for the reasons
+        # `quadrat.alignments.deregister_alignments` records: it does
+        # not go through the parser and does not raise on a name that
+        # is not bound, which is what makes this safe after a
+        # registration that refused partway through.
+        for name in frames:
+            pb.ctx.deregister_table(name)
 
 
 @contextlib.contextmanager
@@ -223,8 +287,33 @@ def engine():
 
     .. rubric:: Implementation notes
 
-    ``TQDM_DISABLE`` is the whole of the quieting, and it is set with
+    ``TQDM_DISABLE`` is most of the quieting, and it is set with
     ``setdefault`` so a caller who wants the bars back can have them.
+    It is not all of it, because tqdm reads its ``TQDM_`` overrides in
+    the ``envwrap`` decorator applied at import of ``tqdm.std`` -- so
+    the variable has to be set before anything imports tqdm, which is
+    what the deferred imports at this package's call sites buy.
+
+    The write lock is the other half, and it is a correctness matter
+    rather than a cosmetic one. ``tqdm.__new__`` builds its lock
+    before it consults ``disable``, and the default lock holds a
+    `multiprocessing.RLock` whose construction binds this process's
+    start method. A caller who had not yet chosen ``fork`` could then
+    no longer choose it, and the residency `quadrat.cache` derives
+    from that choice would be settled by this import rather than by
+    the program. Installing a `threading.RLock` first means
+    ``tqdm.get_lock`` never reaches the default, so importing the
+    engine costs the caller nothing it did not ask for.
+
+    That installation happens once per process, and this function runs
+    once per query, so "once" has to be arranged rather than assumed.
+    ``set_lock`` is tqdm's own published API: a second call would
+    discard whatever lock the host application had installed, and a bar
+    already live in another thread would hold the previous lock while
+    new bars took this one, two locks guarding one stream. The obvious
+    guard is the wrong one, because ``tqdm.tqdm.get_lock`` *constructs*
+    the default lock when none is set and so would do the very thing
+    this avoids; `_installed` records the installation instead.
 
     ``pb.set_loglevel`` is deliberately not called here, and no level
     makes it worth calling. It accepts ``debug``, ``info`` and
@@ -242,6 +331,24 @@ def engine():
     """
 
     os.environ.setdefault("TQDM_DISABLE", "1")
+    if "tqdm-lock" not in _installed:
+        # Before polars-bio imports tqdm, and once per process; the
+        # rubric says why.
+        #
+        # Guarded although tqdm is a base dependency, so it is absent
+        # only from an incomplete environment. A tqdm that cannot be
+        # imported cannot build a lock either, so there is nothing left
+        # to prevent, and the refusal is left to the polars-bio import
+        # below, which imports tqdm itself. The flag is set only on
+        # success, so a later call retries rather than recording the
+        # absence as done.
+        try:
+            tqdm = import_on_first_use("tqdm")
+        except ImportError:
+            pass
+        else:
+            tqdm.tqdm.set_lock(threading.RLock())
+            _installed.add("tqdm-lock")
     return import_on_first_use("polars_bio")
 
 
