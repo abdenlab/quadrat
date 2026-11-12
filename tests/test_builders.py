@@ -20,6 +20,8 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+import quadrat
+from quadrat import stores
 from tests import FILE_BACKED, THREE_CONTIGS, TWO_CONTIGS, builders, record_placements
 
 # Contig names over lowercase letters only, so a generated name cannot
@@ -1325,3 +1327,319 @@ def test_write_random_bam_should_size_its_reads_from_the_read_length(
         reads = list(bam.fetch())
     assert [read.cigarstring for read in reads] == ["35M"] * 8
     assert [read.query_length for read in reads] == [35] * 8
+
+
+def test_write_track_should_write_one_parquet_file_per_contig(tmp_path):
+    """Test the layout a built track has.
+
+    Given:
+        Rows over two contigs.
+    When:
+        The builder writes them as a track.
+    Then:
+        It should produce a directory holding one Parquet file per
+        contig and nothing else, with the completeness record beside
+        the directory rather than inside it.
+
+    Holding Parquet and nothing else is the invariant the format rests
+    on: polars refuses to scan a directory of mixed extensions, and so
+    does anything else pointed at the dataset.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    root = str(tmp_path / "sample.track.parquet")
+
+    # Act
+    builders.write_track(root, [("chr1", 10, 1.0), ("chr2", 5, 2.0)])
+
+    # Assert
+    assert sorted(os.listdir(root)) == ["chr1.parquet", "chr2.parquet"]
+    assert os.path.exists(root + ".manifest.json")
+
+
+def test_write_track_should_sort_rows_it_was_given_out_of_order(tmp_path):
+    """Test that a hand-written row list needs no ordering.
+
+    Given:
+        Rows whose contigs interleave and whose positions descend.
+    When:
+        The builder writes them as a track.
+    Then:
+        It should still write one file per contig, with each file's
+        positions ascending, so a test may list the rows it means in
+        the order it means them.
+
+    An ungrouped, unsorted row list is the one thing a hand-written
+    literal reliably is, and the format requires both.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+    root = str(tmp_path / "jumbled.track.parquet")
+    rows = [("chr2", 50, 1.0), ("chr1", 30, 2.0), ("chr2", 10, 3.0), ("chr1", 20, 4.0)]
+
+    # Act
+    builders.write_track(root, rows)
+
+    # Assert
+    assert sorted(os.listdir(root)) == ["chr1.parquet", "chr2.parquet"]
+    for name, expected in (("chr1", [20, 30]), ("chr2", [10, 50])):
+        frame = polars.read_parquet(os.path.join(root, name + ".parquet"))
+        assert frame.get_column("pos").to_list() == expected
+
+
+def test_write_track_should_produce_a_track_the_package_verifies(tmp_path):
+    """Test that a built track is the artifact a pileup commits.
+
+    Given:
+        Rows written as a track by the builder.
+    When:
+        The package is asked to verify it complete.
+    Then:
+        It should pass, and report the contigs the rows named, so every
+        later assertion about reading a track is an assertion about the
+        same artifact the pileup produces.
+
+    The builder goes through the package's own writer for exactly this
+    reason: a suite that built the layout itself could drift from the
+    format and still agree with itself.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    root = str(tmp_path / "verified.track.parquet")
+
+    # Act
+    builders.write_track(root, [("chr1", 10, 1.0), ("chr1", 20, 2.0), ("chr2", 5, 3.0)])
+
+    # Assert
+    assert quadrat.require_complete(root) == root
+    assert quadrat.track_contigs(root) == {"chr1", "chr2"}
+    assert quadrat.read_manifest(root)["rows"] == 3
+
+
+def test_write_track_should_record_the_parameters_it_was_given(tmp_path):
+    """Test that a track carries the arguments it was built with.
+
+    Given:
+        A parameters mapping passed to the builder.
+    When:
+        The written track's record is read back.
+    Then:
+        It should carry that mapping, so a test can assert on what a
+        track claims about its own provenance.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    root = str(tmp_path / "noted.track.parquet")
+
+    # Act
+    builders.write_track(root, [("chr1", 10, 1.0)], parameters={"shift": 4})
+
+    # Assert
+    assert quadrat.read_manifest(root)["parameters"] == {"shift": 4}
+
+
+def test_write_track_should_write_a_track_that_records_nothing(tmp_path):
+    """Test the natural spelling of a channel with no rows at all.
+
+    Given:
+        An empty row list.
+    When:
+        A track is written from it.
+    Then:
+        It should verify complete and report no contigs, because a
+        channel that recorded nothing is a channel and not an error --
+        and it is what a reader answers a row of zeros for.
+    """
+
+    # Arrange
+    path = str(tmp_path / "empty.track.parquet")
+
+    # Act
+    written = builders.write_track(path, [])
+
+    # Assert
+    assert quadrat.require_complete(written) == written
+    assert quadrat.track_contigs(written) == set()
+
+
+def test_write_track_should_write_a_track_of_one_row(tmp_path):
+    """Test the smallest track that holds anything.
+
+    Given:
+        A single row.
+    When:
+        A track is written from it.
+    Then:
+        It should hold one contig whose record counts one row, so the
+        boundary between nothing and something is a track either way.
+    """
+
+    # Arrange
+    path = str(tmp_path / "one.track.parquet")
+
+    # Act
+    written = builders.write_track(path, [("chr1", 5, 2.0)])
+
+    # Assert
+    assert quadrat.track_contigs(written) == {"chr1"}
+    assert quadrat.read_manifest(written)["rows"] == 1
+
+
+def test_write_track_should_keep_a_position_given_twice(tmp_path):
+    """Test what the builder does with a duplicated position.
+
+    Given:
+        Two rows at one contig and position, with different values.
+    When:
+        A track is written from them.
+    Then:
+        Both should be recorded, because the builder writes the rows a
+        test means rather than the rows the format promises -- which is
+        what lets a test hand the readers a malformed track on purpose.
+    """
+
+    # Arrange
+    path = str(tmp_path / "dup.track.parquet")
+
+    # Act
+    written = builders.write_track(path, [("chr1", 5, 2.0), ("chr1", 5, 3.0)])
+
+    # Assert
+    assert quadrat.read_manifest(written)["rows"] == 2
+
+
+def test_write_track_should_sort_within_a_contig_as_well_as_across_them(tmp_path):
+    """Test the order each contig's own file comes out in.
+
+    Given:
+        Rows already grouped by contig but descending by position
+        inside each group.
+    When:
+        A track is written from them.
+    Then:
+        Each file's positions should ascend, because the format
+        promises a position-sorted file and a grouped-but-unsorted
+        frame is the shape a sort across contigs alone would pass
+        through.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+    path = str(tmp_path / "desc.track.parquet")
+
+    # Act
+    written = builders.write_track(
+        path, [("chr1", 12, 3.0), ("chr1", 8, 1.0), ("chr2", 9, 4.0), ("chr2", 5, 2.0)]
+    )
+
+    # Assert
+    for chrom in ("chr1", "chr2"):
+        rows = polars.read_parquet(quadrat.track_chrom_path(written, chrom))
+        assert rows["pos"].to_list() == sorted(rows["pos"].to_list())
+
+
+def test_write_track_should_round_trip_a_contig_name_needing_quoting(tmp_path):
+    """Test a contig whose name carries characters a filesystem reserves.
+
+    Given:
+        A contig named with a slash, a space and a percent sign.
+    When:
+        A track is written and its contigs read back.
+    Then:
+        It should come back under the name it was given, because the
+        per-contig filename is percent-quoted and a test corpus has to
+        be able to provoke that.
+    """
+
+    # Arrange
+    name = "chr1/a b%c"
+    path = str(tmp_path / "quoted.track.parquet")
+
+    # Act
+    written = builders.write_track(path, [(name, 5, 2.0)])
+
+    # Assert
+    assert quadrat.track_contigs(written) == {name}
+
+
+def test_write_track_should_write_a_track_whose_path_holds_glob_characters(tmp_path):
+    """Test a track path a glob would read as a pattern.
+
+    Given:
+        A track path carrying a bracket, a star and a question mark.
+    When:
+        A track is written there and verified.
+    Then:
+        It should write, verify and list its contigs, because the
+        commit sweeps its own siblings by glob and a caller's path is
+        not a pattern.
+    """
+
+    # Arrange
+    path = str(tmp_path / "t[1]*?.track.parquet")
+
+    # Act
+    written = builders.write_track(path, [("chr1", 5, 2.0)])
+
+    # Assert
+    assert quadrat.require_complete(written) == written
+    assert quadrat.track_contigs(written) == {"chr1"}
+
+
+def test_write_flat_track_should_write_the_rows_in_the_order_given(tmp_path):
+    """Test the layout and row order of a single-file track.
+
+    Given:
+        Rows over two contigs, interleaved and descending by position.
+    When:
+        The builder writes them as a single-file track.
+    Then:
+        It should write one Parquet file with exactly the ``chrom``,
+        ``pos`` and ``value`` columns, holding the rows in the order
+        given, because this layout exists to hand a reader rows it was
+        never promised are sorted.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+    path = str(tmp_path / "flat.parquet")
+    rows = [("chr2", 50, 1.0), ("chr1", 30, 2.0), ("chr2", 10, 3.0), ("chr1", 20, 4.0)]
+
+    # Act
+    written = builders.write_flat_track(path, rows)
+
+    # Assert
+    assert written == path
+    assert os.listdir(tmp_path) == ["flat.parquet"]
+    table = polars.read_parquet(written)
+    assert table.columns == ["chrom", "pos", "value"]
+    assert table.rows() == rows
+
+
+def test_write_flat_track_should_write_a_track_the_package_reads(tmp_path):
+    """Test that a single-file track is one a reader accepts.
+
+    Given:
+        Rows over two contigs written as a single-file track.
+    When:
+        The package reads it as a whole track.
+    Then:
+        It should answer every row, because the builder stands in for a
+        table this package did not write, and a stand-in the readers
+        refuse would test nothing about them.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    rows = [("chr1", 12, 3.0), ("chr2", 5, 2.0), ("chr1", 10, 1.0)]
+    written = builders.write_flat_track(str(tmp_path / "read.parquet"), rows)
+
+    # Act
+    table = stores.track_frame(written).collect()
+
+    # Assert
+    assert sorted(table.select("chrom", "pos", "value").rows()) == sorted(rows)

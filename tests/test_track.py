@@ -3,13 +3,10 @@
 Relocated from the ported ``tests/test_pileup_io.py`` and
 ``tests/test_pileup.py``, assertions unchanged.
 
-One reseat. The refusal of a second concurrent pileup was pinned by
-holding the private ``_engine.exclusive_pileup`` from a thread, which
-made the lock the subject. Here two threads both call
-`pileup_alignments` behind a barrier and exactly one is refused, which
-is the behaviour a caller can actually reach. Measured at one refusal
-in sixty trials before being written this way; the assertion is on the
-count and never on which thread won.
+The refusal of a second concurrent pileup is pinned through the call
+a caller makes rather than through the lock behind it: two threads both
+call `pileup_alignments` behind a barrier and exactly one is refused.
+The assertion is on the count and never on which thread won.
 
 The two BAMs come from `tests.builders` directly rather than from
 ``corpus_factory``, because their geometry is the point -- secondary and
@@ -35,7 +32,7 @@ import pytest
 from quadrat import EngineOptionWarning, tables
 from quadrat import pileup as pileup_pkg
 from quadrat.pileup import track
-from tests import TWO_CONTIGS, builders, digest_track
+from tests import TWO_CONTIGS, bound, builders, digest_track
 
 POS_SHIFT, NEG_SHIFT = 4, -4
 
@@ -1267,16 +1264,6 @@ def test_pileup_alignments_should_refuse_a_frame_that_is_not_grouped_by_strand(
         )
 
 
-def bound(pb, name):
-    """Whether a table name is still registered in the shared session."""
-
-    try:
-        pb.ctx.table(name)
-    except BaseException:
-        return False
-    return True
-
-
 def test_pileup_alignments_should_release_its_tables_when_it_finishes(
     tmp_path, shifted_pair
 ):
@@ -1369,7 +1356,7 @@ def test_pileup_alignments_should_restore_the_partition_count_it_found(
         The option should hold its original value afterwards.
 
     The option is process-global and the session is shared, which
-    `quadrat._engine` makes the module's central hazard and enforces
+    the engine module makes its central hazard and enforces
     for table names. A pileup that left this set would hand the next
     caller in the process whatever parallelism it chose -- the whole
     machine, when the count was defaulted.

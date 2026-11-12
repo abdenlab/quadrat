@@ -40,6 +40,28 @@ FILE_BACKED = settings(
 )
 
 
+def bound(pb, name):
+    """Return whether a table name is still registered in the shared session."""
+
+    try:
+        pb.ctx.table(name)
+    except BaseException:
+        return False
+    return True
+
+
+def quadrat_tables(pb):
+    """Return every table name bound in the shared session under ``quadrat_``.
+
+    The package registers its tables under that prefix and no other, so
+    a release can be checked against the prefix rather than against the
+    names any one caller happens to use.
+    """
+
+    names = pb.sql("SHOW TABLES").collect()["table_name"].to_list()
+    return sorted(name for name in names if name.startswith("quadrat_"))
+
+
 def load_build_hook(name):
     """Return the build hook module ``name``, loaded from its path.
 
@@ -108,13 +130,20 @@ def record_placements(path, pysam, until_eof=False):
         ]
 
 
+#: How long `run_child` waits. A child that never exits would otherwise
+#: hold the whole run until the CI job is cancelled, with the test that
+#: hung named nowhere in the log.
+CHILD_TIMEOUT = 300
+
+
 def run_child(command, failure, cwd=None, environment=None):
     """Run ``command`` to completion and return it, failing with its stderr.
 
     `subprocess.CalledProcessError` carries the stderr but does not
     print it, so a caller that lets it propagate reports an argv and an
     exit status with no diagnosis -- which in a CI log is the whole of
-    what there is to read.
+    what there is to read. A child that does not exit within
+    `CHILD_TIMEOUT` seconds fails the same way.
     """
 
     try:
@@ -125,6 +154,13 @@ def run_child(command, failure, cwd=None, environment=None):
             text=True,
             check=True,
             env=environment,
+            timeout=CHILD_TIMEOUT,
         )
     except subprocess.CalledProcessError as error:
         pytest.fail("{}:\n{}".format(failure, error.stderr))
+    except subprocess.TimeoutExpired as error:
+        pytest.fail(
+            "{}: no exit within {} s.\n{}".format(
+                failure, CHILD_TIMEOUT, error.stderr or ""
+            )
+        )
