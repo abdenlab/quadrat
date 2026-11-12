@@ -40,9 +40,9 @@ BAM_TABLE_PREFIX = "quadrat_bam"
 
 #: Modules the ``pileup`` extra installs rather than the base install.
 #: Named here so a failed import can state the remedy instead of only
-#: the module -- `import_on_first_use` is reached for `joblib` too,
-#: which is a hard dependency and wants a different sentence.
-_PILEUP_EXTRA = ("giql", "polars", "polars_bio", "pyfaidx")
+#: the module. Every other module `import_on_first_use` reaches is a
+#: hard dependency and wants a different sentence.
+_PILEUP_EXTRA = ("giql", "polars_bio")
 
 
 #: Held for the duration of one pileup. Not a queue: a second pileup in
@@ -182,16 +182,17 @@ def import_on_first_use(name):
     ``tests/test_quadrat.py`` pins in a child interpreter, and the
     refusal below.
 
-    Availability *is* guarded, unlike what this said while it was
-    called ``lazy``. ``pyproject.toml`` puts polars, polars-bio, giql
-    and pyfaidx in ``[project.optional-dependencies] pileup``, so a
-    base install reaches here with the module genuinely absent -- and a
-    bare ``ModuleNotFoundError`` raised from the middle of a pileup
-    names neither the extra nor the remedy.
+    Availability *is* guarded. ``pyproject.toml`` puts polars-bio and
+    giql in ``[project.optional-dependencies] pileup``, so a base install
+    reaches here with the module genuinely absent -- and a bare
+    ``ModuleNotFoundError`` raised from the middle of a pileup names
+    neither the extra nor the remedy. Everything else reached through
+    here is a hard dependency, so its absence means an incomplete
+    environment rather than a minimal one, and the second message
+    below says so.
 
-    One accessor rather than one per library. Four one-line functions
-    differing only in a module name would be a parallel surface,
-    introduced by a change made to remove one.
+    One accessor rather than one per library. One-line functions
+    differing only in a module name would be a parallel surface.
     """
 
     try:
@@ -199,14 +200,16 @@ def import_on_first_use(name):
     except ImportError as error:
         if name in _PILEUP_EXTRA:
             raise ImportError(
-                "{} is needed to pile up alignments and is not "
+                "{} is needed to build tracks from alignments or to "
+                "group tracks into a window cache, and is not "
                 "installed. It belongs to quadrat's `pileup` extra: "
                 "install it with `uv sync --all-extras` in a checkout, "
                 'or `pip install "quadrat[pileup]"` once the extra\'s '
                 "git-pinned dependency reaches an index -- the comment "
                 "on `[tool.uv.sources]` in pyproject.toml says when. A "
-                "base install reads tracks that already exist and "
-                "cannot write new ones.".format(name)
+                "base install reads tracks that already exist, one "
+                "window at a time; building them and grouping them "
+                "both need this.".format(name)
             ) from error
         raise ImportError(
             "{} is declared as a dependency of quadrat and is not "
