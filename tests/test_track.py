@@ -1,8 +1,5 @@
 """Tests for turning alignments into tracks.
 
-Relocated from the ported ``tests/test_pileup_io.py`` and
-``tests/test_pileup.py``, assertions unchanged.
-
 The refusal of a second concurrent pileup is pinned through the call
 a caller makes rather than through the lock behind it: two threads both
 call `pileup_alignments` behind a barrier and exactly one is refused.

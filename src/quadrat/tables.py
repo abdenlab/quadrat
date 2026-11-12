@@ -18,7 +18,7 @@ import shutil
 import urllib.parse
 import uuid
 
-from quadrat._engine import fspath_or_none, import_on_first_use
+from quadrat._engine import fspath_or_none, import_on_first_use, name_list
 
 # Suffix of a track directory. Write-side only: nothing reads it back.
 # A reader is handed a path and globs `*.parquet` inside it, and
@@ -37,8 +37,7 @@ TRACK_SUFFIX = ".track.parquet"
 # Beside, not inside: a track directory must hold Parquet and nothing
 # else, because polars refuses to scan a directory of mixed extensions
 # and so does anything else pointed at the dataset. That invariant is
-# pinned by `test_track_directory_holds_parquet_and_nothing_else`,
-# which an earlier memory-mapped read index already broke once.
+# pinned by `test_track_directory_should_hold_parquet_and_nothing_else`.
 MANIFEST_SUFFIX = ".manifest.json"
 
 
@@ -523,7 +522,10 @@ def require_complete(source):
             "{} is missing {} of the {} Parquet files its manifest lists "
             "({}). The table has been truncated since it was written; "
             "rebuild it.".format(
-                path, len(missing), len(files), ", ".join(sorted(missing)[:5])
+                path,
+                len(missing),
+                len(files),
+                name_list(sorted(missing), "none", limit=5),
             )
         )
 
@@ -564,7 +566,11 @@ def require_complete(source):
                 "its {} files declare no count ({}). A record cannot state "
                 "a total it has no per-file heights to support; rebuild "
                 "the table.".format(
-                    path, rows, len(unusable), len(files), ", ".join(unusable[:5])
+                    path,
+                    rows,
+                    len(unusable),
+                    len(files),
+                    name_list(unusable, "none", limit=5),
                 )
             )
         total = sum(files.values())
@@ -583,7 +589,7 @@ def require_complete(source):
 
 # public
 def track_contigs(source):
-    """Every contig a track holds at least one row for.
+    """Return every contig a track holds at least one row for.
 
     The directory layout answers from its filenames: `TrackWriter`
     writes one file per contig run and none at all for a contig with no
@@ -599,29 +605,13 @@ def track_contigs(source):
     which verifies a table once and then addresses it many times; a
     caller who has not verified it should.
 
-    The counterpart of `bam_contigs` on the other side of the
-    pileup. #5's signal join compares its output against this, to
-    refuse a window set reaching a contig the track holds no rows for.
+    The counterpart of `bam_contigs` on the other side of the pileup.
 
     :param source: A ``.track.parquet`` directory, a single Parquet
         file, or an in-memory polars frame -- each as `require_complete`
         accepts them, a path being a `str`, `bytes` or `os.PathLike`.
     :returns: The contig names, as a `set`.
     :raises TypeError: if ``source`` is none of those.
-
-    .. rubric:: Implementation notes
-
-    The three shapes are dispatched here rather than through a shared
-    normalizer. There was one -- a module-private helper written for
-    #5's signal reader and called from this one place -- and it carried
-    the same path-or-frame dispatch `require_complete` performs over
-    the same four input shapes, with its own separately-worded
-    refusal. Its directory branch was unreachable from here, because
-    the branch above has already taken that case, so the half #5 needs
-    was dead and the half it does not was live. Its message was the
-    other cost: asked which contigs a track holds, a caller was told
-    that "the GIQL engine reads signals from .track.parquet tables",
-    about an operation they had not invoked.
     """
 
     path = fspath_or_none(source)
@@ -676,13 +666,12 @@ def strand_slices(frame, unstranded):
         # The precondition is the same one `TrackWriter.write` checks,
         # and the two resolve a violation in opposite directions: that
         # one sorts the frame and slices it again, this one refuses.
-        # The asymmetry is deliberate and criterion #2 is why -- the
-        # output must be byte-identical whatever produced it, and
-        # sorting by contig reorders nothing a reader sees while
-        # sorting by strand reorders the channels themselves. Slicing
-        # rather than repairing is also what keeps this free: a
-        # `filter` per strand costs three copies of half the table, as
-        # the summary above says.
+        # The asymmetry is deliberate: the output must be byte-identical
+        # whatever produced it, and sorting by contig reorders nothing a
+        # reader sees while sorting by strand reorders the channels
+        # themselves. Slicing rather than repairing is also what keeps
+        # this free: a `filter` per strand costs three copies of half the
+        # table, as the summary above says.
         #
         # It is load-bearing for correctness here rather than only for
         # memory: a dict comprehension over

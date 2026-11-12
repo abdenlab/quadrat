@@ -18,7 +18,7 @@ import os
 import struct
 import warnings
 
-from quadrat._engine import BAM_TABLE_PREFIX, engine, fspath_or_none
+from quadrat._engine import BAM_TABLE_PREFIX, engine, fspath_or_none, name_list
 
 # polars-bio's BAM provider returns ``start`` equal to pysam's 0-based
 # ``reference_start`` and ``end`` equal to the exclusive ``reference_end`` on
@@ -149,11 +149,10 @@ def bam_contigs(path):
         opens the same file moments later and reports it better, and a
         header that cannot be read only means the pileup is not split.
     :raises TypeError: if ``path`` is not a path at all. That is a
-        caller error rather than an unreadable file, and it used to
-        answer ``None`` like the rest -- which
-        `require_reference_contigs` reads as "this header could not be
-        read, so exempt it", so criterion #4's refusal was silently
-        waived for a wrong type as well as for an unreadable BAM.
+        caller error rather than an unreadable file, so it is refused
+        rather than answered ``None``, which
+        `require_reference_contigs` reads as a header that could not
+        be read and exempts from its refusal.
 
     .. rubric:: Implementation notes
 
@@ -290,8 +289,8 @@ def require_reference_contigs(lengths, available, alignments, sequences):
                 len(known),
                 alignment,
                 sequences,
-                ", ".join(list(known)[:3]),
-                ", ".join(list(lengths)[:3]),
+                name_list(known, "no contigs"),
+                name_list(lengths, "no contigs"),
             )
         )
 

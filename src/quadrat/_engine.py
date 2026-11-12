@@ -16,11 +16,11 @@ guard. Concurrency is still available through
 `pileup_many`'s ``process`` backend, where each
 worker is a process with a session of its own.
 
-Concurrent window grouping in one process is unsupported for the same
-reason. `quadrat.cache.group_track` registers its frames under the two
-fixed names `WINDOWS_TABLE` and `TRACK_TABLE` without the guard a
-pileup takes, so two groupings at once would bind and drop each
-other's frames.
+Outside a pileup, nothing that registers a table under one of the
+fixed names below takes that guard. Two such registrations of one name
+running at once in one process would bind and drop each other's
+tables, so concurrent calls of anything that makes them are
+unsupported for the same reason.
 """
 
 import contextlib
@@ -46,6 +46,18 @@ WINDOWS_TABLE = "quadrat_windows"
 #: one contig in a single frame, with the channel carried as a column
 #: the join projects rather than as a registration of its own.
 TRACK_TABLE = "quadrat_track"
+
+
+#: The windows side of the exclusion join: each window's span as a
+#: half-open run of exclusion bins, `quadrat.loci.EXCLUSION_BIN_WIDTH`
+#: bases wide. Fixed for the reason `WINDOWS_TABLE` is, the join running
+#: once per call.
+LOCUS_BINS_TABLE = "quadrat_locus_bins"
+
+
+#: The exclusion side of the exclusion join: each excluded region as a
+#: half-open run of the same bins.
+EXCLUSION_BINS_TABLE = "quadrat_exclusion_bins"
 
 
 #: Prefix of the one table name that is generated rather than fixed:
@@ -130,27 +142,40 @@ def fspath_or_none(value):
     return None
 
 
+def name_list(names, empty, limit=3):
+    """Return the first few of ``names`` as message text, with a count of the rest.
+
+    :param names: The names, as any iterable: contigs, paths, or
+        whatever else a message has to list without printing all of.
+    :param empty: The text that stands for no names at all.
+    :param limit: How many to spell out.
+    :returns: The names in backticks and comma-separated, followed by
+        ``and N more`` when there are more than ``limit``, or ``empty``
+        when there are none.
+    """
+
+    names = [str(name) for name in names]
+    shown = ", ".join("`{}`".format(name) for name in names[:limit])
+    if len(names) > limit:
+        return "{} and {} more".format(shown, len(names) - limit)
+    return shown or empty
+
+
 @contextlib.contextmanager
 def registered_fasta(path):
     """Bind ``path`` as `FASTA_TABLE` for the duration of the block.
 
-    The scope the registration did not have. A FASTA provider is a file
-    handle held open inside the process-global DataFusion context, and
-    it was recorded as a key in a dict: a value has no teardown hook,
-    so nothing ever dropped the table and the provider stayed bound for
-    the life of the process. The only documented release said it
-    reclaimed the registration and cleared three dict slots.
-
-    A context manager rather than a cache, because the retention bought
-    nothing. `FASTA_TABLE` has exactly one reader -- the one query
-    `quadrat.reference.chrom_lengths` runs when a reference has no
-    usable index -- and the *lengths* that query produces are what the
-    caller comes back for, so a second call is answered from the length
-    cache and never reaches here. Keeping the provider bound in case of
-    a second read meant keeping it bound for a read that cannot happen.
+    When a reference is scanned, and so registered here, is for
+    `quadrat.reference.chrom_lengths` to say.
 
     Yields the engine handle, so a caller needs one call rather than
     two for what is one operation.
+
+    .. rubric:: Implementation notes
+
+    A context manager rather than a cache, because a registration has
+    to be dropped by something and a cached value has no teardown hook
+    to drop it with.
     """
 
     pb = engine()
@@ -264,16 +289,16 @@ def import_on_first_use(name):
     except ImportError as error:
         if name in _PILEUP_EXTRA:
             raise ImportError(
-                "{} is needed to build tracks from alignments or to "
-                "group tracks into a window cache, and is not "
-                "installed. It belongs to quadrat's `pileup` extra: "
+                "{} is needed to build tracks from alignments and to "
+                "join windows against tracks or exclusion lists, and is "
+                "not installed. It belongs to quadrat's `pileup` extra: "
                 "install it with `uv sync --all-extras` in a checkout, "
                 'or `pip install "quadrat[pileup]"` once the extra\'s '
                 "git-pinned dependency reaches an index -- the comment "
                 "on `[tool.uv.sources]` in pyproject.toml says when. A "
                 "base install reads tracks that already exist, one "
-                "window at a time; building them and grouping them "
-                "both need this.".format(name)
+                "window at a time; building them and joining "
+                "against them both need this.".format(name)
             ) from error
         raise ImportError(
             "{} is declared as a dependency of quadrat and is not "
@@ -350,6 +375,41 @@ def engine():
             tqdm.tqdm.set_lock(threading.RLock())
             _installed.add("tqdm-lock")
     return import_on_first_use("polars_bio")
+
+
+def transpile_intervals(query, *specs):
+    """Return a GIQL interval query transpiled to the SQL the engine runs.
+
+    Nothing is kept between calls. The transpilation is pure, so a
+    caller whose query never varies holds the result itself.
+
+    :param query: The GIQL text, naming each table by the name its
+        frame is registered under.
+    :param specs: One ``(table, start column, end column)`` triple per
+        table the query treats as intervals. Each is half-open over
+        its two columns, on a contig column named ``chrom``, and
+        unstranded.
+    :returns: The SQL, as a `str`.
+    :raises ImportError: if the ``pileup`` extra is not installed.
+
+    .. rubric:: Implementation notes
+
+    Transpiled rather than written, because an interval predicate has
+    no operator in the target dialect: giql turns ``INTERSECTS`` into
+    the bound comparisons the engine plans as an interval join.
+    """
+
+    giql = import_on_first_use("giql")
+    return giql.transpile(
+        query,
+        tables=[
+            giql.Table(
+                name, chrom_col="chrom", start_col=start, end_col=end, strand_col=None
+            )
+            for name, start, end in specs
+        ],
+        dialect="datafusion-bio",
+    )
 
 
 def sql_string(value):
