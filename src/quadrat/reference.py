@@ -1,4 +1,4 @@
-"""Reading a reference: contig lengths and sequence by coordinate.
+"""Reading a reference: its contig lengths.
 
 Lengths come from the FASTA index when one exists and from a scan when
 it does not, because the pileup needs them before it reads a single
@@ -49,10 +49,23 @@ def chrom_lengths(sequences):
     same order. It dominated the memory profile of an otherwise lazy
     pipeline.
 
-    The scan remains the fallback for a FASTA with no ``.fai`` beside it
-    that cannot be indexed in place. pyfaidx is also the reference
+    The scan is the fallback for a FASTA with no usable ``.fai`` beside
+    it that cannot be indexed in place. pyfaidx is also the reference
     definition here, in the sense that bam2bw and tangermeme take their
     lengths the same way.
+
+    The lengths of one reference at a time are kept, keyed on its path,
+    modification time and size. A call for that reference while its
+    file is unchanged is answered from them, with no index read and no
+    scan. A call for any other reference, or for the same path after
+    its file changed, reads the lengths afresh, by a scan where there
+    is no usable index, and keeps them in place of the ones held. A
+    mapping with no contig in it is answered and not kept, so a
+    reference whose index was read while still being written is read
+    again by the next call rather than answered as empty from then on.
+
+    Two calls that scan at once in one process are unsupported;
+    `quadrat._engine` says why.
 
     :param sequences: FASTA path, as a `str`, `bytes` or
         `os.PathLike`.
@@ -116,7 +129,9 @@ def chrom_lengths(sequences):
                 zip(frame["name"].to_list(), frame["length"].to_list())
             )
 
-        cache["chrom_lengths"] = (key, lengths)
+        # Only a mapping that names a contig; the docstring says why.
+        if lengths:
+            cache["chrom_lengths"] = (key, lengths)
     # A copy of what this call resolved, not of the global, and not the
     # cached mapping itself. Two reasons, and the first is the one that
     # bites: reading the slot back hands this caller whatever the slot
@@ -134,32 +149,31 @@ def clear_cache():
     """Forget the cached chromosome lengths.
 
     The cache invalidates itself when the file at a path changes, so
-    there is no staleness left for this to cure; what it buys is the
-    memory the mapping holds.
+    there is no staleness for this to cure; what it buys is the memory
+    the mapping holds.
 
-    Nothing to release beyond that. A FASTA registration is held for
-    the duration of `quadrat._engine.registered_fasta`'s block and
-    dropped on the way out, so no provider outlives the read -- which
-    is what this function's summary used to claim it released while
-    clearing a dict slot.
+    No registration is released by it: `quadrat._engine.registered_fasta`
+    drops its own on the way out of its block.
     """
 
     cache["chrom_lengths"] = None
 
 
 def _fasta_key(sequences):
-    """What a cached read of this FASTA is keyed on.
+    """Return the key a cached read of this FASTA is filed under.
 
-    The path plus its modification time and size, not the path alone.
-    A caller who regenerates or replaces a reference at the same path
+    `chrom_lengths` states the key. It is not the path alone because a
+    caller who regenerates or replaces a reference at the same path
     within one process would otherwise be handed the previous genome's
     lengths -- which then decide which reads are kept and which contigs
     the batches are built from, so the stale answer is not merely stale
     but silently changes what a table contains.
 
-    Falls back to the path alone when it cannot be stat'd, which is the
-    behaviour this had everywhere before: there is nothing better to
-    key on, and the reader below will raise on the same path anyway.
+    .. rubric:: Implementation notes
+
+    A path that cannot be stat'd is keyed on the path alone. There is
+    nothing better to key on, and the read that follows fails on the
+    same path.
     """
 
     try:

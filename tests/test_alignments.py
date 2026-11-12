@@ -1,27 +1,21 @@
-"""Tests for reading alignments: contigs, indexes, and the refusals.
+"""Tests for reading alignments: contigs, registration, and the refusals.
 
-Relocated from the ported ``tests/test_pileup.py`` and
-``tests/test_pileup_io.py``, assertions unchanged, split where one body
-held two behaviours. `register_alignments` is new: it had no test at
-all, although it is the function that puts a BAM into the session under
-the ``quadrat_`` prefix that keeps this package's tables off
-cherimoya's.
+`bam_contigs` is tested against the header pysam reads, and
+`register_alignments` for the ``quadrat_``-prefixed tables it binds,
+and unbinds when one of its files is refused. The BAM provider's
+coordinates are compared with pysam's convention for convention, so a
+provider that changed its base fails. The ``samtools index`` warning
+is pinned by whether it fires, and it fires for an alignment with
+only a CSI beside it, because polars-bio cannot restrict a scan with
+one and treating it as an index would promise a pushdown that does
+not exist.
 
-Two reseats. The provider-parity test compared polars-bio's coordinates
-against pysam's through the private ``BAM_START_OFFSET``, which made
-the constant the subject; it now compares the two conventions directly,
-so a provider that changed its base still fails. And the index-naming
-test called the private ``_has_bam_index``; it now asks whether the
-``samtools index`` warning fires, which is the behaviour that helper
-exists to drive and which also pins the reason -- polars-bio cannot
-restrict a scan with a CSI, so treating one as an index would promise a
-pushdown that does not exist.
-
-The contig-naming refusals are found against a corpus of deliberately
-defective files rather than against the synthetic BAMs the rest of this
-module uses, which are all indexed and all named to match their
-reference. Each of those failures used to be silent, so the tests for
-them are about the noise.
+The contig-naming refusals of a pileup are tested against alignments
+built to mismatch their reference, rather than against the synthetic
+BAMs the rest of this module uses, which are all indexed and all
+named to match it. How the refusal names a long header is tested on
+`require_reference_contigs` itself, which takes the header's contigs
+as a mapping and so needs no alignment at all.
 """
 
 import logging
@@ -579,6 +573,35 @@ def test_bam_provider_should_report_the_coordinates_pysam_reports(corpus, pysam)
 
     unmapped = frame[(frame["flags"] & 4) != 0]
     assert set(unmapped.index) == {"placed_unmapped"}
+
+
+def test_require_reference_contigs_should_count_the_contigs_its_refusal_does_not_list():
+    """Test how the contig-mismatch refusal names a long header.
+
+    Given:
+        An alignment whose header declares five contigs, none of them
+        among the reference's two.
+    When:
+        The reference contigs are required of it.
+    Then:
+        It should raise `ValueError` spelling out the first three of
+        the alignment's contigs and counting the two it leaves out,
+        beside the reference's own.
+    """
+
+    # Arrange
+    header = {str(number): 1000 for number in range(1, 6)}
+
+    # Act & assert
+    with pytest.raises(
+        ValueError,
+        match=r"^none of the 5 contigs in ensembl\.bam appear in genome\.fa -- "
+        r"the alignment names `1`, `2`, `3` and 2 more and the reference "
+        r"names `chr1`, `chr2`\.",
+    ):
+        alignments.require_reference_contigs(
+            dict(TWO_CONTIGS), {"ensembl.bam": header}, ["ensembl.bam"], "genome.fa"
+        )
 
 
 @pytest.mark.parametrize("groups", [1, 4])

@@ -22,7 +22,14 @@ from hypothesis import strategies as st
 
 import quadrat
 from quadrat import stores
-from tests import FILE_BACKED, THREE_CONTIGS, TWO_CONTIGS, builders, record_placements
+from tests import (
+    FILE_BACKED,
+    THREE_CONTIGS,
+    TWO_CONTIGS,
+    builders,
+    parse_fasta,
+    record_placements,
+)
 
 # Contig names over lowercase letters only, so a generated name cannot
 # collide with FASTA or BED syntax. Lengths stay small because every
@@ -42,11 +49,23 @@ alignment_sizes = st.dictionaries(
     contig_names, st.integers(min_value=20, max_value=200), min_size=1, max_size=4
 )
 
+# Rows of a contig, a start and a stop followed by none to seven text
+# fields of mixed width, every field printable and free of tabs, so
+# that rows in one file disagree on how many fields they carry.
 bed_rows = st.lists(
-    st.tuples(
+    st.builds(
+        lambda chrom, start, stop, rest: (chrom, start, stop, *rest),
         contig_names,
         st.integers(min_value=0, max_value=10**6),
         st.integers(min_value=0, max_value=10**6),
+        st.lists(
+            st.text(
+                st.characters(min_codepoint=32, max_codepoint=126),
+                min_size=0,
+                max_size=12,
+            ),
+            max_size=7,
+        ),
     ),
     max_size=10,
 )
@@ -129,21 +148,6 @@ def cigars(draw):
     return "".join("{}{}".format(length, op) for op, length in operations)
 
 
-def parse_fasta(path):
-    """Return contig name to sequence, read back from a FASTA on disk."""
-
-    sequences = {}
-    name = None
-    with open(path) as handle:
-        for line in handle:
-            if line.startswith(">"):
-                name = line[1:].strip()
-                sequences[name] = []
-            else:
-                sequences[name].append(line.strip())
-    return {name: "".join(parts) for name, parts in sequences.items()}
-
-
 def sequence_lines(path):
     """Return the sequence lines of a FASTA, headers dropped."""
 
@@ -152,7 +156,11 @@ def sequence_lines(path):
 
 
 def read_bed(path):
-    """Return ``(chrom, start, stop)`` rows read back from a BED, gzipped or not."""
+    """Return the rows read back from a BED, gzipped or not, as tuples of fields.
+
+    The start and stop come back as integers and every further field
+    as the text it was written as.
+    """
 
     opener = gzip.open if str(path).endswith(".gz") else open
     with opener(path, "rt") as handle:
@@ -160,8 +168,8 @@ def read_bed(path):
         for line in handle:
             if not line.strip():
                 continue
-            chrom, start, stop = line.rstrip("\n").split("\t")
-            rows.append((chrom, int(start), int(stop)))
+            chrom, start, stop, *rest = line.rstrip("\n").split("\t")
+            rows.append((chrom, int(start), int(stop), *rest))
     return rows
 
 
@@ -541,28 +549,36 @@ def test_write_bed_should_round_trip_a_row_for_either_suffix(tmp_path, suffix):
     assert read_bed(path) == [("chr1", 500, 600)]
 
 
-def test_write_bed_should_keep_only_the_leading_three_fields(tmp_path):
-    """Test that wider rows are narrowed rather than written through.
+def test_write_bed_should_write_every_field_a_row_carries(tmp_path):
+    """Test that a wider row is written through at its own width.
 
     Given:
-        Several rows, the first carrying a name, score and strand
-        beyond the leading three fields.
+        A six-field peak row, a ten-field row carrying a summit offset
+        and a three-field row.
     When:
         The builder writes them.
     Then:
-        It should write one line per row in order, keeping only the
-        contig, start and stop.
+        It should write one line per row in order, each with every
+        field its row carried.
     """
 
     # Arrange
     path = str(tmp_path / "wide.bed")
-    rows = [("chr1", 100, 200, "peak", 50, "+"), ("chr2", 10, 20)]
+    rows = [
+        ("chr1", 100, 200, "peak", 50, "+"),
+        ("chr1", 300, 400, "peak", 0, ".", 0, 0, 0, 40),
+        ("chr2", 10, 20),
+    ]
 
     # Act
     builders.write_bed(path, rows)
 
     # Assert
-    assert read_bed(path) == [("chr1", 100, 200), ("chr2", 10, 20)]
+    assert read_bed(path) == [
+        ("chr1", 100, 200, "peak", "50", "+"),
+        ("chr1", 300, 400, "peak", "0", ".", "0", "0", "0", "40"),
+        ("chr2", 10, 20),
+    ]
 
 
 @settings(FILE_BACKED, max_examples=25)
@@ -571,12 +587,14 @@ def test_write_bed_should_round_trip_any_rows(tmp_path, rows):
     """Test the write-and-read roundtrip over arbitrary rows.
 
     Given:
-        Any list of contig, start and stop rows, written to both a
-        plain and a gzipped path.
+        Any list of contig, start and stop rows, each followed by none
+        to seven text fields of mixed width, written to both a plain
+        and a gzipped path.
     When:
         Each file is read back with its matching reader.
     Then:
-        It should return the original rows in order from both.
+        It should return the original rows in order from both, every
+        field a row carried and no other.
     """
 
     # Arrange
@@ -1327,6 +1345,205 @@ def test_write_random_bam_should_size_its_reads_from_the_read_length(
         reads = list(bam.fetch())
     assert [read.cigarstring for read in reads] == ["35M"] * 8
     assert [read.query_length for read in reads] == [35] * 8
+
+
+def test_track_rows_frame_should_answer_the_three_columns_a_track_declares():
+    """Test the schema of a built in-memory track.
+
+    Given:
+        Rows over two contigs.
+    When:
+        The builder turns them into a frame.
+    Then:
+        It should answer a polars frame with exactly ``chrom``, ``pos``
+        and ``value``, as text, 64-bit integers and 64-bit floats.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+
+    # Act
+    frame = builders.track_rows_frame([("chr1", 5, 2.0), ("chr2", 7, 3.0)])
+
+    # Assert
+    assert isinstance(frame, polars.DataFrame)
+    assert dict(frame.schema) == {
+        "chrom": polars.Utf8,
+        "pos": polars.Int64,
+        "value": polars.Float64,
+    }
+
+
+def test_track_rows_frame_should_keep_the_rows_in_the_order_given():
+    """Test that the builder neither sorts nor groups.
+
+    Given:
+        Rows whose contigs interleave and whose positions descend.
+    When:
+        The builder turns them into a frame.
+    Then:
+        It should hold the rows in the order given.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    rows = [("chr2", 50, 1.0), ("chr1", 30, 2.0), ("chr2", 10, 3.0), ("chr1", 20, 4.0)]
+
+    # Act
+    frame = builders.track_rows_frame(rows)
+
+    # Assert
+    assert frame.rows() == rows
+
+
+def test_track_rows_frame_should_convert_each_field_to_its_column_type():
+    """Test the rows the builder accepts beyond the literal ones.
+
+    Given:
+        A row whose contig is an integer, whose position is a string
+        of digits and whose value is an integer.
+    When:
+        The builder turns it into a frame.
+    Then:
+        It should hold the contig as text, the position as an integer
+        and the value as a float.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+
+    # Act
+    frame = builders.track_rows_frame([(1, "12", 3)])
+
+    # Assert
+    assert frame.rows() == [("1", 12, 3.0)]
+    assert isinstance(frame["value"][0], float)
+
+
+def test_track_rows_frame_should_answer_an_empty_track_for_no_rows():
+    """Test the frame built from nothing.
+
+    Given:
+        No rows.
+    When:
+        The builder turns them into a frame.
+    Then:
+        It should answer a frame of no rows that still carries the
+        three columns, so a reader can select them.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+
+    # Act
+    frame = builders.track_rows_frame([])
+
+    # Assert
+    assert frame.height == 0
+    assert frame.columns == ["chrom", "pos", "value"]
+
+
+@settings(max_examples=50)
+@given(
+    rows=st.lists(
+        st.tuples(
+            contig_names,
+            st.integers(min_value=0, max_value=2**40),
+            st.integers(min_value=-(2**20), max_value=2**20).map(float),
+        ),
+        max_size=12,
+    )
+)
+def test_track_rows_frame_should_hold_exactly_the_rows_it_was_given(rows):
+    """Test the builder over arbitrary rows.
+
+    Given:
+        Any rows of a contig name, a position and a whole-number value,
+        repeats allowed.
+    When:
+        The builder turns them into a frame.
+    Then:
+        The frame's rows should equal the rows given, in order.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+
+    # Act
+    frame = builders.track_rows_frame(rows)
+
+    # Assert
+    assert frame.rows() == rows
+
+
+def test_scattered_rows_should_place_distinct_positions_on_every_contig():
+    """Test the geometry of the scattered rows.
+
+    Given:
+        Two contigs of 1000 and 500 bases.
+    When:
+        Rows are scattered over them.
+    Then:
+        It should answer rows on both contigs, each position inside
+        its contig and given once, sorted by contig and position, and
+        no more of them on a contig than a third of its length.
+    """
+
+    # Act
+    rows = builders.scattered_rows(TWO_CONTIGS, seed=3)
+
+    # Assert
+    placed = [(chrom, pos) for chrom, pos, _ in rows]
+    assert placed == sorted(set(placed))
+    for chrom, size in TWO_CONTIGS.items():
+        positions = [pos for on, pos in placed if on == chrom]
+        assert 0 < len(positions) <= size // 3
+        assert 0 <= min(positions) and max(positions) < size
+
+
+def test_scattered_rows_should_give_each_position_a_whole_value_from_one_to_four():
+    """Test the values of the scattered rows.
+
+    Given:
+        Two contigs.
+    When:
+        Rows are scattered over them.
+    Then:
+        Every value should be a float equal to 1, 2, 3 or 4, and more
+        than one of those should occur.
+    """
+
+    # Act
+    rows = builders.scattered_rows(TWO_CONTIGS, seed=3)
+
+    # Assert
+    values = [value for _, _, value in rows]
+    assert all(isinstance(value, float) for value in values)
+    assert set(values) <= {1.0, 2.0, 3.0, 4.0}
+    assert len(set(values)) > 1
+
+
+def test_scattered_rows_should_answer_the_same_rows_for_the_same_seed():
+    """Test that the scattering is a function of its seed.
+
+    Given:
+        Two contigs and two seeds.
+    When:
+        Rows are scattered twice under one seed and once under the
+        other.
+    Then:
+        The two under one seed should be equal, and differ from the
+        third.
+    """
+
+    # Act
+    first = builders.scattered_rows(TWO_CONTIGS, seed=3)
+    again = builders.scattered_rows(TWO_CONTIGS, seed=3)
+    other = builders.scattered_rows(TWO_CONTIGS, seed=4)
+
+    # Assert
+    assert first == again
+    assert first != other
 
 
 def test_write_track_should_write_one_parquet_file_per_contig(tmp_path):

@@ -1,14 +1,12 @@
 """Tests for the track format's readers and the paths it is built from.
 
-The reader guards are relocated from the ported ``tests/test_pileup.py``
-with their assertions unchanged, split where one body held two
-behaviours. The rest is new.
+The readers are tested for what they answer over each shape a track
+takes and for the guards that refuse a track that is incomplete or no
+track at all.
 
 Every directory built by hand here is built through `manifest_path` and
 `track_chrom_path` rather than by spelling the layout out, so the
-format lives in one place. The helper these replaced hand-wrote
-``x.track.parquet.manifest.json``, which is the format asserted in the
-test that reads it.
+format is stated once, in the tests of those two functions.
 """
 
 import importlib
@@ -284,6 +282,37 @@ def test_require_complete_should_raise_when_the_manifest_lists_an_absent_file(
 
     # Act & assert
     with pytest.raises(ValueError, match="truncated"):
+        tables.require_complete(str(table))
+
+
+def test_require_complete_should_count_the_absent_files_it_does_not_list(tmp_path):
+    """Test how the refusal names more absent files than it spells out.
+
+    Given:
+        A track directory whose manifest lists seven files, none of
+        which is there.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` spelling out the first five in
+        order and counting the two it leaves out.
+    """
+
+    # Arrange
+    table = tmp_path / ("x" + tables.TRACK_SUFFIX)
+    table.mkdir()
+    absent = [
+        os.path.basename(tables.track_chrom_path(str(table), "chr{}".format(index)))
+        for index in range(1, 8)
+    ]
+    manifest_for(table, 7, {name: 1 for name in absent})
+
+    # Act & assert
+    with pytest.raises(
+        ValueError,
+        match=r"\(`chr1\.parquet`, `chr2\.parquet`, `chr3\.parquet`, "
+        r"`chr4\.parquet`, `chr5\.parquet` and 2 more\)",
+    ):
         tables.require_complete(str(table))
 
 
@@ -666,6 +695,34 @@ def test_require_complete_should_raise_when_a_row_total_has_no_counts_to_support
         tables.require_complete(str(table))
 
 
+def test_require_complete_should_count_the_uncounted_files_it_does_not_list(tmp_path):
+    """Test how the refusal names more uncounted files than it spells out.
+
+    Given:
+        A manifest recording a row total while none of its seven files
+        declares a count.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` spelling out the first five in
+        order and counting the two it leaves out.
+    """
+
+    # Arrange
+    table = tmp_path / ("partial" + tables.TRACK_SUFFIX)
+    table.mkdir()
+    names = [chrom_file(table, "chr{}".format(index)) for index in range(1, 8)]
+    manifest_for(table, 7, {name: None for name in names})
+
+    # Act & assert
+    with pytest.raises(
+        ValueError,
+        match=r"declare no count \(`chr1\.parquet`, `chr2\.parquet`, "
+        r"`chr3\.parquet`, `chr4\.parquet`, `chr5\.parquet` and 2 more\)",
+    ):
+        tables.require_complete(str(table))
+
+
 def test_require_complete_should_accept_a_table_built_from_the_published_rules(
     tmp_path,
 ):
@@ -710,21 +767,21 @@ def test_require_complete_should_accept_a_table_built_from_the_published_rules(
     assert quadrat.track_contigs(str(table)) == set(heights)
 
 
-def test_track_directory_holds_parquet_and_nothing_else(tmp_path):
+def test_track_directory_should_hold_parquet_and_nothing_else(tmp_path):
     """Test the invariant the manifest sits outside the directory for.
 
     Given:
-        A track written with several contigs and a manifest.
+        A track directory holding several contigs' files, with its
+        manifest written.
     When:
         The directory is listed.
     Then:
-        Every entry should be a Parquet file.
+        It should hold at least one entry, every entry a Parquet file,
+        and the manifest should exist beside it.
 
     polars refuses to scan a directory of mixed extensions, and so does
     anything else pointed at the dataset, which is why the completeness
-    record is a sibling of the directory rather than a member of it. A
-    comment in `quadrat.tables` claimed this test existed before it
-    did; an earlier memory-mapped read index broke the invariant once.
+    record is a sibling of the directory rather than a member of it.
     """
 
     # Arrange
@@ -847,15 +904,11 @@ def test_track_contigs_should_refuse_a_non_track_in_its_own_words():
     When:
         `track_contigs` is asked for its contigs.
     Then:
-        The message should name `track_contigs` and the three shapes it
-        reads, and say nothing about reading signals.
+        It should raise `TypeError` whose message says
+        `track_contigs` reads a track and says nothing about signals.
 
-    The dispatch was shared with a helper written for #5's signal
-    reader, so a caller who asked which contigs a track holds was told
-    that "the GIQL engine reads signals from .track.parquet tables" --
-    about an operation they had not invoked. The helper's other half
-    was worse: its directory branch could not be reached from here,
-    because `track_contigs` takes that case before calling it.
+    A caller who asked which contigs a track holds is told about that
+    call, not about reading signals, an operation they did not invoke.
     """
 
     # Act
@@ -907,8 +960,8 @@ def test_track_contigs_should_read_a_single_file_table(tmp_path):
     Then:
         It should report what the ``chrom`` column holds.
 
-    The branch survives the helper that used to hold it, and it is the
-    shape the reference page records as readable but unverifiable.
+    It is the shape the reference page records as readable but
+    unverifiable.
     """
 
     # Arrange

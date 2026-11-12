@@ -2,19 +2,24 @@
 
 Provides `WindowSignalCache`, `group_track` that produces the arrays a
 cache holds, `window_group_sums` for per-window totals over the same
-rows, and the functions that key, write and read a persisted entry.
+rows, the functions that key, write and read a persisted entry, and
+`require_windows`, `track_list` and `window_columns`, the argument
+checks and the window decomposition this package's readers of window
+sets share.
 
 Everything here is package-internal: no name carries a ``# public``
 marker and none is re-exported from `quadrat`.
 """
 
 import atexit
+import collections.abc
 import functools
 import hashlib
 import json
 import multiprocessing
 import os
 import shutil
+import sys
 import tempfile
 
 import numpy
@@ -25,6 +30,7 @@ from quadrat._engine import (
     fspath_or_none,
     import_on_first_use,
     registered_frames,
+    transpile_intervals,
 )
 from quadrat.stores import ProcessLocalHandles, track_frame
 from quadrat.tables import (
@@ -104,12 +110,6 @@ _NPY_HEADER_BYTES = 128
 
 #: Prefixed to every key. `window_cache_key`'s notes say why.
 _KEY_DOMAIN = b"quadrat-window-cache\x00"
-
-
-#: The transpiled grouping join, per process. A plain dict rather than
-#: SCREAMING_CASE because the binding is constant and the referent is
-#: not: `_signal_sql` fills it on first use.
-_transpiled = {}
 
 
 class WindowSignalCache(ProcessLocalHandles):
@@ -198,11 +198,12 @@ class WindowSignalCache(ProcessLocalHandles):
     ):
         """Group ``tracks`` over ``windows`` and hold the result.
 
-        The grouping is `group_track`'s, and needs the ``pileup`` extra
-        as it states.
+        The grouping is `group_track`'s, and as it states needs the
+        ``pileup`` extra and is unsupported concurrently in one process.
 
         :param windows: As `group_track` takes it.
-        :param tracks: One track per channel, in channel order.
+        :param tracks: One track per channel, in channel order, as
+            `group_track` takes them.
         :param bound_columns: The window's start and end column names.
         :param residency: ``"memory"``, ``"mapped"``, or ``None`` to
             choose from the multiprocessing start method. ``None``
@@ -217,6 +218,7 @@ class WindowSignalCache(ProcessLocalHandles):
             nodes is a tmpfs not sized for a cache.
         """
 
+        tracks = track_list("WindowSignalCache.build", "tracks", tracks)
         return cls.from_arrays(
             group_track(windows, tracks, bound_columns=bound_columns),
             residency=residency,
@@ -879,8 +881,96 @@ def write_cache_arrays(root, offsets, pos, val, chan):
         numpy.save(os.path.join(root, name + ".npy"), array)
 
 
-def _window_columns(windows, bound_columns):
-    """A window set's three columns, with its rows grouped by contig.
+def require_windows(caller, windows):
+    """Raise `TypeError` unless ``windows`` is a `polars.DataFrame`.
+
+    :param caller: The name of the function the windows were given to,
+        for the message.
+    :param windows: The value given as a window frame.
+    :raises TypeError: if it is anything else, a frame of another
+        library included.
+    """
+
+    polars = import_on_first_use("polars")
+    if not isinstance(windows, polars.DataFrame):
+        raise TypeError(
+            "{} takes a polars DataFrame of windows. Got {}.".format(
+                caller, type(windows).__name__
+            )
+        )
+
+
+def track_list(caller, label, tracks):
+    """Return a one-track-per-channel argument as a list, refusing a single track.
+
+    The elements are not looked at: each is refused or read by
+    `quadrat.stores.track_frame` when it is opened.
+
+    :param caller: The name of the function the tracks were given to,
+        for the message.
+    :param label: The name of the argument they were given as.
+    :param tracks: A sequence of tracks, one per channel, in channel
+        order: a `list`, a `tuple`, or any other iterable that yields
+        its elements in an order of its own, a generator included. It
+        is walked once.
+    :returns: The tracks, as a `list`.
+    :raises TypeError: if ``tracks`` is itself a path, i.e., a `str`,
+        `bytes` or `os.PathLike`; itself a frame, polars or pandas; or
+        a `set`, a `frozenset` or a mapping, none of which states the
+        order its tracks are in.
+
+    .. rubric:: Implementation notes
+
+    This is where a track argument's answer to a single item is
+    decided, and it is the opposite of a locus argument's, for the
+    reason `quadrat.loci._locus_sources` gives. Tracks are taken as any
+    ordered iterable, and how many there are is the channel axis of everything
+    read from them, so one track is written ``[track]``, as
+    `quadrat.stores.TrackStore` also requires. It has to be refused by
+    type rather than left to fail, because every single track walks as
+    something: a path a character at a time, each character then
+    looked up as a track of its own, and a frame a column at a time.
+
+    A pandas frame is told by `sys.modules`, since one cannot have been
+    passed in without pandas already imported, and importing it here
+    would charge every grouping for a library it does not use.
+
+    A set is refused because it would be accepted otherwise and walk
+    in an order that changes between processes with the hash seed, so
+    the channel axis, the track an index names and the cache key would
+    all change with it and nothing would raise. A mapping walks as its
+    keys, which drops the tracks if they are its values.
+    """
+
+    polars = import_on_first_use("polars")
+    if fspath_or_none(tracks) is not None or isinstance(
+        tracks, (polars.DataFrame, polars.LazyFrame)
+    ):
+        raise TypeError(
+            "{} reads one track per channel: `{}` must be a sequence of "
+            "tracks, not a single one. Pass a one-element list for one "
+            "channel.".format(caller, label)
+        )
+    pandas = sys.modules.get("pandas")
+    if pandas is not None and isinstance(tracks, pandas.DataFrame):
+        raise TypeError(
+            "{} reads one track per channel: `{}` must be a sequence of "
+            "tracks, and a pandas DataFrame is neither that nor a track. "
+            "Pass a list of track paths or polars frames.".format(caller, label)
+        )
+    if isinstance(tracks, (set, frozenset, collections.abc.Mapping)):
+        raise TypeError(
+            "{} reads one track per channel, and the order of `{}` is the "
+            "channel axis: a {} states no order for its tracks. Pass a "
+            "list or a tuple in channel order.".format(
+                caller, label, type(tracks).__name__
+            )
+        )
+    return list(tracks)
+
+
+def window_columns(windows, bound_columns):
+    """Return a window set's bounds, and its rows grouped by contig.
 
     The decomposition every reader of a window set begins with, written
     once so that no two readers can disagree about which rows belong to
@@ -891,7 +981,8 @@ def _window_columns(windows, bound_columns):
     :param bound_columns: Its start and end column names.
     :returns: ``(starts, ends, groups)``. ``starts`` and ``ends`` are
         ``int64`` over every window. ``groups`` pairs each contig with
-        the ascending row indices on it, in contig order.
+        the ascending row indices on it, in ascending order of contig
+        name, and is empty for an empty frame.
 
     .. rubric:: Implementation notes
 
@@ -939,7 +1030,8 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
     that duplication is the price of a read that needs no search.
 
     Needs the ``pileup`` extra, which installs the engine the grouping
-    runs on.
+    runs on. Concurrent calls in one process are unsupported;
+    `quadrat._engine` says why.
 
     :param windows: A `polars.DataFrame` carrying ``chrom`` and the
         two columns ``bound_columns`` names, one row per window. Row
@@ -947,8 +1039,9 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
         by. Refused by type: a frame of another library groups
         correctly here and then cannot be persisted, so every read of
         its entry would be a miss.
-    :param tracks: One track per channel, in channel order, each of any
-        shape `quadrat.stores.track_frame` accepts.
+    :param tracks: One track per channel, in channel order, as
+        `track_list` takes them, each of any shape
+        `quadrat.stores.track_frame` accepts.
     :param bound_columns: The window's start and end column names.
         The signal is grouped over the output window and a control over
         the wider input window, which is the whole of why this is a
@@ -974,9 +1067,12 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
         ``n_channels`` is returned because the arrays cannot recover
         it: a trailing channel with no rows in any window leaves no
         trace in ``chan``.
-    :raises TypeError: if ``windows`` is not a `polars.DataFrame`.
+    :raises TypeError: if ``windows`` is not a `polars.DataFrame`, if
+        ``tracks`` is a single track or an unordered collection of
+        them, or if a track is of no shape a track can take.
     :raises ValueError: if there are more channels than ``int16`` can
-        index.
+        index, or if a track directory does not verify complete.
+    :raises FileNotFoundError: if a track path does not exist.
     :raises ImportError: if the ``pileup`` extra is not installed.
 
     .. rubric:: Implementation notes
@@ -1004,9 +1100,19 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
     implementations of one function agreeing is a thing to test rather
     than a thing to have. `window_group_sums` reads the same rows
     another way, for the reason its own notes give.
+
+    Memory peaks near 28 bytes a site, a site being one row of the
+    result. Every contig's hits are held until the last contig is
+    joined, at 18 bytes a site: an ``int64`` window index, an ``int32``
+    offset, a ``float32`` value and an ``int16`` channel. The 10 bytes a
+    site returned, ``pos``, ``val`` and ``chan`` at the dtypes above,
+    are filled from them while they are still held. Beside that sit
+    ``offsets``, at 8 bytes a window, and one contig's join answer at a
+    time.
     """
 
     polars = import_on_first_use("polars")
+    tracks = track_list("group_track", "tracks", tracks)
     n_windows = len(windows)
     n_channels = len(tracks)
 
@@ -1021,15 +1127,9 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
         )
 
     # Refused by type, for the reason the ``windows`` parameter gives.
-    if not isinstance(windows, polars.DataFrame):
-        raise TypeError(
-            "group_track takes a polars DataFrame of windows, because "
-            "an entry's window tables are written with it. Got {}.".format(
-                type(windows).__name__
-            )
-        )
+    require_windows("group_track", windows)
 
-    starts, ends, groups = _window_columns(windows, bound_columns)
+    starts, ends, groups = window_columns(windows, bound_columns)
 
     sql = _signal_sql()
     frames = [track_frame(track) for track in tracks]
@@ -1154,9 +1254,8 @@ def window_group_sums(
 
     :param windows: A `polars.DataFrame` carrying ``chrom`` and the
         two columns ``bound_columns`` names, one row per window.
-    :param tracks: One track per channel, in channel order, each of
-        any shape `quadrat.stores.track_frame` accepts, as `group_track`
-        takes them.
+    :param tracks: One track per channel, in channel order, as
+        `group_track` takes them.
     :param channel_group_sizes: How many consecutive channels each
         group pools, in group order. Must sum to the channel count.
     :param bound_columns: The window's start and end column names, as
@@ -1166,7 +1265,10 @@ def window_group_sums(
     :raises ValueError: if ``channel_group_sizes`` does not sum to
         the channel count, or if a track is a directory that cannot be
         verified complete.
-    :raises TypeError: if a track is of no shape a track can take.
+    :raises TypeError: if ``tracks`` is a single track or an unordered
+        collection of them, or if a track is of no shape a track can
+        take.
+    :raises FileNotFoundError: if a track path does not exist.
 
     .. rubric:: Implementation notes
 
@@ -1199,6 +1301,7 @@ def window_group_sums(
 
     polars = import_on_first_use("polars")
     torch = import_on_first_use("torch")
+    tracks = track_list("window_group_sums", "tracks", tracks)
     n_windows = len(windows)
     totals = numpy.zeros((n_windows, len(channel_group_sizes)), dtype=numpy.float64)
 
@@ -1219,7 +1322,7 @@ def window_group_sums(
     if n_windows == 0:
         return torch.from_numpy(totals.astype(numpy.float32))
 
-    starts, ends, groups = _window_columns(windows, bound_columns)
+    starts, ends, groups = window_columns(windows, bound_columns)
 
     # Resolved once per track, before any contig, so a directory is
     # verified complete, and verified once rather than once per contig.
@@ -1552,16 +1655,14 @@ def _resolve_residency(residency=None):
     return residency
 
 
+@functools.cache
 def _signal_sql():
-    """The grouping join, transpiled for this engine once per process.
+    """Return the grouping join, transpiled once per process.
 
-    Transpiled rather than written, because the join is an interval
-    predicate and the target dialect has no such operator: giql is what
-    turns ``INTERSECTS`` into the bound comparisons the engine runs.
-    Once per process because the transpilation is pure and the query
-    never varies -- the contig varies by what is registered under the
-    two table names, not by the text, and the channel is a column the
-    join carries through rather than a thing the text knows about.
+    Once per process because the query never varies: the contig varies
+    by what is registered under the two table names, not by the text,
+    and the channel is a column the join carries through rather than a
+    thing the text knows about.
 
     ``chan`` is projected rather than joined on. giql rewrites the
     ``ON`` clause and leaves the select list alone, so an extra column
@@ -1569,28 +1670,10 @@ def _signal_sql():
     per contig.
     """
 
-    if "signal" not in _transpiled:
-        giql = import_on_first_use("giql")
-        _transpiled["signal"] = giql.transpile(
-            "SELECT w.idx, c.cstart - w.wstart AS offset, c.value, "
-            "c.chan FROM {} AS w JOIN {} AS c ON w.interval "
-            "INTERSECTS c.interval".format(WINDOWS_TABLE, TRACK_TABLE),
-            tables=[
-                giql.Table(
-                    WINDOWS_TABLE,
-                    chrom_col="chrom",
-                    start_col="wstart",
-                    end_col="wend",
-                    strand_col=None,
-                ),
-                giql.Table(
-                    TRACK_TABLE,
-                    chrom_col="chrom",
-                    start_col="cstart",
-                    end_col="cend",
-                    strand_col=None,
-                ),
-            ],
-            dialect="datafusion-bio",
-        )
-    return _transpiled["signal"]
+    return transpile_intervals(
+        "SELECT w.idx, c.cstart - w.wstart AS offset, c.value, "
+        "c.chan FROM {} AS w JOIN {} AS c ON w.interval "
+        "INTERSECTS c.interval".format(WINDOWS_TABLE, TRACK_TABLE),
+        (WINDOWS_TABLE, "wstart", "wend"),
+        (TRACK_TABLE, "cstart", "cend"),
+    )

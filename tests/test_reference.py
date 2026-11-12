@@ -1,24 +1,29 @@
-"""Tests for reading a reference: contig lengths by coordinate.
+"""Tests for reading a reference: its contig lengths, and the cache that holds them.
 
-The cache test is relocated from the ported ``tests/test_pileup_io.py``
-with its assertions unchanged. The rest is new: nothing asserted what
-`chrom_lengths` actually returns, only that it returned more than one
-entry and that a deleted key came back, so a function answering
-``{"chr1": 1, "chr2": 2}`` would have passed the whole suite.
+`chrom_lengths` is read from references written to a known geometry,
+so each assertion is of the lengths and their order rather than of
+how many there are, beside the path shapes it takes and the argument
+it refuses. The cache is tested through what a caller sees: another
+path, or a file replaced at the same path, is read afresh, a mapping
+with no contig in it is not kept, and a caller changing the mapping
+it was handed does not change what a later call answers. The scan a
+reference with no usable index falls back to is tested for the
+registration it must release. `clear_cache` is tested through what
+`chrom_lengths` answers after it.
 
-`clear_cache` is tested here because it now lives here: the cache and
-its reset moved out of `_engine`, which held the dict and read none of
-its keys. Every assertion below still goes through `chrom_lengths` and
-`clear_cache` is named only as the trigger.
+.. rubric:: Why three tests are white-box
 
-That it has to be named at all is an API finding rather than a test
-convention, and the move narrows it rather than settling it.
-`clear_cache` carries no underscore and `reference`'s own module
-docstring points a reader at it as the reclamation path for what this
-caches, but it is exported from no ``__all__`` and carries no
-``# public`` marker -- so whether cache reclamation is a capability
-this package offers is still undecided. What is no longer true is that
-the function was unreachable because its module was private.
+Two tests reach the cache's own state, because what they pin is not
+observable through `chrom_lengths` from one thread: that the key and
+the lengths are held as one value, and that a call answers the
+lengths it computed rather than whatever the slot holds afterwards.
+Both failures need another thread writing between two statements,
+which a test cannot schedule, so the first asserts the shape of the
+slot and the second stands in for that thread with a dict that
+rewrites whatever is published to it. A third queries the engine's
+session by the table name
+`quadrat._engine` holds, there being no public route to whether the
+scan's registration was released.
 """
 
 import collections
@@ -234,6 +239,39 @@ def test_chrom_lengths_should_reread_a_reference_replaced_at_the_same_path(
     assert list(replaced.items()) == [("chr1", 777)]
 
 
+def test_chrom_lengths_should_not_keep_an_empty_mapping_read_from_an_index(
+    tmp_path, pysam
+):
+    """Test that an index read while empty is not the answer from then on.
+
+    Given:
+        An indexed reference whose index is emptied, as one still
+        being written reads, and whose lengths are then read.
+    When:
+        The complete index is put back, the reference itself untouched,
+        and the lengths are read again.
+    Then:
+        It should answer no contigs the first time and every contig
+        the second.
+    """
+
+    # Arrange
+    pytest.importorskip("pyfaidx")
+    path = builders.write_fasta(str(tmp_path / "genome.fa"), TWO_CONTIGS, index=True)
+    index = pathlib.Path(path + ".fai")
+    complete = index.read_bytes()
+    index.write_bytes(b"")
+    while_empty = reference.chrom_lengths(path)
+
+    # Act
+    index.write_bytes(complete)
+    once_complete = reference.chrom_lengths(path)
+
+    # Assert
+    assert list(while_empty.items()) == []
+    assert list(once_complete.items()) == list(TWO_CONTIGS.items())
+
+
 def test_chrom_lengths_should_cache_the_path_and_the_lengths_as_one_value(
     tmp_path, pysam
 ):
@@ -247,15 +285,13 @@ def test_chrom_lengths_should_cache_the_path_and_the_lengths_as_one_value(
         It should hold the second reference's key and its lengths as a
         single value, so no reader can observe one without the other.
 
-    The pair used to live in two slots written by two statements, with
-    a file read between the check and the writes and no lock anywhere
-    -- `chrom_lengths` is published, is in ``quadrat.__all__`` and
-    documents no single-thread precondition. Two threads on two
-    references could leave one genome's lengths filed under the other's
-    key, permanently, passing the validity check for every later caller
-    of that path. A single assignment is what makes that unreachable
-    rather than unlikely, and the shape is the whole of the fix, so the
-    shape is what this pins.
+    Held in two slots written by two statements, the key and the
+    lengths could be written by two threads on two references in
+    opposite orders, leaving one genome's lengths filed under the
+    other's key, permanently, and passing the validity check for every
+    later caller of that path. One value written by one assignment
+    makes that unreachable rather than unlikely, so the shape is what
+    this pins.
     """
 
     # Arrange
@@ -290,13 +326,12 @@ def test_chrom_lengths_should_return_what_it_computed_not_the_cache(
         It should return the geometry it computed rather than whatever
         the cache holds afterwards.
 
-    The return read the module-global back after writing it, which made
-    the torn state observable inside a single call: a thread could be
-    handed another genome's mapping on the path where it did the work
+    A return that read the slot back after writing it would hand a
+    thread another genome's mapping on the path where it did the work
     itself. A real interleaving cannot be forced at that granularity
     from a test, so the concurrent writer is stood in for by a cache
     that replaces whatever is published to it -- which is what any
-    second caller publishing between the write and the read-back
+    second caller publishing between the write and a read-back
     amounts to.
 
     Those lengths build the chrom-sizes table, are what the header
@@ -340,15 +375,10 @@ def test_chrom_lengths_should_not_leave_the_fasta_bound_in_the_session(
         The FASTA table should be unqueryable, so the provider holding
         that file is released rather than merely forgotten.
 
-    The registration was recorded as a key in a dict and nothing ever
-    dropped the table: a value has no teardown hook, so the provider
-    stayed bound in the process-global session holding its file handle
-    for the life of the process. Three claims rested on it being
-    released -- `clear_cache`'s summary, `pileup_alignments`' "everything
-    this call puts into the shared session is undone on the way out",
-    and the fork prohibition `pileup_many` publishes on every runner a
-    deployment may use. The shape of this assertion is the one
-    ``tests/test_alignments.py`` already uses for the BAM tables.
+    A table left bound would keep the provider, and its file handle,
+    in the process-global session for the life of the process. The
+    shape of this assertion is the one ``tests/test_alignments.py``
+    uses for the BAM tables.
     """
 
     # Arrange

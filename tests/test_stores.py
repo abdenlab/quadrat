@@ -29,7 +29,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from quadrat import stores, tables
-from tests import FILE_BACKED, TWO_CONTIGS, builders
+from tests import FILE_BACKED, TWO_CONTIGS, builders, one_hot
 
 # Two channels over two contigs, with chr2 absent from channel 1, which
 # is the contig-missing-from-a-channel case every reader has to answer
@@ -107,16 +107,6 @@ def dense(rows, start, end):
     for chrom, pos, value in rows:
         if chrom == "chr1" and start <= pos < end:
             out[pos - start] = value
-    return out
-
-
-def one_hot(residues):
-    """Return the one-hot matrix a residue string implies, built rather than read."""
-
-    out = numpy.zeros((4, len(residues)), dtype=numpy.int8)
-    for column, base in enumerate(residues.upper()):
-        if base in "ACGT":
-            out["ACGT".index(base), column] = 1
     return out
 
 
@@ -305,6 +295,28 @@ class TestSequenceStore:
         # Assert
         assert window.numpy().sum() == 0
 
+    def test_window_should_raise_when_a_residue_is_neither_encoded_nor_ignored(
+        self, corpus
+    ):
+        """Test the refusal for a residue the store has no provision for.
+
+        Given:
+            A store with the default alphabet and nothing ignored, over
+            a run of ``N``.
+        When:
+            That interval is read.
+        Then:
+            It should raise `ValueError` saying a residue is in neither
+            the alphabet nor the ignored residues.
+        """
+
+        # Arrange
+        store = stores.SequenceStore(corpus.fasta, ignore=())
+
+        # Act & assert
+        with pytest.raises(ValueError, match="not in `alphabet` or in `ignore`"):
+            store.window("chr1", 300, 320)
+
     @pytest.mark.parametrize(
         "start, end",
         [(990, 1010), (1000, 1010), (-5, 10), (1200, 1220)],
@@ -432,6 +444,53 @@ class TestSequenceStore:
         # Assert
         assert opened.call_count == 2
 
+    def test_window_should_raise_os_error_when_no_index_can_be_written(
+        self, unindexable_fasta
+    ):
+        """Test the refusal for a reference that cannot be indexed in place.
+
+        Given:
+            A reference with no index, in a directory that cannot be
+            written to.
+        When:
+            A window is read.
+        Then:
+            It should raise `OSError` naming the reference and the
+            command that indexes it.
+        """
+
+        # Arrange
+        unindexed = stores.SequenceStore(unindexable_fasta)
+
+        # Act & assert
+        with pytest.raises(
+            OSError, match=r"genome\.fa has no usable faidx index.*`samtools faidx \S+`"
+        ):
+            unindexed.window("chr1", 0, 8)
+
+    def test_window_should_raise_as_pyfaidx_does_when_the_reference_is_missing(
+        self, tmp_path
+    ):
+        """Test that a missing reference is not reported as a missing index.
+
+        Given:
+            A path at which there is no reference.
+        When:
+            A window is read.
+        Then:
+            It should raise `pyfaidx.FastaNotFoundError`, an `OSError`,
+            naming the path and saying nothing of an index.
+        """
+
+        # Arrange
+        missing = stores.SequenceStore(str(tmp_path / "missing.fa"))
+
+        # Act & assert
+        with pytest.raises(pyfaidx.FastaNotFoundError, match=r"missing\.fa") as caught:
+            missing.window("chr1", 0, 8)
+        assert isinstance(caught.value, OSError)
+        assert "faidx index" not in str(caught.value)
+
     @settings(FILE_BACKED, max_examples=25)
     @given(bounds=st.tuples(st.integers(-200, 1200), st.integers(-200, 1200)))
     def test_window_should_be_as_wide_as_any_span_it_is_given(self, sequence, bounds):
@@ -457,6 +516,73 @@ class TestSequenceStore:
         # Assert
         assert tuple(window.shape) == (4, end - start)
         assert set(window.sum(axis=0).tolist()) <= {0, 1}
+
+    def test_contig_lengths_should_answer_every_contig_in_the_references_order(
+        self, sequence
+    ):
+        """Test the lengths a store reads off its reference's index.
+
+        Given:
+            A store over an indexed reference of a known geometry.
+        When:
+            Its contig lengths are asked for.
+        Then:
+            It should answer every contig at the length it was written
+            at, in the reference's own order.
+        """
+
+        # Act
+        lengths = sequence.contig_lengths()
+
+        # Assert
+        assert list(lengths.items()) == list(TWO_CONTIGS.items())
+
+    def test_contig_lengths_should_build_the_index_a_reference_lacks(self, tmp_path):
+        """Test that asking for lengths counts as a first read.
+
+        Given:
+            A reference with no index, in a directory that can be
+            written to.
+        When:
+            Its contig lengths are asked for.
+        Then:
+            It should answer them and leave the index beside the
+            reference.
+        """
+
+        # Arrange
+        path = builders.write_fasta(str(tmp_path / "genome.fa"), TWO_CONTIGS)
+
+        # Act
+        lengths = stores.SequenceStore(path).contig_lengths()
+
+        # Assert
+        assert lengths == dict(TWO_CONTIGS)
+        assert os.path.exists(path + ".fai")
+
+    def test_contig_lengths_should_raise_os_error_when_no_index_can_be_written(
+        self, unindexable_fasta
+    ):
+        """Test the refusal for a reference that cannot be indexed in place.
+
+        Given:
+            A reference with no index, in a directory that cannot be
+            written to.
+        When:
+            Its contig lengths are asked for.
+        Then:
+            It should raise `OSError` naming the reference and the
+            command that indexes it.
+        """
+
+        # Arrange
+        unindexed = stores.SequenceStore(unindexable_fasta)
+
+        # Act & assert
+        with pytest.raises(
+            OSError, match=r"genome\.fa has no usable faidx index.*`samtools faidx \S+`"
+        ):
+            unindexed.contig_lengths()
 
 
 def test_chrom_plan_should_answer_none_for_a_contig_the_track_lacks(corpus):
@@ -680,14 +806,7 @@ def test_track_frame_should_read_every_shape_a_track_takes(tmp_path, shape):
 
     # Arrange
     rows = [("chr1", 5, 2.0), ("chr2", 7, 3.0)]
-    frame = polars.DataFrame(
-        {
-            "chrom": [row[0] for row in rows],
-            "pos": [row[1] for row in rows],
-            "value": [row[2] for row in rows],
-        },
-        schema={"chrom": polars.Utf8, "pos": polars.Int64, "value": polars.Float64},
-    )
+    frame = builders.track_rows_frame(rows)
     if shape == "directory":
         source = str(tmp_path / "t.track.parquet")
         builders.write_track(source, rows)
@@ -728,6 +847,33 @@ def test_track_frame_should_refuse_a_shape_that_is_no_track():
         ),
     ):
         stores.track_frame(7)
+
+
+@pytest.mark.parametrize("name", ["mistyped.parquet", "mistyped.track.parquet"])
+def test_track_frame_should_raise_when_nothing_is_at_the_path(tmp_path, name):
+    """Test a whole-table read of a path at which nothing exists.
+
+    Given:
+        A path under a single-file or a directory track's name, with
+        no file or directory at it.
+    When:
+        It is read as a whole frame, and the frame is not collected.
+    Then:
+        It should raise `FileNotFoundError` naming the path, from the
+        read itself rather than from a later collect.
+    """
+
+    # Arrange
+    path = str(tmp_path / name)
+
+    # Act & assert
+    with pytest.raises(
+        FileNotFoundError,
+        match=r"{} is not a track; there is no such file".format(
+            name.replace(".", r"\.")
+        ),
+    ):
+        stores.track_frame(path)
 
 
 def test_track_frame_should_refuse_a_directory_that_does_not_verify(tmp_path):

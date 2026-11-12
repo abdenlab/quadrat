@@ -1,29 +1,21 @@
 """Tests for the shape of the track aggregate's query plan.
 
-Relocated from the ported ``tests/test_pileup_io.py``, assertions
-unchanged.
+.. rubric:: Why this test is white-box
 
-.. rubric:: Why this one test is white-box
-
-It is the only test in the suite that reaches a private symbol, and
-that is deliberate rather than unconverted. §8 of the test guide
-forbids referencing private names, and the honest position is that
-there is no public route to what this pins: `pileup_sql` builds a query
-string, nothing public hands back that string or the plan DataFusion
-makes of it, and the sizes frame it joins against is registered through
-`quadrat._engine`.
+It reaches a private module deliberately, because there is no public
+route to what it pins: `pileup_sql` builds a query string, nothing
+public hands back that string or the plan DataFusion makes of it, and
+the sizes frame it joins against is registered under a name
+`quadrat._engine` holds.
 
 The behavioural consequence -- that a pileup over off-reference contigs
-still counts correctly -- is already covered in ``tests/test_track.py``
-by the bam2bw oracle. What that cannot distinguish is a plan that joins
+still counts correctly -- is covered in ``tests/test_track.py`` by the
+bam2bw oracle. What that cannot distinguish is a plan that joins
 *above* the aggregate from one that joins below, because the two differ
 only in whether the query survives at 291,063,148 records, which no
 fixture small enough for CI can reach. So the choice is between a
-white-box test and no regression guard on a defect that killed the
-query outright.
-
-The guard is kept. If a public accessor for the plan ever exists, this
-is the test to reseat onto it.
+white-box test and no regression guard on a plan that fails outright
+at scale, and the guard is kept.
 """
 
 import pytest

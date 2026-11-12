@@ -382,6 +382,36 @@ class TestDistribution:
         assert result.stdout.strip() == "False"
 
     @pytest.mark.packaging
+    @pytest.mark.parametrize(
+        "name", PILEUP_MODULES + ("torch", "tangermeme", "tqdm", "pandas")
+    )
+    def test_quadrat_loci_should_import_nothing_it_defers(self, name):
+        """Test what importing the locus module costs, one module at a time.
+
+        Given:
+            A fresh interpreter, and one module the locus module
+            defers: the engine, a frame library, torch, tangermeme or
+            tqdm.
+        When:
+            ``quadrat.loci`` is imported and the loaded modules
+            inspected.
+        Then:
+            That module should not have been loaded.
+        """
+
+        # Arrange
+        pytest.importorskip(name)
+        program = "import sys, quadrat.loci\nprint({!r} in sys.modules)\n".format(name)
+
+        # Act
+        result = run_child(
+            [sys.executable, "-c", program], "the child interpreter failed"
+        )
+
+        # Assert
+        assert result.stdout.strip() == "False"
+
+    @pytest.mark.packaging
     @pytest.mark.skipif(
         shutil.which("uv") is None,
         reason="uv builds the wheel under test",
