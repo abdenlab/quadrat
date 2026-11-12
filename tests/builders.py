@@ -225,6 +225,76 @@ def write_bed(path, rows):
     return path
 
 
+def write_track(path, rows, *, parameters=None):
+    """Write ``(chrom, pos, value)`` rows as one track directory.
+
+    The track equivalent of `write_bed`: a builder that takes the rows
+    a test means and leaves the layout to the code under test. It goes
+    through `quadrat.tables.TrackWriter` rather than spelling the
+    directory, the per-contig filenames and the manifest itself, so a
+    track the suite builds is the same artifact a pileup commits and a
+    change to the format cannot leave the two disagreeing.
+
+    Rows need not be sorted or grouped. The writer sorts a frame it was
+    handed ungrouped, which is the one thing a hand-written row list
+    reliably is.
+
+    Needs ``polars``, which is a base dependency, and the writer, which
+    is not imported until this is called: ``conftest`` assigns
+    ``QUADRAT_CACHE_DIR`` at its own import time and a module-level
+    ``quadrat`` import here would land before it.
+    """
+
+    import polars
+
+    from quadrat.tables import TrackWriter
+
+    frame = polars.DataFrame(
+        {
+            "chrom": [str(row[0]) for row in rows],
+            "pos": [int(row[1]) for row in rows],
+            "value": [float(row[2]) for row in rows],
+        },
+        schema={"chrom": polars.Utf8, "pos": polars.Int64, "value": polars.Float64},
+    )
+    with TrackWriter(str(path), parameters=parameters) as writer:
+        writer.write(frame)
+    return str(path)
+
+
+def write_flat_track(path, rows):
+    """Write ``(chrom, pos, value)`` rows as one single-file track.
+
+    The other layout a track reader takes: one Parquet carrying every
+    contig, rather than the directory and manifest `write_track`
+    builds. A table this package did not write looks like this, which
+    is why the readers accept it at all.
+
+    Rows are written in the order given, unsorted and ungrouped. That
+    is deliberate: the directory layout is sorted by construction and
+    this one is not, so it is the shape that catches a reader assuming
+    an order the layout does not promise.
+
+    Needs ``polars``, imported here rather than at module level as
+    `pysam` is guarded above: ``conftest`` imports this module for
+    every test module, and the tests that need polars skip without it
+    rather than fail, so an import at module level would turn one
+    absent dependency into a collection error for the whole suite.
+    """
+
+    import polars
+
+    polars.DataFrame(
+        {
+            "chrom": [str(row[0]) for row in rows],
+            "pos": [int(row[1]) for row in rows],
+            "value": [float(row[2]) for row in rows],
+        },
+        schema={"chrom": polars.Utf8, "pos": polars.Int64, "value": polars.Float64},
+    ).write_parquet(str(path))
+    return str(path)
+
+
 def intervals(chrom, start, stop, step, width):
     """Return ``(chrom, start, stop)`` rows every ``step`` bases over a range."""
 

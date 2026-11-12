@@ -20,6 +20,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+import quadrat
 from tests import (
     FILE_BACKED,
     PROJECT_ROOT,
@@ -96,9 +97,9 @@ class TestCorpus:
         When:
             A corpus is instantiated.
         Then:
-            It should expose that root and mapping with no alignments
-            and no locus files, so a test cannot read a file nothing
-            built.
+            It should expose that root and mapping with no alignments,
+            no locus files, no tracks and no window geometry, so a test
+            cannot read a file nothing built or a span nothing chose.
         """
 
         # Act
@@ -112,6 +113,13 @@ class TestCorpus:
         assert corpus.peaks is None
         assert corpus.negatives is None
         assert corpus.exclusion is None
+        # The four the factory always overwrites, which is why nothing
+        # noticed that the initialiser's own default for `tracks` could
+        # be deleted outright.
+        assert corpus.tracks == []
+        assert corpus.in_window is None
+        assert corpus.out_window is None
+        assert corpus.max_jitter == 0
 
     def test___init___should_copy_the_chromosome_sizes_it_is_given(self, tmp_path):
         """Test that a corpus does not alias the caller's mapping.
@@ -563,6 +571,262 @@ def test_corpus_factory_should_render_a_corpus_to_any_geometry(
         assert built.read() == reference.read()
     assert os.path.exists(corpus.peaks)
     assert os.path.exists(corpus.exclusion)
+
+
+def test_corpus_factory_should_write_one_track_per_channel(corpus_factory):
+    """Test that a track request lands as the channel axis.
+
+    Given:
+        Two channels' worth of rows.
+    When:
+        A corpus is built from them.
+    Then:
+        It should write one track per channel, in the order given, so
+        the list a reader takes as its channel axis is the list the
+        test wrote.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+
+    # Act
+    corpus = corpus_factory(
+        "channels",
+        TWO_CONTIGS,
+        tracks=[[("chr1", 10, 1.0)], [("chr1", 20, 2.0), ("chr2", 5, 3.0)]],
+    )
+
+    # Assert
+    assert [os.path.basename(path) for path in corpus.tracks] == [
+        "t0.track.parquet",
+        "t1.track.parquet",
+    ]
+    assert [quadrat.read_manifest(path)["rows"] for path in corpus.tracks] == [1, 2]
+
+
+def test_corpus_factory_should_write_a_track_for_a_channel_with_no_rows(
+    corpus_factory,
+):
+    """Test a channel whose row list is empty.
+
+    Given:
+        Two channels, the second recording nothing.
+    When:
+        A corpus is built.
+    Then:
+        Both tracks should be written, because the channel axis is the
+        source order and a channel that recorded nothing still occupies
+        its row -- which is the case a reader answers as zeros.
+    """
+
+    # Act
+    corpus = corpus_factory("sparse", TWO_CONTIGS, tracks=[[("chr1", 10, 1.0)], []])
+
+    # Assert
+    assert len(corpus.tracks) == 2
+    for track in corpus.tracks:
+        assert quadrat.require_complete(track) == track
+
+
+def test_corpus_factory_should_leave_an_empty_track_request_unset(corpus_factory):
+    """Test that asking for no tracks builds none.
+
+    Given:
+        No track rows.
+    When:
+        A corpus is built.
+    Then:
+        It should leave ``tracks`` empty, which means nothing built
+        them rather than built and empty.
+    """
+
+    # Act
+    corpus = corpus_factory("no-tracks", TWO_CONTIGS)
+
+    # Assert
+    assert corpus.tracks == []
+
+
+def test_corpus_factory_should_record_the_window_geometry(corpus_factory):
+    """Test that the geometry a corpus was built to is readable from it.
+
+    Given:
+        An input window, an output window and a jitter bound.
+    When:
+        A corpus is built to them.
+    Then:
+        It should carry all three, so a test reading this corpus's
+        tracks asks the corpus for the geometry rather than repeating
+        the numbers its tracks were built to.
+    """
+
+    # Act
+    corpus = corpus_factory(
+        "geometry", TWO_CONTIGS, in_window=60, out_window=30, max_jitter=6
+    )
+
+    # Assert
+    assert (corpus.in_window, corpus.out_window, corpus.max_jitter) == (60, 30, 6)
+
+
+def test_corpus_factory_should_default_the_window_geometry_to_unset(corpus_factory):
+    """Test what a corpus built without a geometry reports.
+
+    Given:
+        No geometry.
+    When:
+        A corpus is built.
+    Then:
+        It should report both window spans as ``None`` and no jitter,
+        so a corpus that was never given a geometry cannot be read as
+        having one.
+    """
+
+    # Act
+    corpus = corpus_factory("no-geometry", TWO_CONTIGS)
+
+    # Assert
+    assert (corpus.in_window, corpus.out_window, corpus.max_jitter) == (None, None, 0)
+
+
+def test_corpus_factory_should_raise_when_the_window_cannot_be_placed(corpus_factory):
+    """Test the refusal of a geometry no contig can hold.
+
+    Given:
+        A window whose span plus jitter on both sides exceeds the
+        shortest contig.
+    When:
+        A corpus is asked for.
+    Then:
+        It should raise `ValueError` naming the contig and both
+        lengths.
+
+    Every window drawn from such a corpus would be filtered out for
+    falling off the end, so the test reading it would pass over nothing
+    and say so by passing.
+    """
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"needs 520 bp and chr2 is 500 bp long"):
+        corpus_factory("unplaceable", TWO_CONTIGS, in_window=400, max_jitter=60)
+
+
+def test_corpus_factory_should_raise_when_the_output_window_is_the_wider_one(
+    corpus_factory,
+):
+    """Test the refusal of a swapped window pair.
+
+    Given:
+        An output window wider than the input window.
+    When:
+        A corpus is asked for.
+    Then:
+        It should raise `ValueError` naming both spans.
+
+    The output window sits inside the input one, so a swapped pair is
+    otherwise visible only as a wrong-shaped tensor much later.
+    """
+
+    # Act & assert
+    with pytest.raises(ValueError, match="out_window 60 exceeds in_window 30"):
+        corpus_factory("swapped", TWO_CONTIGS, in_window=30, out_window=60)
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [{"in_window": 60, "out_window": 60}, {"in_window": 488, "max_jitter": 6}],
+    ids=["equal_windows", "exactly_the_shortest_contig"],
+)
+def test_corpus_factory_should_accept_a_geometry_at_the_limit(corpus_factory, geometry):
+    """Test both refusals at the value they stop refusing.
+
+    Given:
+        An output window exactly as wide as the input one, and an input
+        window plus jitter on both sides exactly as long as the
+        shortest contig.
+    When:
+        A corpus is built from each.
+    Then:
+        Both should be accepted, because the output window sits inside
+        the input one rather than strictly inside it, and a window that
+        exactly fits can be placed.
+
+    Without these the two comparisons can be tightened to refuse a
+    geometry that fits and nothing notices.
+    """
+
+    # Act
+    corpus = corpus_factory("limit", TWO_CONTIGS, **geometry)
+
+    # Assert
+    assert corpus.in_window == geometry["in_window"]
+
+
+def test_corpus_factory_should_refuse_a_geometry_before_writing_a_track(
+    corpus_factory, tmp_path_factory
+):
+    """Test the order the factory validates in.
+
+    Given:
+        A track request together with a window no contig can hold.
+    When:
+        A corpus is asked for.
+    Then:
+        It should refuse, and no directory for that corpus should
+        exist afterwards, because the refusal has to come before
+        anything is written -- a corpus that half exists is worse to
+        debug than one that does not.
+    """
+
+    # Arrange
+    name = "refused-before-writing"
+
+    # Act
+    with pytest.raises(ValueError, match="no window could be placed"):
+        corpus_factory(
+            name,
+            TWO_CONTIGS,
+            tracks=[[("chr1", 10, 1.0)]],
+            in_window=10_000,
+        )
+
+    # Assert
+    written = [
+        entry.name
+        for entry in tmp_path_factory.getbasetemp().iterdir()
+        if entry.name.startswith(name)
+    ]
+    assert written == []
+
+
+def test_corpus_factory_should_write_tracks_and_record_geometry_together(
+    corpus_factory,
+):
+    """Test the track and geometry arguments used as a reader will use them.
+
+    Given:
+        A track request and a window geometry in one call.
+    When:
+        A corpus is built.
+    Then:
+        It should carry both, because a test that reads windows over
+        tracks needs both at once, and each tested on its own cannot
+        show that one does not displace the other.
+    """
+
+    # Act
+    corpus = corpus_factory(
+        "both",
+        TWO_CONTIGS,
+        tracks=[[("chr1", 10, 1.0)], [("chr1", 11, 2.0)]],
+        in_window=60,
+        out_window=30,
+        max_jitter=6,
+    )
+
+    # Assert
+    assert len(corpus.tracks) == 2
+    assert (corpus.in_window, corpus.out_window, corpus.max_jitter) == (60, 30, 6)
 
 
 @pytest.mark.packaging
