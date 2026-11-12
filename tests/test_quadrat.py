@@ -14,6 +14,7 @@ populated `sys.modules` and the question cannot be asked.
 
 import ast
 import importlib.metadata
+import re
 import shutil
 import sys
 import tarfile
@@ -25,9 +26,36 @@ import pytest
 import quadrat
 from tests import PROJECT_ROOT, load_build_hook, run_child
 
-# The import names of what the ``pileup`` extra installs. The package
-# docstring states the guarantee these are checked against.
-PILEUP_MODULES = ("polars", "polars_bio", "giql", "pyfaidx")
+# What the ``pileup`` extra installs, by import name, against what the
+# base install carries but still declines to import at package import
+# time. The package docstring states the guarantee both are checked
+# against, and the split is the one `pyproject.toml` declares -- which
+# `TestDistribution.test_metadata_should_declare_the_partition_it_imports_by`
+# pins, so these two tuples cannot drift from it in silence.
+EXTRA_MODULES = ("polars_bio", "giql")
+
+
+DEFERRED_MODULES = ("polars", "pyfaidx")
+
+
+PILEUP_MODULES = EXTRA_MODULES + DEFERRED_MODULES
+
+
+# A public call that reaches each deferred module's first import, for a
+# child interpreter in which that module will not import. Two calls
+# rather than one, because no single entry point reaches all four:
+# grouping needs polars, polars-bio and giql, and a sequence read is
+# the one that opens a reference.
+REACHES = {
+    "polars": "tables.track_contigs(42)",
+    "polars_bio": (
+        "cache.group_track(polars.DataFrame("
+        "{'chrom': ['chr1'], 'sig_start': [0], 'sig_end': [8]}), "
+        "[polars.DataFrame({'chrom': ['chr1'], 'pos': [1], 'value': [1.0]})])"
+    ),
+    "pyfaidx": "stores.SequenceStore('absent.fa').window('chr1', 0, 4)",
+}
+REACHES["giql"] = REACHES["polars_bio"]
 
 
 def declared_names(node):
@@ -102,6 +130,21 @@ def sdist_members(project, out_dir):
 
     with tarfile.open(uv_build(project, out_dir, "sdist")) as handle:
         return {name.split("/", 1)[1] for name in handle.getnames() if "/" in name}
+
+
+def declared_partition():
+    """Return the installed distribution's requirements as ``(extra, base)`` import names.
+
+    A requirement marked for any extra lands in the first set and every
+    other one in the second, each spelled as the module it imports as.
+    """
+
+    extra = set()
+    base = set()
+    for requirement in importlib.metadata.requires("quadrat"):
+        name = re.split(r"[\s<>=!;\[]", requirement, maxsplit=1)[0]
+        (extra if "extra ==" in requirement else base).add(name.replace("-", "_"))
+    return extra, base
 
 
 def wheel_metadata(project, out_dir):
@@ -191,33 +234,67 @@ class TestDistribution:
         # Assert
         assert marked == set(quadrat.__all__)
 
-    @pytest.mark.packaging
-    def test_quadrat_should_import_none_of_the_pileup_engine(self):
-        """Test that a base install never pays for the pileup engine.
+    def test_metadata_should_declare_the_partition_it_imports_by(self):
+        """Test which dependencies the distribution puts behind the extra.
 
         Given:
-            A fresh interpreter in an environment where the optional
-            dependencies are installed.
+            The installed distribution's declared requirements.
         When:
-            The package is imported and the loaded modules inspected.
+            They are split by whether they are marked for the ``pileup``
+            extra.
         Then:
-            It should have loaded none of polars, polars-bio, giql or
-            pyfaidx, so a caller who already has tracks never
-            pays for the engine that builds them.
+            The engine -- polars-bio and giql -- should be behind it and
+            polars and pyfaidx should not, because that line is what
+            decides whether a caller is told to install an extra or
+            told their install is incomplete.
+
+        Read from the metadata rather than restated here, so the tuples
+        above are checked against what `pyproject.toml` declares.
+        """
+
+        # Act
+        extra, base = declared_partition()
+
+        # Assert
+        assert extra == set(EXTRA_MODULES)
+        assert set(DEFERRED_MODULES) <= base
+
+    @pytest.mark.packaging
+    @pytest.mark.parametrize("name", PILEUP_MODULES)
+    def test_deferred_import_should_name_the_extra_only_for_an_extra_module(self, name):
+        """Test the remedy a deferred import reports a missing module with.
+
+        Given:
+            A fresh interpreter in which one deferred module will not
+            import, and the extra the installed metadata declares.
+        When:
+            A public call that needs that module is made.
+        Then:
+            It should raise `ImportError` naming the module, and should
+            name the ``pileup`` extra exactly when the metadata puts the
+            module behind it -- a missing extra module is a minimal
+            install the extra completes, and a missing base one is a
+            broken install no extra repairs.
+
+        The partition the package reports by and the one it declares
+        are two lists, so this is what keeps the first from naming a
+        module the second puts in the base install, or the reverse.
         """
 
         # Arrange
-        # An absent module is indistinguishable from one the package
-        # declined to import, so a base install skips rather than fails.
-        for name in PILEUP_MODULES:
-            pytest.importorskip(name)
-
+        for other in PILEUP_MODULES:
+            if other != name and REACHES[name] == REACHES.get(other):
+                pytest.importorskip(other)
+        extra, _ = declared_partition()
         program = (
-            "import sys, quadrat\n"
-            "names = {!r}\n"
-            "print(' '.join(n for n in names if n in sys.modules))\n".format(
-                PILEUP_MODULES
-            )
+            "import sys\n"
+            "sys.modules[{!r}] = None\n"
+            "from quadrat import cache, stores, tables\n"
+            "polars = None if {!r} == 'polars' else __import__('polars')\n"
+            "try:\n"
+            "    {}\n"
+            "except ImportError as error:\n"
+            "    print(error)\n".format(name, name, REACHES[name])
         )
 
         # Act
@@ -226,13 +303,84 @@ class TestDistribution:
         )
 
         # Assert
-        assert result.stdout.split() == []
+        assert result.stdout.startswith(name + " is ")
+        assert ("`pileup` extra" in result.stdout) is (name in extra)
 
     @pytest.mark.packaging
-    @pytest.mark.skipif(
-        shutil.which("uv") is None,
-        reason="uv builds the wheel under test",
-    )
+    @pytest.mark.parametrize("name", PILEUP_MODULES)
+    def test_quadrat_should_import_none_of_the_pileup_engine(self, name):
+        """Test what importing the package costs, one module at a time.
+
+        Given:
+            A fresh interpreter, and one module the package defers.
+        When:
+            The package is imported and the loaded modules inspected.
+        Then:
+            That module should not have been loaded, so a caller who
+            already has tracks never pays for the engine that builds
+            them.
+
+        One case per module rather than one case for the set, because
+        an absent module is indistinguishable from one the package
+        declined to import and so has to be skipped. Checked as a set,
+        a base install -- where polars and pyfaidx are installed and
+        their deferral is the whole guarantee -- would skip the whole
+        check on account of the two that are absent.
+        """
+
+        # Arrange
+        pytest.importorskip(name)
+        program = "import sys, quadrat\nprint({!r} in sys.modules)\n".format(name)
+
+        # Act
+        result = run_child(
+            [sys.executable, "-c", program], "the child interpreter failed"
+        )
+
+        # Assert
+        assert result.stdout.strip() == "False"
+
+    @pytest.mark.packaging
+    @pytest.mark.parametrize("name", PILEUP_MODULES + ("torch", "tangermeme", "tqdm"))
+    def test_quadrat_cache_should_import_neither_the_engine_nor_a_tensor_library(
+        self, name
+    ):
+        """Test what importing the window cache costs, one module at a time.
+
+        Given:
+            A fresh interpreter, and one module the window cache defers:
+            the engine, torch, tangermeme or tqdm.
+        When:
+            ``quadrat.cache`` is imported and the loaded modules
+            inspected.
+        Then:
+            That module should not have been loaded, so importing the
+            module costs nothing that running it will.
+
+        One case per module, for the reason the package-import test
+        gives: an absent module has to be skipped, and a skip should
+        cost only its own case.
+
+        tqdm is the one that bites rather than merely costs. The
+        package quiets the engine's progress bars by setting
+        ``TQDM_DISABLE`` before importing polars-bio, and that works
+        only while nothing has imported tqdm already -- so a
+        module-level torch or tangermeme import here would put the bars
+        back on every grouping run.
+        """
+
+        # Arrange
+        pytest.importorskip(name)
+        program = "import sys, quadrat.cache\nprint({!r} in sys.modules)\n".format(name)
+
+        # Act
+        result = run_child(
+            [sys.executable, "-c", program], "the child interpreter failed"
+        )
+
+        # Assert
+        assert result.stdout.strip() == "False"
+
     @pytest.mark.packaging
     @pytest.mark.skipif(
         shutil.which("uv") is None,
@@ -259,6 +407,11 @@ class TestDistribution:
         expected = "Version: {}".format(derived_version(PROJECT_ROOT))
         assert expected in metadata.splitlines()
 
+    @pytest.mark.packaging
+    @pytest.mark.skipif(
+        shutil.which("uv") is None,
+        reason="uv builds the wheel under test",
+    )
     def test_metadata_should_declare_the_license_once(self, tmp_path):
         """Test that the built metadata names the licence exactly once.
 
