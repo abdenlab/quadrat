@@ -6,15 +6,16 @@ beside it rather than inside it. Beside, because a track directory
 must hold Parquet and nothing else: polars refuses to scan a directory
 of mixed extensions, and so does anything else pointed at the dataset.
 
-The format and ``MANIFEST_VERSION`` are deliberately unchanged from
-cherimoya's. Tables either package writes are readable by the other,
-and the alternative is re-piling every corpus to move between them.
+Which version a table's record carries, and why, is `read_manifest`'s
+to state.
 """
 
 import glob
 import json
+import math
 import os
 import shutil
+import types
 import urllib.parse
 import uuid
 
@@ -31,8 +32,7 @@ TRACK_SUFFIX = ".track.parquet"
 
 
 # Suffix of the completeness record that sits *beside* a track
-# directory, and the schema version it declares. See
-# `require_complete` for what it is for.
+# directory. See `require_complete` for what it is for.
 #
 # Beside, not inside: a track directory must hold Parquet and nothing
 # else, because polars refuses to scan a directory of mixed extensions
@@ -43,11 +43,30 @@ MANIFEST_SUFFIX = ".manifest.json"
 
 # public
 MANIFEST_VERSION = 1
+"""The manifest version a table of counts carries, which is the version
+cherimoya writes and reads, so a corpus of counts moves between the two
+packages without being piled up again. `read_manifest` states the
+version every other ``signal`` carries."""
+
+
+#: The ``signal`` of a track of counts; see `read_manifest`.
+COUNTS = "counts"
+
+
+#: The ``signal`` of a track of coverage deltas; see `read_manifest`.
+COVERAGE_DELTAS = "coverage_deltas"
+
+
+#: The schema version a manifest declaring each signal carries; see
+#: `read_manifest`'s ``version`` for which, and why.
+SIGNAL_VERSIONS = types.MappingProxyType({COUNTS: MANIFEST_VERSION, COVERAGE_DELTAS: 2})
 
 
 # Parquet row-group size for the track files. See
 # `TrackWriter` for why this number and not a rounder one.
-_ROW_GROUP_SIZE = 10_000
+# Un-underscored because it is read across modules, and a name that
+# crosses modules carries no underscore here.
+ROW_GROUP_SIZE = 10_000
 
 
 # Prefixes for the staging and discard directories the atomic write uses.
@@ -70,7 +89,7 @@ class TrackWriter(object):
     """One track, assembled from one or more frames.
 
     The pileup runs the genome in contig groups so that it holds only
-    part of the aggregate at a time, and so hands a table over in
+    part of the grouping at a time, and so hands a table over in
     several disjoint pieces rather than one. The staging directory, the
     file list and the commit belong to a *writer*, not to a path: two
     separate writers on the same path still replace one another
@@ -85,6 +104,20 @@ class TrackWriter(object):
     Use it as a context manager. A writer abandoned without one leaks
     its staging directory until the next `_sweep_stale`, which is the
     same exposure a killed process has always had.
+
+    :param path: The track directory to write, as a `str`.
+    :param parameters: Recorded in the manifest as ``parameters``.
+    :param signal: What the rows' values mean, recorded in the manifest
+        as ``signal`` and deciding its ``version``; see
+        `read_manifest`. Always recorded, the default included, so
+        every manifest this writes carries one.
+    :param scale: Recorded in the manifest as ``scale``; see
+        `read_manifest`. Required with ``"coverage_deltas"`` and
+        refused with ``"counts"``.
+    :raises ValueError: if ``signal`` is not one `read_manifest`
+        documents, or if ``scale`` is missing where ``signal`` needs
+        one, given where it takes none, or not one `read_manifest`
+        documents.
 
     .. rubric:: Implementation notes
 
@@ -132,12 +165,13 @@ class TrackWriter(object):
 
     The last row is the standing caveat. Occupancy, not depth, is what
     moves this -- past about 8% the optimum walks back up and 10,000
-    costs 1.46x against 50,000 -- so a per-base or span-coverage
-    aggregate wants a larger group than a cut-site one, and one
-    constant cannot serve both. That is a reason to size the group
-    from the frame's height when such a mode lands, not before it:
-    every track this package writes today is a point-event track at
-    the top two rows.
+    costs 1.46x against 50,000 -- so a per-base grouping wants a
+    larger group than a cut-site one, and one constant cannot serve
+    both. That is a reason to size the group from the frame's height
+    when such a mode lands, not before it: every track this package
+    writes holds one row per position where something happened, a
+    count or a change in coverage, at the occupancies of the top two
+    rows.
 
     The dtypes are deliberately left as Int64/Float64. Narrowing
     ``pos`` to Int32 and ``value`` to UInt16 *doubles* the file on
@@ -170,10 +204,31 @@ class TrackWriter(object):
     what the manifest is for.
     """
 
-    def __init__(self, path, parameters=None):
+    def __init__(self, path, parameters=None, signal=COUNTS, scale=None):
+        if not _known_signal(signal):
+            raise ValueError(
+                "TrackWriter records what a track's values mean: signal "
+                "must be one of {}, got {!r}.".format(
+                    name_list(SIGNAL_VERSIONS, "none"), signal
+                )
+            )
+        if signal == COVERAGE_DELTAS and not _known_scale(scale):
+            raise ValueError(
+                "TrackWriter writes coverage deltas unscaled and records the "
+                "scale a reader applies after summing them: scale must be a "
+                "finite number a float can hold, got {!r}.".format(scale)
+            )
+        if signal != COVERAGE_DELTAS and scale is not None:
+            raise ValueError(
+                "TrackWriter records a scale for coverage deltas alone; a "
+                "{!r} track's values are already scaled, so scale must be "
+                "None, got {!r}.".format(signal, scale)
+            )
         self.path = path
         self.rows = 0
         self.parameters = dict(parameters or {})
+        self.signal = signal
+        self.scale = None if scale is None else float(scale)
         self._files = {}
         self._staging = stage_directory(path)
 
@@ -228,7 +283,7 @@ class TrackWriter(object):
                     part = part.sort("pos")
                 part.write_parquet(
                     os.path.join(self._staging, name),
-                    row_group_size=_ROW_GROUP_SIZE,
+                    row_group_size=ROW_GROUP_SIZE,
                     statistics=True,
                 )
                 self._files[name] = part.height
@@ -243,16 +298,16 @@ class TrackWriter(object):
         if self._staging is None:
             raise RuntimeError("{} is already closed".format(self.path))
         staging, self._staging = self._staging, None
-        commit_directory(
-            self.path,
-            staging,
-            {
-                "version": MANIFEST_VERSION,
-                "rows": int(self.rows),
-                "files": self._files,
-                "parameters": self.parameters,
-            },
-        )
+        record = {
+            "version": SIGNAL_VERSIONS[self.signal],
+            "signal": self.signal,
+            "rows": int(self.rows),
+            "files": self._files,
+            "parameters": self.parameters,
+        }
+        if self.scale is not None:
+            record["scale"] = self.scale
+        commit_directory(self.path, staging, record)
 
     def abort(self):
         """Discard whatever was staged. A no-op once closed."""
@@ -355,10 +410,39 @@ def read_manifest(source):
         published schema:
 
         ``version``
-            Schema version, which must equal `MANIFEST_VERSION`.
-            `require_complete` refuses any other value rather than
-            guessing, so a writer that cannot reach this constant
-            cannot conform.
+            Schema version, a JSON integer, which must be the one
+            ``signal`` implies: `MANIFEST_VERSION` for ``"counts"``,
+            and ``2`` for ``"coverage_deltas"``, which no public
+            constant holds. `require_complete` refuses any other value
+            rather than guessing, both ways: a ``"counts"`` record at
+            ``2`` as well as a ``"coverage_deltas"`` one at
+            `MANIFEST_VERSION`. A table of counts is
+            therefore readable by every reader of this format, and a
+            table of coverage deltas, whose rows share the columns and
+            the sort order of counts, is refused by a reader that knows
+            only `MANIFEST_VERSION` rather than read as counts.
+
+        ``signal``
+            What the values mean, as a string. ``"counts"``: the value
+            at a position is what accumulated at that position, already
+            scaled. ``"coverage_deltas"``: the value at a position is
+            the unscaled change in coverage there, so coverage at a
+            position is the sum of every value at or before it on its
+            contig, multiplied by ``scale``. Such a table may hold a row
+            at its contig's length, closing the spans that reach the
+            contig's end. Absent means
+            ``"counts"``, permanently, which is what a record written
+            before this field existed holds. Every track this package
+            writes records one. A table `require_complete` passes with
+            no record at all, i.e., a single Parquet file or an
+            in-memory frame, holds counts too.
+
+        ``scale``
+            The multiplier applied to coverage after the deltas are
+            summed, as a JSON number that is finite once read as a
+            float, so neither an infinity, a NaN nor an integer too
+            large for a float. Required on a ``"coverage_deltas"``
+            record and refused on a ``"counts"`` one.
 
         ``files``
             Object mapping each per-contig filename to the number of
@@ -433,6 +517,107 @@ def require_complete(source):
     In-memory frames and single-file tables pass through untouched -- a
     frame has no partial state, and a truncated Parquet file fails on its
     own footer.
+
+    What this accepts it accepts whatever the ``signal``, since nothing
+    here reads a value: a table of coverage deltas passes as a table of
+    counts does. Passing says the table is complete and that its record
+    is one this package can read, not that its values are counts. A
+    caller who reads the values without this package's readers learns
+    what they mean from the record, where a missing record or a missing
+    ``signal`` means counts; see `read_manifest`.
+
+    Needs nothing the ``pileup`` extra installs.
+
+    :param source: The track: a directory or a single Parquet file, as
+        a `str`, `bytes` or `os.PathLike`, or an in-memory
+        `polars.DataFrame` or `polars.LazyFrame`.
+    :returns: ``source``, unchanged.
+    :raises TypeError: if ``source`` is neither a path nor a polars
+        frame.
+    :raises ValueError: if nothing exists at ``source``; if a directory
+        has no record beside it, or one that is not a readable JSON
+        object; if the record's ``signal`` is not one `read_manifest`
+        documents, its ``version`` is not the integer that ``signal``
+        implies, or its ``scale`` is absent or not one `read_manifest`
+        documents on a ``"coverage_deltas"`` record or present on a
+        ``"counts"`` one;
+        if its ``files`` is neither an object nor empty, or lists a
+        file the directory does not hold; or if it states ``rows`` and
+        a file declares no count or the counts do not add up to it.
+    """
+
+    track_signal(source)
+    return source
+
+
+# public
+def track_contigs(source):
+    """Return every contig a track holds at least one row for.
+
+    The directory layout answers from its filenames: `TrackWriter`
+    writes one file per contig run and none at all for a contig with no
+    rows, so for the tables training reads this costs a listing and no
+    bytes. A single-file table or an in-memory frame has to be asked,
+    which reads the ``chrom`` column and nothing else.
+
+    The manifest is preferred over the listing when there is one, on
+    the assumption that the caller has already verified the table --
+    nothing on this path calls `require_complete`, and a truncated
+    table therefore reports whatever its manifest lists rather than
+    what is on the disk. That is the right trade for the training path,
+    which verifies a table once and then addresses it many times; a
+    caller who has not verified it should.
+
+    The counterpart of `bam_contigs` on the other side of the pileup.
+
+    :param source: A ``.track.parquet`` directory, a single Parquet
+        file, or an in-memory polars frame -- each as `require_complete`
+        accepts them, a path being a `str`, `bytes` or `os.PathLike`.
+    :returns: The contig names, as a `set`.
+    :raises TypeError: if ``source`` is none of those.
+    """
+
+    path = fspath_or_none(source)
+    if path is not None and os.path.isdir(path):
+        manifest = read_manifest(path)
+        names = list((manifest.get("files") or {}) if manifest else [])
+        if not names:
+            names = [name for name in os.listdir(path) if name.endswith(".parquet")]
+        return {urllib.parse.unquote(name[: -len(".parquet")]) for name in names}
+
+    polars = import_on_first_use("polars")
+    if path is not None:
+        # A plain file is still read, so tables written before the
+        # per-contig layout keep loading.
+        frame = polars.scan_parquet(path)
+    elif isinstance(source, polars.LazyFrame):
+        frame = source
+    elif isinstance(source, polars.DataFrame):
+        frame = source.lazy()
+    else:
+        raise TypeError(
+            "track_contigs reads a track: a {} directory, a single "
+            "Parquet file, or an in-memory polars frame with chrom, pos "
+            "and value columns. Got {}.".format(TRACK_SUFFIX, type(source).__name__)
+        )
+    return set(frame.select("chrom").unique().collect()["chrom"].to_list())
+
+
+def track_signal(source):
+    """Verify a track as `require_complete` does and return what its values mean.
+
+    The one reader of a manifest's ``signal`` and ``scale``, so a
+    reader of values verifies a track and learns how to read it from a
+    single pass over its record. A track with no record, or a record
+    with no ``signal``, is answered as `read_manifest` states. Needs
+    nothing the ``pileup`` extra installs.
+
+    :param source: The track, as any shape `require_complete` takes.
+    :returns: ``(signal, scale)``: the signal, one of `SIGNAL_VERSIONS`,
+        and the multiplier summed coverage takes, or ``None`` for
+        counts, whose values are already scaled.
+    :raises TypeError: as `require_complete` raises it.
+    :raises ValueError: as `require_complete` raises it.
     """
 
     path = fspath_or_none(source)
@@ -444,7 +629,7 @@ def require_complete(source):
         # or `require_complete(None)` read as verified.
         polars = import_on_first_use("polars")
         if isinstance(source, (polars.DataFrame, polars.LazyFrame)):
-            return source
+            return COUNTS, None
         raise TypeError(
             "require_complete verifies a track: a path to one, "
             "or an in-memory polars frame. Got {}.".format(type(source).__name__)
@@ -453,7 +638,7 @@ def require_complete(source):
     if os.path.isfile(path):
         # A single-file table has no partial state this can see: a
         # truncated Parquet file fails on its own footer.
-        return source
+        return COUNTS, None
 
     if not os.path.isdir(path):
         raise ValueError(
@@ -493,12 +678,38 @@ def require_complete(source):
         )
 
     version = manifest.get("version")
-    if version != MANIFEST_VERSION:
+    # By type as well as by value: `True` and `1.0` both compare equal
+    # to 1, and neither is the integer the format fixes.
+    if type(version) is not int or version not in SIGNAL_VERSIONS.values():
         raise ValueError(
             "{} declares manifest schema version {!r}, but this quadrat "
-            "writes and reads version {}. Rebuild the table.".format(
-                path, version, MANIFEST_VERSION
+            "writes and reads versions {}. Rebuild the table.".format(
+                path, version, name_list(sorted(SIGNAL_VERSIONS.values()), "none")
             )
+        )
+    signal = _manifest_signal(path, manifest)
+    # One version per signal, both ways; see `read_manifest`'s `version`.
+    if version != SIGNAL_VERSIONS[signal]:
+        raise ValueError(
+            "{} declares signal {!r} at manifest schema version {!r}, but "
+            "a {!r} track is written at version {}. The record does not "
+            "describe a track this can read; rebuild the table.".format(
+                path, signal, version, signal, SIGNAL_VERSIONS[signal]
+            )
+        )
+    scale = manifest.get("scale")
+    if signal == COVERAGE_DELTAS and not _known_scale(scale):
+        raise ValueError(
+            "{} declares coverage deltas with scale {!r}. A coverage-deltas "
+            "record states the finite number its summed deltas are "
+            "multiplied by, and without one its values have no magnitude; "
+            "rebuild the table.".format(path, scale)
+        )
+    if signal != COVERAGE_DELTAS and "scale" in manifest:
+        raise ValueError(
+            "{} declares a scale of {!r} on a {!r} track, whose values are "
+            "already scaled. The record does not say whether to scale them "
+            "again; rebuild the table.".format(path, scale, signal)
         )
 
     files = manifest.get("files") or {}
@@ -584,60 +795,7 @@ def require_complete(source):
                 )
             )
 
-    return source
-
-
-# public
-def track_contigs(source):
-    """Return every contig a track holds at least one row for.
-
-    The directory layout answers from its filenames: `TrackWriter`
-    writes one file per contig run and none at all for a contig with no
-    rows, so for the tables training reads this costs a listing and no
-    bytes. A single-file table or an in-memory frame has to be asked,
-    which reads the ``chrom`` column and nothing else.
-
-    The manifest is preferred over the listing when there is one, on
-    the assumption that the caller has already verified the table --
-    nothing on this path calls `require_complete`, and a truncated
-    table therefore reports whatever its manifest lists rather than
-    what is on the disk. That is the right trade for the training path,
-    which verifies a table once and then addresses it many times; a
-    caller who has not verified it should.
-
-    The counterpart of `bam_contigs` on the other side of the pileup.
-
-    :param source: A ``.track.parquet`` directory, a single Parquet
-        file, or an in-memory polars frame -- each as `require_complete`
-        accepts them, a path being a `str`, `bytes` or `os.PathLike`.
-    :returns: The contig names, as a `set`.
-    :raises TypeError: if ``source`` is none of those.
-    """
-
-    path = fspath_or_none(source)
-    if path is not None and os.path.isdir(path):
-        manifest = read_manifest(path)
-        names = list((manifest.get("files") or {}) if manifest else [])
-        if not names:
-            names = [name for name in os.listdir(path) if name.endswith(".parquet")]
-        return {urllib.parse.unquote(name[: -len(".parquet")]) for name in names}
-
-    polars = import_on_first_use("polars")
-    if path is not None:
-        # A plain file is still read, so tables written before the
-        # per-contig layout keep loading.
-        frame = polars.scan_parquet(path)
-    elif isinstance(source, polars.LazyFrame):
-        frame = source
-    elif isinstance(source, polars.DataFrame):
-        frame = source.lazy()
-    else:
-        raise TypeError(
-            "track_contigs reads a track: a {} directory, a single "
-            "Parquet file, or an in-memory polars frame with chrom, pos "
-            "and value columns. Got {}.".format(TRACK_SUFFIX, type(source).__name__)
-        )
-    return set(frame.select("chrom").unique().collect()["chrom"].to_list())
+    return signal, scale
 
 
 def strand_slices(frame, unstranded):
@@ -830,6 +988,57 @@ def commit_directory(path, staging, manifest):
 
     if trash is not None:
         shutil.rmtree(trash, ignore_errors=True)
+
+
+def _manifest_signal(path, manifest):
+    """The signal a manifest record declares, refusing one it cannot.
+
+    An absent one is read as `read_manifest` states. A present value
+    that is not one of `SIGNAL_VERSIONS` is refused rather than
+    defaulted, because a record naming a signal this does not know was
+    written by something that knows a meaning this does not.
+    """
+
+    signal = manifest.get("signal", COUNTS)
+    if not _known_signal(signal):
+        raise ValueError(
+            "{} has a manifest whose signal is {!r}, which is none of {}. "
+            "The record does not say what its values mean in a way this "
+            "quadrat can read, and guessing would read them wrong; rebuild "
+            "the table.".format(path, signal, name_list(SIGNAL_VERSIONS, "none"))
+        )
+    return signal
+
+
+def _known_signal(signal):
+    """Whether ``signal`` is one `read_manifest` documents.
+
+    The one test of a signal, shared by the writer and the reader of a
+    record so the two cannot disagree about which values are one.
+    """
+
+    # The type first: a list or an object would raise `TypeError` from
+    # the membership test rather than answer that it is not a signal.
+    return isinstance(signal, str) and signal in SIGNAL_VERSIONS
+
+
+def _known_scale(scale):
+    """Whether ``scale`` is a ``scale`` `read_manifest` documents.
+
+    The one test of a scale, shared by the writer and the reader of a
+    record. A `bool` is refused although Python counts it a number,
+    since JSON does not, and so is an integer too large to hold as a
+    `float`, which no reader could multiply by.
+    """
+
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool):
+        return False
+    try:
+        return math.isfinite(scale)
+    except OverflowError:
+        # `math.isfinite` converts an `int` to a float first, and that
+        # is where an integer such as ``10**400`` fails.
+        return False
 
 
 def _chrom_filename(chrom):
