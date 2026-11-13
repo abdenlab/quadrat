@@ -412,6 +412,102 @@ class TestDistribution:
         assert result.stdout.strip() == "False"
 
     @pytest.mark.packaging
+    @pytest.mark.parametrize("name", ("torch", "tangermeme", "tqdm", "pandas"))
+    def test_quadrat_should_import_no_tensor_or_frame_library(self, name):
+        """Test that the package's own import stays clear of the stream's.
+
+        Given:
+            A fresh interpreter, and one library the sampler, the
+            dataset and the loader import or reach: torch, tangermeme,
+            tqdm or pandas.
+        When:
+            The package is imported and the loaded modules inspected.
+        Then:
+            That module should not have been loaded, so the one name
+            the package exports from beside the stream costs none of
+            what the stream imports.
+        """
+
+        # Arrange
+        pytest.importorskip(name)
+        program = "import sys, quadrat\nprint({!r} in sys.modules)\n".format(name)
+
+        # Act
+        result = run_child(
+            [sys.executable, "-c", program], "the child interpreter failed"
+        )
+
+        # Assert
+        assert result.stdout.strip() == "False"
+
+    @pytest.mark.packaging
+    @pytest.mark.parametrize(
+        "name", PILEUP_MODULES + ("torch", "tangermeme", "tqdm", "pandas", "numpy")
+    )
+    def test_quadrat_groups_should_import_nothing_third_party(self, name):
+        """Test what importing the signal-group module costs.
+
+        Given:
+            A fresh interpreter, and one third-party module: the
+            engine, a frame library, torch, tangermeme, tqdm or numpy.
+        When:
+            ``quadrat.groups`` is imported and the loaded modules
+            inspected.
+        Then:
+            That module should not have been loaded, so a model that
+            imports the group check alone imports no data path with it.
+        """
+
+        # Arrange
+        pytest.importorskip(name)
+        program = "import sys, quadrat.groups\nprint({!r} in sys.modules)\n".format(name)
+
+        # Act
+        result = run_child(
+            [sys.executable, "-c", program], "the child interpreter failed"
+        )
+
+        # Assert
+        assert result.stdout.strip() == "False"
+
+    @pytest.mark.packaging
+    @pytest.mark.parametrize("module", ("sampling", "dataset", "loader"))
+    def test_quadrat_sampling_dataset_and_loader_should_import_torch_and_nothing_deferred(
+        self, module
+    ):
+        """Test what importing a module of the stream loads.
+
+        Given:
+            A fresh interpreter, and one of the sampler, dataset and
+            loader modules.
+        When:
+            It is imported and the loaded modules inspected.
+        Then:
+            It should have loaded torch, which each of them subclasses
+            or builds on at import, and none of the engine, polars,
+            pyfaidx, tangermeme or pandas, which each reaches only when
+            it reads.
+        """
+
+        # Arrange
+        # tqdm is left out on purpose: torch imports it where it is
+        # installed, so these modules load it without naming it.
+        deferred = PILEUP_MODULES + ("tangermeme", "pandas")
+        program = (
+            "import sys, quadrat.{}\n"
+            "print('torch' in sys.modules)\n"
+            "print(sorted(set({!r}) & set(sys.modules)))\n".format(module, deferred)
+        )
+
+        # Act
+        result = run_child(
+            [sys.executable, "-c", program], "the child interpreter failed"
+        )
+
+        # Assert
+        assert result.stdout.split("\n")[:2] == ["True", "[]"]
+
+    @pytest.mark.packaging
     @pytest.mark.skipif(
         shutil.which("uv") is None,
         reason="uv builds the wheel under test",
