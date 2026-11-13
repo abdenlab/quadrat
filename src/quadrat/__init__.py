@@ -66,12 +66,14 @@ __all__ = [
     "require_complete",
     "track_chrom_path",
     "track_contigs",
+    "validate_signal_groups",
 ]
 
 from importlib.metadata import version
 
 from quadrat._engine import EngineOptionWarning
 from quadrat.alignments import bam_contigs
+from quadrat.groups import validate_signal_groups
 from quadrat.pileup import pileup_alignments, pileup_many
 from quadrat.reference import chrom_lengths
 from quadrat.tables import (

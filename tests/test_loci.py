@@ -34,6 +34,7 @@ from quadrat import loci
 from tests import (
     TWO_CONTIGS,
     builders,
+    dense,
     one_hot,
     parse_fasta,
     quadrat_tables,
@@ -179,6 +180,19 @@ control_tracks = st.lists(track_positions, min_size=1, max_size=2)
 count_floors = st.none() | st.integers(min_value=0, max_value=8)
 
 
+# Counts to filter, any of them not a number, with a floor and a
+# ceiling that are each absent, any number, or one of the counts, so
+# a bound lands exactly on a count as often as not.
+@st.composite
+def count_bands(draw):
+    counts = draw(st.lists(st.floats(allow_infinity=False, width=32), max_size=12))
+    numbers = [count for count in counts if not numpy.isnan(count)]
+    bound = st.none() | st.floats(allow_nan=False, allow_infinity=False, width=32)
+    if numbers:
+        bound = bound | st.sampled_from(numbers)
+    return counts, draw(bound), draw(bound)
+
+
 # Regions to exclude, as ``(contig, start, end)``, or no exclusion
 # list at all.
 exclusion_rows = st.none() | st.lists(
@@ -224,17 +238,6 @@ def no_engine(mocker):
     """Make the engine's two modules unimportable for one test."""
 
     mocker.patch.dict(sys.modules, {"polars_bio": None, "giql": None})
-
-
-def dense(rows, sizes=TWO_CONTIGS):
-    """Return the per-contig dense arrays one channel's rows imply."""
-
-    arrays = {
-        chrom: numpy.zeros(size, dtype=numpy.float32) for chrom, size in sizes.items()
-    }
-    for chrom, pos, value in rows:
-        arrays[chrom][pos] += value
-    return arrays
 
 
 def dense_signal(channels, rows):
@@ -1019,6 +1022,27 @@ def test_load_windows_should_raise_file_not_found_error_when_the_reference_is_mi
     assert not [caught for caught in recwarn.list if "scanning" in str(caught.message)]
 
 
+def test_load_windows_should_raise_file_not_found_error_when_a_locus_file_is_missing(
+    corpus, tmp_path
+):
+    """Test the refusal for a locus file that is not there.
+
+    Given:
+        A reference, and a path at which there is no locus file.
+    When:
+        Its windows are loaded.
+    Then:
+        It should raise `FileNotFoundError` naming the path.
+    """
+
+    # Arrange
+    missing = str(tmp_path / "missing.bed")
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match="missing.bed"):
+        loci.load_windows(missing, corpus.fasta, 60, 30)
+
+
 def test_load_windows_should_raise_when_chroms_names_no_contig_the_loci_use(corpus):
     """Test the refusal for a filter and loci on different conventions.
 
@@ -1496,6 +1520,27 @@ def test_exclusion_mask_should_raise_type_error_when_a_region_set_is_no_locus_se
         loci.exclusion_mask(windows, 42)
 
 
+def test_exclusion_mask_should_raise_file_not_found_error_when_a_list_is_missing(
+    tmp_path,
+):
+    """Test the refusal for an exclusion list that is not there.
+
+    Given:
+        A window, and a path at which there is no exclusion list.
+    When:
+        The mask is taken.
+    Then:
+        It should raise `FileNotFoundError` naming the path.
+    """
+
+    # Arrange
+    windows = window_frame([("chr1", 0, 60)], ("outer_start", "outer_end"))
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match="missing.bed"):
+        loci.exclusion_mask(windows, str(tmp_path / "missing.bed"))
+
+
 def test_exclusion_mask_should_leave_no_table_bound(corpus, engine):
     """Test that the join's frames do not outlive it.
 
@@ -1569,6 +1614,113 @@ def test_exclusion_mask_should_match_a_bin_by_bin_test_for_any_intervals(
 
     # Assert
     assert mask.tolist() == [touches(window, regions) for window in windows]
+
+
+def test_readable_windows_should_keep_the_windows_in_bounds_that_no_region_excludes(
+    corpus, engine
+):
+    """Test both tests of readability over the module's peaks.
+
+    Given:
+        The module's nine peaks at a jitter of 5 and its exclusion
+        list.
+    When:
+        Their readable windows are taken.
+    Then:
+        It should answer the frame `load_windows` answers, and keep
+        the windows on their contig apart from the one inside the
+        excluded region and the one reaching it through a bin edge.
+    """
+
+    # Act
+    windows, keep = loci.readable_windows(
+        corpus.peaks,
+        corpus.fasta,
+        IN_WINDOW,
+        OUT_WINDOW,
+        max_jitter=5,
+        exclusion_lists=[corpus.exclusion],
+    )
+
+    # Assert
+    assert windows.equals(
+        loci.load_windows(
+            corpus.peaks, corpus.fasta, IN_WINDOW, OUT_WINDOW, max_jitter=5
+        )
+    )
+    assert keep.dtype == numpy.bool_
+    assert keep.tolist() == [
+        True,  # chr2 200-260
+        True,  # chr1 100-140
+        False,  # chr1 20-40 starts before the contig
+        False,  # chr1 960-1000 ends past the contig
+        True,  # chr1 955-975 ends exactly at its length
+        False,  # chr1 690-720 reaches the region through a bin edge
+        True,  # chr1 800-840
+        True,  # chr1 930-940
+        False,  # chr1 540-560 is inside the region
+    ]
+
+
+def test_readable_windows_should_keep_every_window_in_bounds_when_nothing_is_excluded(
+    corpus,
+):
+    """Test readability without an exclusion list.
+
+    Given:
+        The module's nine peaks at a jitter of 5 and no exclusion list.
+    When:
+        Their readable windows are taken.
+    Then:
+        It should keep exactly the windows `load_windows` marks
+        ``in_bounds``, the two inside or beside the region included.
+    """
+
+    # Act
+    windows, keep = loci.readable_windows(
+        corpus.peaks, corpus.fasta, IN_WINDOW, OUT_WINDOW, max_jitter=5
+    )
+
+    # Assert
+    assert keep.tolist() == windows["in_bounds"].to_list()
+    assert keep.tolist() == [True, True, False, False, True, True, True, True, True]
+
+
+@settings(max_examples=200)
+@given(band=count_bands())
+def test_within_counts_should_keep_a_count_inside_the_band_or_not_a_number(band):
+    """Test the count band over arbitrary counts and bounds.
+
+    Given:
+        Up to twelve counts, any of them not a number, and a floor and
+        a ceiling that are each ``None``, any number, or one of the
+        counts.
+    When:
+        The counts are tested against the band.
+    Then:
+        It should answer one boolean per count, true exactly where the
+        count is not a number or lies within the bounds given, both
+        ends included.
+    """
+
+    # Arrange
+    counts, min_counts, max_counts = band
+
+    # Act
+    within = loci.within_counts(counts, min_counts, max_counts)
+
+    # Assert
+    expected = [
+        bool(numpy.isnan(count))
+        or (
+            (min_counts is None or count >= min_counts)
+            and (max_counts is None or count <= max_counts)
+        )
+        for count in counts
+    ]
+    assert isinstance(within, numpy.ndarray)
+    assert within.dtype == numpy.bool_
+    assert within.tolist() == expected
 
 
 def test_require_track_contigs_should_raise_when_no_track_shares_a_contig(corpus):
