@@ -142,6 +142,23 @@ def fspath_or_none(value):
     return None
 
 
+def item_list(value):
+    """``value`` as a list of items: a `list` or `tuple` as its own, anything else as one.
+
+    One definition of a locus-shaped argument's answer to a single
+    item, which is to wrap it: one file is the ordinary locus set, so a
+    path or a frame is taken whole, and only a `list` or `tuple` is
+    read as several. Wrapping can lose nothing, because how many items
+    there are is no axis of anything read from them, e.g., locus sets
+    are interleaved into one locus order. Nothing is checked here; each
+    caller refuses an item in the words its own contract names. A track
+    argument answers a single item the other way, for the reason
+    `quadrat.cache.track_list` gives.
+    """
+
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
 def name_list(names, empty, limit=3):
     """Return the first few of ``names`` as message text, with a count of the rest.
 

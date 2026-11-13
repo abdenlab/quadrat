@@ -1,10 +1,10 @@
 """Locus loading and extraction: windows from locus files, tensors from windows.
 
 Provides `load_windows`, which turns locus files into a window frame;
-`exclusion_mask` and `require_track_contigs`, which decide what of a
-window frame may be read; `extract_signal` and `extract_sequences`,
-which read it; and `extract_loci`, which composes all of them into
-`ExtractedLoci`.
+`exclusion_mask`, `readable_windows`, `within_counts` and
+`require_track_contigs`, which decide what of a window frame may be
+read; `extract_signal` and `extract_sequences`, which read it; and
+`extract_loci`, which composes all of them into `ExtractedLoci`.
 
 Everything here is package-internal: no name carries a ``# public``
 marker and none is re-exported from `quadrat`.
@@ -22,6 +22,7 @@ from quadrat._engine import (
     LOCUS_BINS_TABLE,
     fspath_or_none,
     import_on_first_use,
+    item_list,
     name_list,
     registered_frames,
     transpile_intervals,
@@ -122,13 +123,15 @@ def load_windows(
     :param summits: Whether to centre each locus on its summit, i.e.,
         its start plus the offset in the tenth column. The centre is
         then the summit exactly, whatever the locus's width.
-    :param max_jitter: The largest offset a draw may be shifted by, in
-        bases.
+    :param max_jitter: The margin every window is widened by on both
+        sides, in bases. `quadrat.sampling.PeakNegativeMixSampler`
+        states the shifts a draw takes within it.
     :returns: A `polars.DataFrame` with the columns above.
     :raises TypeError: if ``loci`` is of none of those shapes, if
         ``chroms`` is a single name rather than a collection of them,
         or if ``sequences`` is not a path.
-    :raises FileNotFoundError: if nothing exists at ``sequences``.
+    :raises FileNotFoundError: if nothing exists at ``sequences`` or at
+        a locus file's path.
     :raises ValueError: if ``chroms`` leaves no locus where the loci
         hold some, which is a naming mismatch between the two; if any
         locus is on a contig the reference does not name; or if a
@@ -269,6 +272,8 @@ def exclusion_mask(windows, exclusion_lists):
         row order, true where the window is excluded.
     :raises TypeError: if ``windows`` is not a `polars.DataFrame`, or
         if ``exclusion_lists`` is of no shape a locus set can take.
+    :raises FileNotFoundError: if nothing exists at an exclusion
+        list's path.
     :raises ImportError: if the ``pileup`` extra is not installed.
 
     .. rubric:: Implementation notes
@@ -310,6 +315,85 @@ def exclusion_mask(windows, exclusion_lists):
         hits = pb.sql(_exclusion_sql()).collect()
     mask[hits["idx"].to_numpy()] = True
     return mask
+
+
+def readable_windows(
+    loci,
+    sequences,
+    in_window,
+    out_window,
+    chroms=None,
+    summits=False,
+    max_jitter=0,
+    exclusion_lists=None,
+):
+    """Return a locus set's windows, and which of them may be read.
+
+    A window may be read when it is ``in_bounds`` and `exclusion_mask`
+    does not flag it, the two tested in that order.
+
+    Needs the ``pileup`` extra where `load_windows` or `exclusion_mask`
+    does.
+
+    :param loci: The loci, as `load_windows` takes them.
+    :param sequences: The reference, likewise.
+    :param in_window: The input window's width, likewise.
+    :param out_window: The output window's width, likewise.
+    :param chroms: The contigs to keep, likewise.
+    :param summits: Whether loci are centred on their summits,
+        likewise.
+    :param max_jitter: The jitter margin, likewise.
+    :param exclusion_lists: The excluded regions, as `exclusion_mask`
+        takes them, or ``None`` to exclude nothing.
+    :returns: ``(windows, keep)``: the frame `load_windows` returns,
+        and a boolean `numpy.ndarray` with one entry per row, true
+        where the window may be read.
+    :raises TypeError: for anything `load_windows` or `exclusion_mask`
+        refuses by type.
+    :raises ValueError: for anything `load_windows` refuses by value.
+    :raises FileNotFoundError: for a path `load_windows` or
+        `exclusion_mask` finds nothing at.
+    :raises ImportError: where `load_windows` or `exclusion_mask` needs
+        the ``pileup`` extra and it is not installed.
+    """
+
+    windows = load_windows(
+        loci,
+        sequences,
+        in_window,
+        out_window,
+        chroms=chroms,
+        summits=summits,
+        max_jitter=max_jitter,
+    )
+    keep = windows["in_bounds"].to_numpy().copy()
+    if exclusion_lists is not None:
+        keep &= ~exclusion_mask(windows, exclusion_lists)
+    return windows, keep
+
+
+def within_counts(counts, min_counts=None, max_counts=None):
+    """Return which counts lie within a floor and a ceiling, both ends included.
+
+    A count that is not a number is kept: it is below no floor and
+    above no ceiling.
+
+    :param counts: One count per locus, as anything `numpy.asarray`
+        reads as a one-dimensional array.
+    :param min_counts: The lowest count kept, or ``None`` for no floor.
+    :param max_counts: The highest count kept, or ``None`` for no
+        ceiling.
+    :returns: A boolean `numpy.ndarray` with one entry per count, true
+        where the count is kept.
+    """
+
+    counts = numpy.asarray(counts)
+    within = numpy.ones(len(counts), dtype=bool)
+    if min_counts is not None:
+        within &= ~(counts < min_counts)
+    if max_counts is not None:
+        within &= ~(counts > max_counts)
+    return within
 
 
 def require_track_contigs(chroms, tracks, label="signals"):
@@ -561,9 +645,11 @@ def extract_loci(
 
     1. its windows lie on its contig, i.e., ``in_bounds``;
     2. `exclusion_mask` does not flag it;
-    3. its count is within ``min_counts`` and ``max_counts``, the count
-       being the total of signal track ``target_idx`` over its output
-       window. A count equal to either threshold is kept.
+    3. its count is within ``min_counts`` and ``max_counts`` as
+       `within_counts` decides, the count being the total of signal
+       track ``target_idx`` over its output window.
+
+    The first two are the test `readable_windows` makes.
 
     Between the second test and the third, `require_track_contigs` is
     applied to ``signals`` and to ``controls`` over the contigs of the
@@ -600,8 +686,8 @@ def extract_loci(
     :param controls: One track per control channel, in the same form,
         or ``None``.
     :param chroms: The contigs to keep, as `load_windows` takes them.
-    :param max_jitter: The largest offset a draw may be shifted by, in
-        bases; every window is that much wider on both sides.
+    :param max_jitter: The margin every window is widened by on both
+        sides, in bases, as `load_windows` takes it.
     :param min_counts: The lowest count a kept locus may have, or
         ``None`` for no floor.
     :param max_counts: The highest count a kept locus may have, or
@@ -626,7 +712,9 @@ def extract_loci(
         not verify complete; for the two naming mismatches
         `load_windows` refuses; for the one `require_track_contigs`
         refuses; or for a residue `extract_sequences` refuses.
-    :raises FileNotFoundError: if a track path does not exist.
+    :raises FileNotFoundError: if a track path does not exist, or for a
+        locus file or an exclusion list `readable_windows` finds nothing
+        at.
     :raises OSError: if the reference cannot be read, or has no index
         and none can be written beside it.
     :raises ImportError: if the ``pileup`` extra is needed and not
@@ -676,7 +764,7 @@ def extract_loci(
     if fspath_or_none(sequences) is not None:
         SequenceStore(sequences).contig_lengths()
 
-    windows = load_windows(
+    windows, keep = readable_windows(
         loci,
         sequences,
         in_window,
@@ -684,10 +772,8 @@ def extract_loci(
         chroms=chroms,
         summits=summits,
         max_jitter=max_jitter,
+        exclusion_lists=exclusion_lists,
     )
-    keep = windows["in_bounds"].to_numpy().copy()
-    if exclusion_lists is not None:
-        keep &= ~exclusion_mask(windows, exclusion_lists)
 
     # Placed for the reason in the notes.
     if keep.any():
@@ -698,13 +784,9 @@ def extract_loci(
     signal = None
     if signals is not None and keep.any():
         signal = extract_signal(windows.filter(keep), signals)
-        if min_counts is not None or max_counts is not None:
+        if counting:
             counts = signal.numpy()[:, target_idx].sum(axis=1)
-            within = numpy.ones(len(counts), dtype=bool)
-            if min_counts is not None:
-                within &= ~(counts < min_counts)
-            if max_counts is not None:
-                within &= ~(counts > max_counts)
+            within = within_counts(counts, min_counts, max_counts)
             keep[numpy.flatnonzero(keep)[~within]] = False
             signal = signal[torch.from_numpy(within)]
 
@@ -776,20 +858,15 @@ def _contig_names(chroms):
 def _locus_sources(label, loci):
     """Return a locus argument as a list of path strings and pandas frames.
 
-    A single path or frame is wrapped, because one file is the ordinary
-    locus set, and only a `list` or `tuple` is read as several. How many
-    sets there are is no axis of anything read from them: they are
-    interleaved into one locus order. A track argument answers a single
-    item the other way, for the reason `quadrat.cache.track_list`
-    gives. A polars frame is answered as the pandas frame of the same
-    columns.
+    A single path or frame is one locus set, as
+    `quadrat._engine.item_list` reads one and for the reason it gives.
+    A polars frame is answered as the pandas frame of the same columns.
     """
 
     pandas = import_on_first_use("pandas")
     polars = import_on_first_use("polars")
-    items = loci if isinstance(loci, (list, tuple)) else [loci]
     sources = []
-    for item in items:
+    for item in item_list(loci):
         path = fspath_or_none(item)
         if path is not None:
             sources.append(path)
