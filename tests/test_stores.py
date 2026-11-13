@@ -1229,10 +1229,11 @@ class TestTrackStore:
         path = str(tmp_path / "property.track.parquet")
         builders.write_track(path, [("chr1", pos, value) for pos, value in rows])
         store = stores.TrackStore([path])
-        expected = numpy.zeros(end - start, dtype=numpy.float32)
+        expected = numpy.zeros(end - start, dtype=numpy.float64)
         for pos, value in rows:
             if start <= pos < end:
-                expected[pos - start] += numpy.float32(value)
+                expected[pos - start] += value
+        expected = expected.astype(numpy.float32)
 
         # Act
         window = store.window("chr1", start, end).numpy()
