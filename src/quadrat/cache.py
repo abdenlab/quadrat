@@ -36,8 +36,16 @@ from quadrat._engine import (
     registered_frames,
     transpile_intervals,
 )
-from quadrat.stores import ProcessLocalHandles, SequenceStore, track_frame
+from quadrat.stores import (
+    ProcessLocalHandles,
+    SequenceStore,
+    chrom_track,
+    coverage_levels,
+    coverage_runs,
+    track_frame,
+)
 from quadrat.tables import (
+    COVERAGE_DELTAS,
     MANIFEST_VERSION,
     commit_directory,
     read_manifest,
@@ -112,6 +120,12 @@ _ARRAY_NAMES = tuple(name for name, _, _ in _ARRAY_WIDTHS)
 
 _NPY_HEADER_BYTES = 128
 
+#: The widths `group_track` holds a site at between grouping and
+#: filling the result: window index, offset, value and channel, the
+#: last three being the widths ``pos``, ``val`` and ``chan`` are
+#: written at.
+_SITE_DTYPES = (numpy.int64, numpy.int32, numpy.float32, numpy.int16)
+
 #: The bounds a control is grouped over, i.e., the input window, where
 #: `group_track` defaults to the output window a signal is grouped
 #: over.
@@ -168,7 +182,9 @@ class WindowSignalCache(ProcessLocalHandles):
     is 31.4 GB. That is also what makes the cost insensitive to channel
     count: pooling changes how positions are labelled rather than how
     many there are, so ten channels cost 4.86 GB against sixty-eight at
-    5.71 GB, where dense would be 4.6 GB against 31.4 GB.
+    5.71 GB, where dense would be 4.6 GB against 31.4 GB. Those figures
+    are channels of counts; a channel of coverage costs what
+    `group_track` states.
     """
 
     def __init__(
@@ -434,7 +450,7 @@ class WindowSignalCache(ProcessLocalHandles):
         its mirrored offset and permuted channel, rather than afterwards
         by flipping the dense result. Afterwards means two passes over
         ``(channels, length)`` floats for the sake of the hundred or so
-        rows per channel that are not zero.
+        rows per channel of counts that are not zero.
         """
 
         torch = import_on_first_use("torch")
@@ -796,7 +812,7 @@ def write_window_cache(
     with exactly these fields:
 
     ``version``
-        `MANIFEST_VERSION`, the schema version a track's record carries.
+        `MANIFEST_VERSION`, the version a track of counts carries.
 
     ``files``
         Every file the entry holds, as a path relative to its root,
@@ -1212,6 +1228,23 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
     covered by two overlapping windows is stored once per window, and
     that duplication is the price of a read that needs no search.
 
+    Each channel is grouped as its track's ``signal`` says; see
+    `quadrat.read_manifest`. A channel of counts holds a row per
+    recorded position inside a window. A channel of coverage deltas
+    holds a row per base inside a window where the coverage is not
+    zero, the row's value being that coverage as
+    `quadrat.stores.coverage_levels` sums it, so it reads back as
+    per-base coverage like any other row. Coverage is therefore dense
+    inside a covered window: a channel of it costs up to one row per
+    base of every window, at the 10 bytes a row the result holds, so
+    the result is bounded by the windows times their width times the
+    channels of coverage, where counts are bounded by the positions
+    recorded. That is more than a dense ``float32`` array of the same
+    coverage would hold. Size a window set with coverage channels by
+    that bound rather than by the rows its tracks hold; a
+    `WindowSignalCache.window` draw scatters every row of its window,
+    so it slows in the same proportion.
+
     Needs the ``pileup`` extra, which installs the engine the grouping
     runs on. Concurrent calls in one process are unsupported;
     `quadrat._engine` says why.
@@ -1254,7 +1287,8 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
         ``tracks`` is a single track or an unordered collection of
         them, or if a track is of no shape a track can take.
     :raises ValueError: if there are more channels than ``int16`` can
-        index, or if a track directory does not verify complete.
+        index, or if a track directory does not verify complete, as
+        `quadrat.stores.track_frame` refuses it.
     :raises FileNotFoundError: if a track path does not exist.
     :raises ImportError: if the ``pileup`` extra is not installed.
 
@@ -1267,10 +1301,10 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
     write, which is 4.3x faster at ten channels and the difference
     between the read being linear in channel count or not.
 
-    One GIQL ``INTERSECTS`` join per contig, covering every channel:
-    each channel's rows on the contig are stacked into one frame, and
-    the channel is carried through the join as a projected column
-    (`_signal_sql` says why that costs the join nothing). The join
+    One GIQL ``INTERSECTS`` join per contig, covering every channel of
+    counts: each channel's rows on the contig are stacked into one
+    frame, and the channel is carried through the join as a projected
+    column (`_signal_sql` says why that costs the join nothing). The join
     returns ``(window index, offset within the window, value,
     channel)``, which is the grouped form already, so the engine does
     the work this would otherwise do with two ``searchsorted`` calls
@@ -1279,19 +1313,52 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
     dominated by planning rather than by binding, so the rows per query
     do not.
 
-    The join is the one implementation of the grouping. Two
+    The join is the one implementation of the grouping of counts. Two
     implementations of one function agreeing is a thing to test rather
     than a thing to have. `window_group_sums` reads the same rows
     another way, for the reason its own notes give.
 
-    Memory peaks near 28 bytes a site, a site being one row of the
-    result. Every contig's hits are held until the last contig is
-    joined, at 18 bytes a site: an ``int64`` window index, an ``int32``
-    offset, a ``float32`` value and an ``int16`` channel. The 10 bytes a
-    site returned, ``pos``, ``val`` and ``chan`` at the dtypes above,
-    are filled from them while they are still held. Beside that sit
-    ``offsets``, at 8 bytes a window, and one contig's join answer at a
-    time.
+    A channel of coverage deltas does not go through the join, because
+    its rows are not the sites: the sites are bases, and a base between
+    two deltas has no row to intersect. Its contig is read whole and
+    summed once, each window is cut into runs of constant coverage by
+    `quadrat.stores.coverage_runs`, and only the runs whose coverage is
+    not zero are expanded to bases, straight into the narrow site
+    columns, so the transient is the result's own sites rather than
+    every base of every window.
+
+    A contig's sites are put in order by one stable sort over a single
+    integer key, the window index, the offset and the channel packed
+    together, rather than by a sort over four keys: over 4M sites in
+    random order the four-key sort takes 2.6 s and the one-key sort
+    1.0 s, and sites that arrive near their order, as a coverage
+    channel's do, sort faster still. The value is a key only where two
+    sites share the other three, i.e., where a channel of counts
+    records a position twice on the contig, and that contig takes the
+    four-key sort, as does one whose packed key would not fit in 64
+    bits.
+
+    Every contig's sites are held until the last contig is grouped, at
+    18 bytes a site: an ``int64`` window index, an ``int32`` offset, a
+    ``float32`` value and an ``int16`` channel, the widths every site
+    is narrowed to as it leaves the join or the expansion. The 10 bytes
+    a site returned, ``pos``, ``val`` and ``chan`` at the dtypes above,
+    are filled from them while they are still held, through 8 bytes a
+    site of slots for one contig at a time. Ordering a contig holds its
+    sites at 18 bytes beside the sort's key and permutation at 8 bytes
+    each, and then one column at a time of the ordered copy. So what
+    numpy holds peaks near 36 bytes a site of a single contig, beside
+    ``offsets`` at 8 bytes a window and the join's own buffers, which
+    are the engine's and not numpy's.
+
+    A channel of coverage deltas adds its contig's deltas to that while
+    the contig is grouped, however few sites its windows hold: the rows
+    as `quadrat.stores.chrom_track` reads them, 16 bytes a row held by
+    polars, and the coverage `quadrat.stores.coverage_levels` sums from
+    them, 16 bytes a row of numpy while it is summed. So a coverage
+    channel's contig costs near 32 bytes a delta row on top of the
+    sites; 100 one-base windows over a contig of 400,000 deltas peak at
+    6.4 MB of numpy against at most 3,600 bytes for their sites.
     """
 
     polars = import_on_first_use("polars")
@@ -1318,6 +1385,9 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
     frames = [track_frame(track) for track in tracks]
     counts = numpy.zeros(n_windows, dtype=numpy.int64)
     gathered = []
+    # The widest window bounds every offset, which is what lets one
+    # integer key order a contig's sites; see `_site_order`.
+    width = max(1, int((ends - starts).max())) if n_windows else 1
 
     for chrom, rows in groups:
         placed = polars.DataFrame(
@@ -1335,38 +1405,67 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
             },
         )
 
-        # Every channel in one join per contig; see the notes.
+        # Every channel of counts in one join per contig; see the
+        # notes. A channel of coverage deltas is grouped beside it.
         rowsets = []
-        for channel, frame in enumerate(frames):
-            rowset = (
-                frame.filter(polars.col("chrom") == str(chrom))
-                .select(
-                    polars.col("chrom").cast(polars.Utf8),
-                    polars.col("pos").cast(polars.Int64).alias("cstart"),
-                    (polars.col("pos").cast(polars.Int64) + 1).alias("cend"),
-                    polars.col("value").cast(polars.Float64),
-                    polars.lit(channel, dtype=polars.Int16).alias("chan"),
-                )
-                .collect()
-            )
+        parts = []
+        # Whether a channel of counts records a position twice on this
+        # contig, the one way two sites can share a window, an offset
+        # and a channel; see `_site_order`.
+        repeated = False
+        for channel, (frame, signal, scale) in enumerate(frames):
+            on_contig = frame.filter(polars.col("chrom") == str(chrom))
+            if signal == COVERAGE_DELTAS:
+                read = chrom_track(on_contig)
+                if read is not None:
+                    parts.append(
+                        _coverage_sites(read, scale, rows, starts, ends, channel)
+                    )
+                continue
+            rowset = on_contig.select(
+                polars.col("chrom").cast(polars.Utf8),
+                polars.col("pos").cast(polars.Int64).alias("cstart"),
+                (polars.col("pos").cast(polars.Int64) + 1).alias("cend"),
+                polars.col("value").cast(polars.Float64),
+                polars.lit(channel, dtype=polars.Int16).alias("chan"),
+            ).collect()
             # Skipped rather than concatenated. Every part is built by
             # the select above and so carries the same schema, empty or
             # not, which `concat` would accept -- this drops the copy
-            # and the pass over it, not a failure. The `continue` below
-            # is the one that matters: a contig no channel records
-            # leaves nothing to concatenate at all.
+            # and the pass over it, not a failure.
             if rowset.height:
                 rowsets.append(rowset)
-        if not rowsets:
+                repeated = repeated or bool(rowset["cstart"].is_duplicated().any())
+        if rowsets:
+            rowset = rowsets[0] if len(rowsets) == 1 else polars.concat(rowsets)
+            with registered_frames({WINDOWS_TABLE: placed, TRACK_TABLE: rowset}) as pb:
+                hits = pb.sql(sql).collect()
+            if hits.height:
+                # Narrowed as they leave the join, before anything is
+                # concatenated or ordered, so every copy below is made
+                # at the widths the result keeps; see the notes.
+                parts.append(
+                    tuple(
+                        hits[column].to_numpy().astype(dtype, copy=False)
+                        for column, dtype in zip(
+                            ("idx", "offset", "value", "chan"), _SITE_DTYPES
+                        )
+                    )
+                )
+        # A contig no channel records leaves nothing to order.
+        if not parts:
             continue
-        rowset = rowsets[0] if len(rowsets) == 1 else polars.concat(rowsets)
-
-        with registered_frames({WINDOWS_TABLE: placed, TRACK_TABLE: rowset}) as pb:
-            hits = pb.sql(sql).collect()
-        if not hits.height:
+        if len(parts) == 1:
+            index, offset, value, channel_of = parts[0]
+        else:
+            index, offset, value, channel_of = (
+                numpy.concatenate([part[column] for part in parts])
+                for column in range(4)
+            )
+        del parts
+        if not len(index):
             continue
 
-        index = hits["idx"].to_numpy()
         # Sorted per contig rather than once over every contig's hits
         # together. A window belongs to one contig, so these index
         # ranges are disjoint between iterations and each can be
@@ -1374,30 +1473,17 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
         # sort is super-linear: one pass over everything measured
         # nearly three times the cost of the same rows sorted in
         # tenths.
-        #
-        # Every column is a key, for the ordering guarantee in the
-        # docstring.
-        order = numpy.lexsort(
-            (
-                hits["value"].to_numpy(),
-                hits["chan"].to_numpy(),
-                hits["offset"].to_numpy(),
-                index,
-            )
+        order = _site_order(
+            index, offset, value, channel_of, width, n_channels, repeated
         )
-        # Narrowed here rather than at the scatter. The join answers in
-        # the widths it computes in, and holding every contig's hits at
-        # those widths to the end costs 24 bytes a site against the 10
-        # the result keeps -- so the cast that has to happen anyway
-        # happens while the arrays are small.
-        gathered.append(
-            (
-                index[order],
-                hits["offset"].to_numpy()[order].astype(numpy.int32),
-                hits["value"].to_numpy()[order].astype(numpy.float32),
-                hits["chan"].to_numpy()[order].astype(numpy.int16),
-            )
-        )
+        # One column at a time, so only one unordered copy is ever
+        # alive beside the ordered ones.
+        index = index[order]
+        offset = offset[order]
+        value = value[order]
+        channel_of = channel_of[order]
+        del order
+        gathered.append((index, offset, value, channel_of))
         # Per window over every channel at once, which is the only
         # breakdown anything reads: the result has no channel axis.
         counts += numpy.bincount(index, minlength=n_windows)
@@ -1411,14 +1497,20 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
     chan = numpy.empty(total, dtype=numpy.int16)
 
     for index, offset, value, channel_of in gathered:
-        # `index` is sorted, so `searchsorted` gives each row's first
-        # occurrence and the distance from it is its rank in the
-        # window. Every channel is in this one pass, so the rank is the
-        # position in the whole run and the window's own start is the
-        # base -- there is no per-channel write head to carry, and no
-        # contig can reach a window another contig wrote.
-        rank = numpy.arange(len(index)) - numpy.searchsorted(index, index)
-        slots = offsets[index] + rank
+        # `index` is sorted, so each window's sites are one run of it,
+        # and they fill consecutive slots from the window's own offset.
+        # Every channel is in this one pass, so there is no per-channel
+        # write head to carry, and no contig can reach a window another
+        # contig wrote. Built as a running sum of steps of one, jumping
+        # at each run's first site from the slot before it to the
+        # window's offset, so the only array a site long is the slots.
+        heads = numpy.flatnonzero(numpy.concatenate(([True], index[1:] != index[:-1])))
+        first = offsets[index[heads]]
+        slots = numpy.ones(len(index), dtype=numpy.int64)
+        slots[heads] = first - numpy.concatenate(
+            ([0], first[:-1] + numpy.diff(heads) - 1)
+        )
+        numpy.cumsum(slots, out=slots)
         pos[slots] = offset
         val[slots] = value
         chan[slots] = channel_of
@@ -1431,9 +1523,26 @@ def window_group_sums(
 ):
     """Return the total signal per window per channel group, without densifying.
 
-    The arithmetic is exact rather than approximate: a prefix sum per
-    contig and two searches per window, in ``float64``, so a locus's
-    total does not depend on how the windows were batched.
+    The arithmetic is exact rather than approximate, in ``float64``,
+    and per window rather than per batch, so a locus's total does not
+    depend on how the windows were batched.
+
+    A channel's total over a window is what its rows in that window's
+    run of a `group_track` read add up to, whichever its track's
+    ``signal``. Needs nothing the ``pileup`` extra installs.
+
+    On a channel of coverage deltas that total is the area under the
+    window's coverage, i.e., its per-base coverage summed, rather than
+    a count of records: each record adds the bases of its span that
+    fall inside the window. That is about the read length times the
+    records only where every record lies inside the window, and less
+    where one overhangs an end. A band chosen for counts therefore shifts at both
+    ends when it is applied to such a total, e.g., by
+    `quadrat.loci.within_counts`: five 20-base records inside a window
+    total 5 as 5' counts and 100 as coverage, so the floor is cleared
+    by fewer records than on counts and the ceiling exceeded by fewer
+    too. Nothing refuses a band for the kind of channel it is applied
+    to.
 
     :param windows: A `polars.DataFrame` carrying ``chrom`` and the
         two columns ``bound_columns`` names, one row per window.
@@ -1477,9 +1586,19 @@ def window_group_sums(
     cannot group one, which is the distinct reason this exists and
     the exemption from the rule its sibling's notes state.
 
-    The per-contig sort is not incidental. The prefix sum below needs
+    The per-contig sort is not incidental. The prefix sums below need
     positions ascending, and a track read whole rather than per contig
-    arrives in whatever order its files are globbed in.
+    arrives in whatever order its files are globbed in; `chrom_track`
+    sorts what arrives out of order.
+
+    Each contig's running sum is built once per channel and every
+    window is answered from it. Counts take a prefix sum of the values,
+    searched at both of a window's bounds. Coverage takes the levels
+    `coverage_levels` sums, and each window is cut into runs of
+    constant coverage by `quadrat.stores.coverage_runs` and totalled as
+    each run's level times its width. Nothing per base is built, so a
+    coverage channel costs about what a channel of counts with the same
+    rows does.
     """
 
     polars = import_on_first_use("polars")
@@ -1512,26 +1631,14 @@ def window_group_sums(
     frames = [track_frame(track) for track in tracks]
 
     for chrom, rows in groups:
-        for channel, frame in enumerate(frames):
-            read = (
-                frame.filter(polars.col("chrom") == str(chrom))
-                .select(
-                    polars.col("pos").cast(polars.Int64),
-                    polars.col("value").cast(polars.Float64),
-                )
-                .sort("pos")
-                .collect()
-            )
-            if read.height == 0:
+        lo, hi = starts[rows], ends[rows]
+        for channel, (frame, signal, scale) in enumerate(frames):
+            read = chrom_track(frame.filter(polars.col("chrom") == str(chrom)))
+            if read is None:
                 continue
-            positions = read["pos"].to_numpy()
-            values = read["value"].to_numpy()
-            cumulative = numpy.concatenate(
-                ([0.0], numpy.cumsum(values, dtype=numpy.float64))
+            totals[rows, group_of[channel]] += _window_totals(
+                read, signal, scale, lo, hi
             )
-            lo = numpy.searchsorted(positions, starts[rows], side="left")
-            hi = numpy.searchsorted(positions, ends[rows], side="left")
-            totals[rows, group_of[channel]] += cumulative[hi] - cumulative[lo]
 
     return torch.from_numpy(totals.astype(numpy.float32))
 
@@ -1598,6 +1705,101 @@ def resolve_residency(residency=None):
             )
         )
     return residency
+
+
+def _coverage_sites(read, scale, rows, starts, ends, channel):
+    """Return a contig's coverage at every base of its windows where it is not zero.
+
+    ``read`` is the contig's deltas as `quadrat.stores.chrom_track`
+    answers them, ``scale`` the track's, ``rows`` the windows on the
+    contig, indexing ``starts`` and ``ends``, and ``channel`` the
+    channel they are. Answers ``(index, offset, value, chan)`` at
+    `_SITE_DTYPES`, one entry per site: the window's row, the base's
+    offset from the window's start, the coverage there, and
+    ``channel``. Needs nothing the ``pileup`` extra installs.
+
+    .. rubric:: Implementation notes
+
+    The offsets are built by a running sum in ``int32`` rather than as
+    ``int64`` ramps less each run's start: every site steps one past
+    the last, and a run's first site steps from the previous run's last
+    offset to its own, so the sum at every site is that site's offset,
+    which a window's width bounds. One four-byte array a site replaces
+    three eight-byte ones.
+    """
+
+    positions, deltas = read
+    lo_bound = starts[rows]
+    window, left, right, level = coverage_runs(
+        positions, coverage_levels(deltas, scale), lo_bound, ends[rows]
+    )
+    # Only the covered runs become bases, which is what bounds the
+    # transient by the result rather than by every base of every window.
+    covered = level != 0
+    window, left, right, level = (
+        window[covered],
+        left[covered],
+        right[covered],
+        level[covered],
+    )
+    width = right - left
+    first = left - lo_bound[window]
+    offset = numpy.ones(int(width.sum()), dtype=numpy.int32)
+    if len(width):
+        heads = numpy.cumsum(width) - width
+        offset[heads] = first - numpy.concatenate(([0], first[:-1] + width[:-1] - 1))
+        numpy.cumsum(offset, dtype=numpy.int32, out=offset)
+    index_dtype, _, value_dtype, chan_dtype = _SITE_DTYPES
+    return (
+        numpy.repeat(rows[window].astype(index_dtype, copy=False), width),
+        offset,
+        numpy.repeat(level.astype(value_dtype), width),
+        numpy.full(len(offset), channel, dtype=chan_dtype),
+    )
+
+
+def _site_order(index, offset, value, channel_of, width, n_channels, repeated):
+    """Return the permutation that puts a contig's sites in the order `group_track` keeps.
+
+    By window index, then offset, then channel, then value; see
+    `group_track`'s notes for why one key does most of it.
+    ``width`` bounds every offset and ``n_channels`` every channel, and
+    ``repeated`` says whether two sites may share all three of the
+    others, which leaves the value to order them. Needs nothing the
+    ``pileup`` extra installs.
+    """
+
+    if repeated or (int(index.max()) + 1) * width * n_channels >= 2**63:
+        return numpy.lexsort((value, channel_of, offset, index))
+    key = index.astype(numpy.int64)
+    key *= width
+    key += offset
+    key *= n_channels
+    key += channel_of
+    return numpy.argsort(key, kind="stable")
+
+
+def _window_totals(read, signal, scale, starts, ends):
+    """Return one channel's total over each of a contig's windows ``[starts, ends)``.
+
+    ``read`` is the contig's rows as `quadrat.stores.chrom_track`
+    answers them, totalled as `window_group_sums` states. Needs nothing
+    the ``pileup`` extra installs.
+    """
+
+    positions, values = read
+    if signal == COVERAGE_DELTAS:
+        window, left, right, level = coverage_runs(
+            positions, coverage_levels(values, scale), starts, ends
+        )
+        return numpy.bincount(
+            window, weights=level * (right - left), minlength=len(starts)
+        )
+    cumulative = numpy.concatenate(([0.0], numpy.cumsum(values, dtype=numpy.float64)))
+    return (
+        cumulative[numpy.searchsorted(positions, ends, side="left")]
+        - cumulative[numpy.searchsorted(positions, starts, side="left")]
+    )
 
 
 def _key_paths(label, items):

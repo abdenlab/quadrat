@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 import quadrat
+from quadrat import tables
 from tests import PROJECT_ROOT, load_build_hook, run_child
 
 # What the ``pileup`` extra installs, by import name, against what the
@@ -233,6 +234,32 @@ class TestDistribution:
 
         # Assert
         assert marked == set(quadrat.__all__)
+
+    def test___doc___should_record_the_declined_signals_and_their_seam(self):
+        """Test that the package says which signals it declines, and where.
+
+        Given:
+            The package docstring.
+        When:
+            It is read for the declined signals.
+        Then:
+            It should name splice junctions, contact maps and
+            methylation, and the two functions whose channel split is
+            methylation's reopening condition, each of which should
+            still exist under the name it is given.
+        """
+
+        # Arrange
+        text = " ".join(quadrat.__doc__.split())
+
+        # Act
+        seams = re.findall(r"``quadrat\.tables\.(\w+)``", text)
+
+        # Assert
+        for declined in ("Splice junctions", "contact maps", "Methylation"):
+            assert declined in text
+        assert seams == ["strand_slices", "track_paths"]
+        assert all(callable(getattr(tables, name)) for name in seams)
 
     def test_metadata_should_declare_the_partition_it_imports_by(self):
         """Test which dependencies the distribution puts behind the extra.
@@ -461,6 +488,41 @@ class TestDistribution:
         # Arrange
         pytest.importorskip(name)
         program = "import sys, quadrat.groups\nprint({!r} in sys.modules)\n".format(name)
+
+        # Act
+        result = run_child(
+            [sys.executable, "-c", program], "the child interpreter failed"
+        )
+
+        # Assert
+        assert result.stdout.strip() == "False"
+
+    @pytest.mark.packaging
+    @pytest.mark.parametrize(
+        "name", PILEUP_MODULES + ("torch", "tangermeme", "tqdm", "pandas")
+    )
+    def test_quadrat_pileup_aggregate_should_import_nothing_it_does_not_need(self, name):
+        """Test what importing the aggregate record costs.
+
+        Given:
+            A fresh interpreter, and one module the record has no use
+            for: the engine, a frame library, torch, tangermeme or tqdm.
+        When:
+            ``quadrat.pileup.aggregate`` is imported, and a record
+            constructed and pickled.
+        Then:
+            That module should not have been loaded, so the record is
+            data a base install builds and ships to a worker.
+        """
+
+        # Arrange
+        pytest.importorskip(name)
+        program = (
+            "import pickle, sys\n"
+            "from quadrat.pileup.aggregate import Aggregate\n"
+            "pickle.dumps(Aggregate(position='span', unstranded=True))\n"
+            "print({!r} in sys.modules)\n".format(name)
+        )
 
         # Act
         result = run_child(

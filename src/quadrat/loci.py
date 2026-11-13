@@ -376,7 +376,9 @@ def within_counts(counts, min_counts=None, max_counts=None):
     """Return which counts lie within a floor and a ceiling, both ends included.
 
     A count that is not a number is kept: it is below no floor and
-    above no ceiling.
+    above no ceiling. A count is whatever total the caller passes, and
+    the band is compared against it as given, whatever kind of channel
+    it was totalled from. Needs nothing the ``pileup`` extra installs.
 
     :param counts: One count per locus, as anything `numpy.asarray`
         reads as a one-dimensional array.
@@ -493,8 +495,9 @@ def extract_signal(windows, tracks, bound_columns=("sig_start", "sig_end")):
         signal is read over the output window and a control over the
         input window.
     :returns: A `torch.Tensor` of shape ``(len(windows), len(tracks),
-        width)`` and dtype ``float32``, zero wherever a track records
-        nothing. ``width`` is ``0`` for an empty window frame.
+        width)`` and dtype ``float32``, each channel holding per base
+        what `quadrat.stores.TrackStore.window` answers for its track's
+        signal. ``width`` is ``0`` for an empty window frame.
     :raises TypeError: if ``windows`` is not a `polars.DataFrame`, if
         ``tracks`` is a single track or an unordered collection of
         them, or if a track is of no shape a track can take.
@@ -647,7 +650,8 @@ def extract_loci(
     2. `exclusion_mask` does not flag it;
     3. its count is within ``min_counts`` and ``max_counts`` as
        `within_counts` decides, the count being the total of signal
-       track ``target_idx`` over its output window.
+       track ``target_idx`` over its output window, which on a track
+       of coverage means what `quadrat.cache.window_group_sums` states.
 
     The first two are the test `readable_windows` makes.
 

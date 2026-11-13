@@ -208,7 +208,8 @@ def build_training_loader(
     3. its count is within ``min_counts`` and ``max_counts`` as
        `quadrat.loci.within_counts` decides, the count being the total
        of the first signal track over its output window, a peak's
-       jitter margin included;
+       jitter margin included, as `quadrat.cache.window_group_sums`
+       totals it;
     4. `outlier_mask` does not flag it among the peaks still standing,
        on their totals per signal group.
 
@@ -287,7 +288,9 @@ def build_training_loader(
     :param reverse_complement: Whether to mirror about half the draws.
     :param shuffle: Whether to permute the peak order every epoch.
     :param min_counts: The lowest count a kept locus may have, or
-        ``None`` for no floor.
+        ``None`` for no floor. On a track of coverage the count is
+        what `quadrat.cache.window_group_sums` states, and so is how it
+        moves this floor and ``max_counts``.
     :param max_counts: The highest count a kept locus may have, or
         ``None`` for no ceiling.
     :param summits: Whether peaks are centred on their summits, as

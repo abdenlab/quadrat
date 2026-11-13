@@ -27,7 +27,7 @@ import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from quadrat import cache, dataset, groups, loci, pileup, sampling, stores
+from quadrat import Aggregate, cache, dataset, groups, loci, pileup, sampling, stores
 from tests import (
     TWO_CONTIGS,
     WORKER_TIMEOUT,
@@ -44,6 +44,10 @@ CHROM_SIZES = MappingProxyType({"chr1": 4000, "chr2": 3000})
 
 
 IN_WINDOW, OUT_WINDOW, MAX_JITTER = 100, 50, 8
+
+
+# What the piled corpus is piled up under: ATAC's Tn5 shift, unstranded.
+ATAC = Aggregate(start_shift=4, end_shift=-4, unstranded=True)
 
 
 # Twenty-bp loci, every one far enough inside its contig that its
@@ -150,9 +154,7 @@ def piled(corpus_factory, pysam):
             [bam],
             built.fasta,
             built.path("sample{}".format(index)),
-            pos_shift=4,
-            neg_shift=-4,
-            unstranded=True,
+            aggregate=ATAC,
         )
     return built
 
@@ -721,7 +723,7 @@ class TestLocusDataset:
         # Arrange
         reader = build_dataset(piled, signal_groups=[2], signal_tracks=piled.tracks)
         dense = [
-            oracle_pileup([bam], piled.chrom_sizes, pysam, 4, -4) for bam in piled.bams
+            oracle_pileup([bam], piled.chrom_sizes, pysam, ATAC) for bam in piled.bams
         ]
         peaks = builders.intervals("chr1", 100, 900, 90, 20)
         negatives = builders.intervals("chr2", 100, 400, 70, 20)

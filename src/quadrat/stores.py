@@ -2,8 +2,10 @@
 
 Provides `SequenceStore` and `TrackStore`, the readers addressed by
 coordinate; `ProcessLocalHandles`, the base that keeps their handles
-per process; and the functions that read one track whole or one contig
-of it.
+per process; the functions that read one track whole or one contig of
+it; `coverage_levels`, the one place coverage is summed from its
+deltas; and `coverage_runs`, the one place summed coverage is cut into
+the runs that tile a window.
 
 Nothing here needs the ``pileup`` extra, and every third-party module
 is imported on first use rather than with this one;
@@ -19,7 +21,14 @@ import os
 import numpy
 
 from quadrat._engine import fspath_or_none, import_on_first_use
-from quadrat.tables import TRACK_SUFFIX, require_complete, track_chrom_path
+from quadrat.tables import (
+    COUNTS,
+    COVERAGE_DELTAS,
+    ROW_GROUP_SIZE,
+    TRACK_SUFFIX,
+    track_chrom_path,
+    track_signal,
+)
 
 
 # Defined ahead of the stores that use it, against the public-first
@@ -251,6 +260,14 @@ class TrackStore(ProcessLocalHandles):
     contig whose file never landed reads as a contig with no signal,
     which is indistinguishable from one that is genuinely empty.
 
+    Reads a track of either ``signal`` `quadrat.read_manifest` documents,
+    each channel as its own manifest declares, so every channel's window
+    holds per-base values whichever it is; `window` states what each
+    holds. On a channel of coverage deltas the first read of a contig in
+    a process briefly takes about the memory collecting that contig's
+    ``pos`` and ``value`` columns would, so once per contig in every
+    loader worker that reads it; the notes give the figures.
+
     :param sources: One track per channel, each a `str`, `bytes` or
         `os.PathLike`. A single path is refused rather than treated as
         a one-channel set.
@@ -265,6 +282,38 @@ class TrackStore(ProcessLocalHandles):
     not data, and reusing it saves about 20% of a window read
     (0.76 ms to 0.61 ms) now that the read itself is small enough for
     plan construction to show up in it.
+
+    A channel of coverage deltas keeps only checkpoints: the position
+    of every `quadrat.tables.ROW_GROUP_SIZE`-th delta row of a contig's
+    file and the total of the deltas below it, taken the first time the
+    contig is read in a process. The coverage at a window's first base
+    depends on every delta before it, and the nearest checkpoint at or
+    before the window answers that prefix, so a window reads only its
+    own deltas and those back to the checkpoint -- about one row group
+    -- through the same position filter a channel of counts uses. What
+    a process keeps is 16 bytes per checkpoint, i.e., the contig's
+    delta rows divided by the row-group size, rather than the rows
+    themselves.
+
+    The checkpoints are taken in two scans of the file: one keeps every
+    `quadrat.tables.ROW_GROUP_SIZE`-th row's position, and one sums the
+    deltas between consecutive positions so kept. The checkpoints are
+    what stays; taking them reads the contig's columns once, and the
+    first read of a contig costs about what collecting those columns
+    would. Measured on one contig's file under polars 2.0, the two
+    scans raised peak resident memory by 73 MB against 70 MB for
+    collecting its ``pos`` and ``value`` at 1M rows, and by 157 MB
+    against 187 MB at 4M. polars' streaming engine lowered neither
+    figure, so the scans run on the default one.
+
+    The checkpoints need nothing of the file's order: the totals are
+    sums below a position, which no order changes, and a position
+    filter selects the same rows in any order, while `chrom_track` sorts
+    what it reads only when it is out of order. The order still matters
+    to speed: `TrackWriter` writes every contig's file sorted by
+    position, as the format requires, which is what spaces the
+    checkpoints a row group apart and lets the filter skip every row
+    group before the checkpoint.
     """
 
     def __init__(self, sources):
@@ -275,6 +324,7 @@ class TrackStore(ProcessLocalHandles):
                 "channel.".format(sources)
             )
         self.sources = []
+        self._signals = []
         for index, source in enumerate(sources):
             converted = fspath_or_none(source)
             if converted is None:
@@ -284,7 +334,7 @@ class TrackStore(ProcessLocalHandles):
                         index, type(source).__name__
                     )
                 )
-            require_complete(converted)
+            self._signals.append(track_signal(converted))
             self.sources.append(converted)
         self._local = None
 
@@ -305,10 +355,15 @@ class TrackStore(ProcessLocalHandles):
         nothing promised.
 
         :returns: A `torch.Tensor` of shape ``(n_channels, end -
-            start)`` and dtype ``float32``, zero at every position
-            where the channel recorded nothing. A contig absent from a
-            channel reads as that channel's row of zeros rather than as
-            an error, which is routine for the small unplaced contigs.
+            start)`` and dtype ``float32``. A channel of counts is zero
+            at every position where it recorded nothing; a channel of
+            coverage deltas holds the coverage at every position, as
+            `coverage_levels` sums it, which is zero before its
+            contig's first delta and wherever every span has ended. A
+            contig absent
+            from a channel reads as that channel's row of zeros rather
+            than as an error, which is routine for the small unplaced
+            contigs.
         :raises ValueError: if ``end`` is before ``start``.
 
         .. rubric:: Implementation notes
@@ -329,7 +384,11 @@ class TrackStore(ProcessLocalHandles):
             )
         out = numpy.zeros((self.n_channels, end - start), dtype=numpy.float32)
 
-        for channel in range(self.n_channels):
+        for channel, (signal, scale) in enumerate(self._signals):
+            if signal == COVERAGE_DELTAS:
+                if end > start:
+                    out[channel] = self._coverage(channel, chrom, start, end, scale)
+                continue
             plan = self._frame(channel, chrom)
             if plan is None:
                 continue
@@ -360,6 +419,79 @@ class TrackStore(ProcessLocalHandles):
             plans[key] = chrom_plan(self.sources[channel], chrom)
         return plans[key]
 
+    def _checkpoints(self, channel, chrom):
+        """This process's coverage checkpoints for one channel's contig, or ``None``.
+
+        ``(marks, totals)``, where ``totals[i]`` is the sum of every
+        delta whose position is below ``marks[i]``; see the class notes.
+        ``None`` where the contig has no rows.
+        """
+
+        local = self._handles()
+        checkpoints = local.setdefault("checkpoints", {})
+        key = (channel, str(chrom))
+        if key not in checkpoints:
+            found = None
+            plan = self._frame(channel, chrom)
+            if plan is not None:
+                polars = import_on_first_use("polars")
+                pos = polars.col("pos").cast(polars.Int64)
+                marks = (
+                    plan.select(pos)
+                    .with_row_index("row")
+                    .filter(polars.col("row") % ROW_GROUP_SIZE == 0)
+                    .collect()["pos"]
+                    .to_numpy()
+                )
+                if len(marks):
+                    marks = numpy.unique(marks)
+                    # Segment ``k`` holds the deltas at or past ``marks[k
+                    # - 1]`` and below ``marks[k]``, so the total below
+                    # ``marks[k]`` is the sum of segments up to ``k``.
+                    segment = polars.lit(polars.Series(marks)).search_sorted(
+                        pos, side="right"
+                    )
+                    sums = (
+                        plan.group_by(segment.alias("segment"))
+                        .agg(polars.col("value").cast(polars.Float64).sum())
+                        .collect()
+                    )
+                    per = numpy.zeros(len(marks) + 1, dtype=numpy.float64)
+                    per[sums["segment"].to_numpy()] = sums["value"].to_numpy()
+                    found = (marks, numpy.cumsum(per)[: len(marks)])
+            checkpoints[key] = found
+        return checkpoints[key]
+
+    def _coverage(self, channel, chrom, start, end, scale):
+        """One channel's coverage over a non-empty ``[start, end)``, as `window` answers it."""
+
+        polars = import_on_first_use("polars")
+        checkpoints = self._checkpoints(channel, chrom)
+        if checkpoints is None:
+            return 0.0
+        marks, totals = checkpoints
+        plan = self._frame(channel, chrom)
+        mark = int(numpy.searchsorted(marks, start, side="right")) - 1
+        within = polars.col("pos") < end
+        if mark < 0:
+            before = 0.0
+        else:
+            before = totals[mark]
+            within = within & (polars.col("pos") >= int(marks[mark]))
+        read = chrom_track(plan.filter(within))
+        if read is None:
+            positions = numpy.empty(0, dtype=numpy.int64)
+            deltas = numpy.empty(0, dtype=numpy.float64)
+        else:
+            positions, deltas = read
+        _, left, right, level = coverage_runs(
+            positions,
+            coverage_levels(deltas, scale, before),
+            numpy.array([start], dtype=numpy.int64),
+            numpy.array([end], dtype=numpy.int64),
+        )
+        return numpy.repeat(level, right - left)
+
 
 def chrom_plan(source, chrom):
     """Return one contig's ``(pos, value)`` rows in a track as a scan, or ``None``.
@@ -372,6 +504,8 @@ def chrom_plan(source, chrom):
     per contig, so the read opens that contig's file and pays for
     nothing else. A single Parquet file holding every contig is
     filtered instead.
+
+    What the rows hold is as `chrom_track` states.
 
     :param source: The track, as a `str`.
     :param chrom: The contig to read.
@@ -392,35 +526,126 @@ def chrom_plan(source, chrom):
     )
 
 
-def chrom_track(source, chrom):
-    """Return one track's sorted ``(pos, value)`` arrays for one contig, or ``None``.
+def chrom_track(plan):
+    """Return one contig's rows as ascending ``(pos, value)`` arrays, or ``None``.
 
-    What `chrom_plan` describes, collected and sorted. ``None`` means
-    the contig has nothing in this track, for the reasons stated there.
+    The one reader that turns a contig's rows into arrays, for every
+    caller that searches them rather than scans them: a prefix sum or a
+    pair of ``searchsorted`` calls both need ascending positions. The
+    format writes each contig's file sorted already, so on a track this
+    package wrote the order is checked and kept, and only rows that
+    arrive out of order are sorted.
 
-    Sorted because a consumer searches it rather than scans it: a
-    prefix sum or a pair of ``searchsorted`` calls both need ascending
-    positions. The format writes each contig's file sorted already, so
-    this is a no-op on a track this package wrote and a real sort only
-    on a single-file table it did not.
+    The rows are the stored ones whatever the track's signal: a caller
+    that reads values knows the signal from `quadrat.tables.track_signal`
+    and reads the arrays accordingly.
 
-    :param source: The track, as a `str`.
-    :param chrom: The contig to read.
-    :returns: A ``(positions, values)`` pair of numpy arrays, or
-        ``None`` where the contig has no rows.
+    :param plan: The contig's rows, as a `polars.LazyFrame` carrying
+        ``pos`` and ``value``: `chrom_plan`'s answer, a filter of it, or
+        a whole-table frame filtered to one contig. ``None``, which
+        `chrom_plan` answers for a contig the track lacks, answers
+        ``None``.
+    :returns: ``(positions, values)``, ``int64`` and ``float64`` numpy
+        arrays, the positions ascending and each value beside its own
+        position; or ``None`` where there are no rows.
     """
 
-    plan = chrom_plan(source, chrom)
     if plan is None:
         return None
-    table = plan.sort("pos").collect()
+    polars = import_on_first_use("polars")
+    table = plan.select(
+        polars.col("pos").cast(polars.Int64), polars.col("value").cast(polars.Float64)
+    ).collect()
     if table.height == 0:
         return None
-    return table["pos"].to_numpy(), table["value"].to_numpy()
+    positions = table["pos"].to_numpy()
+    values = table["value"].to_numpy()
+    if (positions[1:] < positions[:-1]).any():
+        order = numpy.argsort(positions, kind="stable")
+        positions, values = positions[order], values[order]
+    return positions, values
+
+
+def coverage_levels(deltas, scale, before=0.0):
+    """Return the coverage a contig's ascending deltas step through, summed and then scaled.
+
+    Element ``i`` is the coverage once the first ``i`` deltas have
+    applied, multiplied by ``scale``: element ``0`` holds before the
+    first delta's position, and element ``i`` from the position of
+    delta ``i - 1`` up to that of delta ``i``. Deltas on one position
+    are summed through in turn, so the last of them carries their
+    total, as a position recorded twice is read everywhere else.
+
+    The deltas are summed before anything is scaled, so where the
+    deltas cancel the coverage is exactly zero whatever ``scale`` is:
+    a scale applied per delta leaves rounding residue behind, which
+    reads as coverage where every span has ended.
+
+    :param deltas: The contig's coverage deltas, unscaled, in ascending
+        order of position, as `chrom_track` answers them.
+    :param scale: The track's ``scale``; see `quadrat.read_manifest`.
+    :param before: The unscaled coverage before the first of
+        ``deltas``, i.e., the sum of every delta of the contig before
+        them, for a caller that reads a contig from part-way through.
+    :returns: A ``float64`` numpy array one longer than ``deltas``.
+    """
+
+    running = numpy.concatenate(([before], numpy.asarray(deltas, dtype=numpy.float64)))
+    return numpy.cumsum(running) * scale
+
+
+def coverage_runs(positions, levels, starts, ends):
+    """Return the runs of constant coverage that tile each of a contig's windows.
+
+    A window ``[starts[i], ends[i])`` is cut at every delta position
+    inside it, and each piece is one run at the coverage in force
+    there: the deltas at or before a window's first base set its first
+    run's level, and each delta inside it starts a run lasting to the
+    next. Empty runs, i.e., those between deltas on one position or of
+    an empty window, are left out, so the runs of window ``i`` tile it
+    exactly.
+
+    :param positions: Ascending ``int64`` positions of one contig's
+        deltas: every delta of the contig, or every one at or past some
+        position, in which case each window must start at or past it
+        too.
+    :param levels: The coverage those deltas step through, one longer
+        than ``positions``, as `coverage_levels` sums them: its first
+        element is the coverage before the first of ``positions``,
+        which for deltas taken from part-way through is the total of
+        every delta before them, passed to `coverage_levels` as
+        ``before``.
+    :param starts: Each window's first base, as an ``int64`` array.
+    :param ends: Each window's end, one past its last base, as an
+        ``int64`` array as long as ``starts``.
+    :returns: ``(window, left, right, level)``, one entry per run: the
+        window's index into ``starts``, the run's ``[left, right)`` as
+        ``int64``, and its coverage as ``levels`` holds it, ordered by
+        window and then by ``left``.
+    """
+
+    lo = numpy.searchsorted(positions, starts, side="right")
+    hi = numpy.maximum(numpy.searchsorted(positions, ends, side="left"), lo)
+    runs = hi - lo + 1
+    window = numpy.repeat(numpy.arange(len(starts)), runs)
+    rank = numpy.arange(len(window)) - numpy.repeat(numpy.cumsum(runs) - runs, runs)
+    at = lo[window] + rank
+    first, last = rank == 0, rank == runs[window] - 1
+    if len(positions):
+        left = numpy.where(first, starts[window], positions[numpy.maximum(at - 1, 0)])
+        right = numpy.where(
+            last, ends[window], positions[numpy.minimum(at, len(positions) - 1)]
+        )
+    else:
+        # One run per window, from its start to its end; nothing to cut at.
+        left, right = starts[window], ends[window]
+    level = numpy.asarray(levels)[at]
+    keep = right > left
+    return window[keep], left[keep], right[keep], level[keep]
 
 
 def track_frame(source):
-    """Return one track as a single frame covering every contig it holds.
+    """Return one track as a single frame covering every contig it holds, and its signal.
 
     The whole-table counterpart of `chrom_plan`, for the callers that
     filter on ``chrom`` themselves and want every contig visible at
@@ -429,14 +654,20 @@ def track_frame(source):
     taken as given, which is what lets a caller go from alignments to
     tensors without a track on disk.
 
+    What the rows hold is as `chrom_track` states, and a caller reads
+    them by the signal this answers beside them.
+
     :param source: A track directory, a single Parquet file, or a
         `polars.DataFrame` or `polars.LazyFrame` carrying ``chrom``,
         ``pos`` and ``value``.
-    :returns: A `polars.LazyFrame`.
+    :returns: ``(frame, signal, scale)``: a `polars.LazyFrame`, and
+        the track's signal and scale as `quadrat.tables.track_signal`
+        answers them for ``source``.
     :raises TypeError: if ``source`` is none of those shapes.
     :raises FileNotFoundError: if ``source`` is a path at which nothing
         exists.
-    :raises ValueError: if a track directory does not verify complete.
+    :raises ValueError: if a track directory does not verify complete;
+        see `quadrat.require_complete`.
 
     .. rubric:: Implementation notes
 
@@ -450,17 +681,17 @@ def track_frame(source):
     path = fspath_or_none(source)
     if path is not None:
         if os.path.isdir(path):
-            require_complete(path)
-            return polars.scan_parquet(os.path.join(path, "*.parquet"))
+            signal, scale = track_signal(path)
+            return polars.scan_parquet(os.path.join(path, "*.parquet")), signal, scale
         if not os.path.exists(path):
             raise FileNotFoundError(
                 "{} is not a track; there is no such file or directory.".format(path)
             )
-        return polars.scan_parquet(path)
+        return polars.scan_parquet(path), COUNTS, None
     if isinstance(source, polars.LazyFrame):
-        return source
+        return source, COUNTS, None
     if isinstance(source, polars.DataFrame):
-        return source.lazy()
+        return source.lazy(), COUNTS, None
     raise TypeError(
         "track_frame reads a track: a {} directory, a single Parquet "
         "file, or an in-memory polars frame with chrom, pos and value "

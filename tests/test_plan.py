@@ -20,9 +20,35 @@ it runs on a base install.
 """
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from quadrat.pileup import plan
 from tests import budget
+
+# Input sizes from nothing to past what one scan may hold at the batch
+# ceiling, drawn as a whole number of scan caps and a remainder, so
+# every regime of the floor is drawn rather than mostly small sizes.
+input_bytes = st.builds(
+    lambda caps, rest: caps * plan.MAX_GROUP_INPUT_BYTES + rest,
+    st.integers(0, 15),
+    st.integers(0, plan.MAX_GROUP_INPUT_BYTES - 1),
+)
+
+
+# What one worker's share of a budget may be, from nothing to past the
+# largest projected peak, drawn as whole GiB and a remainder for the
+# reason `input_bytes` is.
+shares = st.builds(
+    lambda gib, rest: gib * 1024**3 + rest,
+    st.integers(0, 64),
+    st.integers(0, 1024**3 - 1),
+)
+
+
+# A budget that fits a worker at any batch count, so the scan floor is
+# the only thing a solver's answer can depend on.
+AMPLE = 2**80
 
 
 def test_projected_peak_should_sum_the_per_worker_cost_and_the_scanned_bytes():
@@ -97,6 +123,54 @@ def test_projected_peak_should_stay_near_the_per_worker_cost_when_split_far():
     # Act & assert
     assert plan.projected_peak(job, 1024) > fixed
     assert plan.projected_peak(job, 1024) < fixed * 1.01
+
+
+def test_projected_peak_should_project_two_rows_per_record_as_twice_the_bytes():
+    """Test that the rows per record multiply the input part of the peak.
+
+    Given:
+        A known input size at two rows per record, and twice that size
+        at one, each at one batch and at four.
+    When:
+        The peaks are projected.
+    Then:
+        They should be equal, because what the input bytes buy is the
+        grouping's state, one entry per key, and two rows per record
+        key about twice as many entries.
+    """
+
+    # Arrange
+    job = 3 * 1024**3
+
+    # Act & assert
+    for groups in (1, 4):
+        assert plan.projected_peak(job, groups, 2) == plan.projected_peak(
+            2 * job, groups
+        )
+
+
+@settings(max_examples=50)
+@given(job=st.integers(min_value=1, max_value=2**45), groups=st.integers(1, 64))
+def test_projected_peak_should_project_two_rows_per_record_as_twice_the_bytes_for_any_job(
+    job, groups
+):
+    """Test the rows-per-record equivalence over sized jobs and batch counts.
+
+    Given:
+        Any sized job and any batch count.
+    When:
+        The peak is projected at two rows per record, and for twice
+        the bytes at one.
+    Then:
+        It should be the same figure.
+    """
+
+    # Act
+    two_rows = plan.projected_peak(job, groups, 2)
+    one_row = plan.projected_peak(2 * job, groups)
+
+    # Assert
+    assert two_rows == one_row
 
 
 def test_projected_peak_should_return_the_unknown_input_figure_when_no_size_is_given():
@@ -304,6 +378,163 @@ def test_plan_pileup_should_count_batches_from_the_bytes_one_scan_may_hold(machi
     # The ceiling is real and the floor does not pretend otherwise: past
     # `MAX_CONTIG_GROUPS` batches it asks for no more than it can get.
     assert plan.group_floor(1024**4) == plan.MAX_CONTIG_GROUPS
+
+
+def test_group_floor_should_divide_the_scan_cap_by_the_rows_per_record(machine):
+    """Test the scan floor of an aggregate contributing two rows a record.
+
+    Given:
+        Input sizes either side of half the scan cap and of the whole
+        of it, at one and at two rows per record.
+    When:
+        The batch floor is read.
+    Then:
+        It should split at half the bytes at two rows per record, as a
+        job of twice the bytes splits at one, because the cap stands in
+        for the rows one aggregate holds.
+    """
+
+    # Arrange
+    machine(64, 64 * 1024**3)
+    cap = plan.MAX_GROUP_INPUT_BYTES
+
+    # Act & assert
+    assert plan.group_floor(cap // 2, points_per_record=2) == 1
+    assert plan.group_floor(cap // 2 + 1, points_per_record=2) == 2
+    assert plan.group_floor(cap, points_per_record=2) == 2
+    assert plan.group_floor(cap) == 1
+    assert plan.group_floor(5 * cap, points_per_record=2) == plan.MAX_CONTIG_GROUPS
+
+
+@settings(max_examples=50)
+@given(size=input_bytes, points=st.sampled_from((1, 2)))
+def test_group_floor_should_answer_the_fewest_batches_under_the_cap_for_any_input(
+    size, points
+):
+    """Test the scan floor over every input size and both row counts.
+
+    Given:
+        Any input size, at one or at two rows per record.
+    When:
+        The batch floor is read.
+    Then:
+        It should be the fewest batches, from one up to the batch
+        ceiling, whose share of the bytes times the rows per record is
+        within the scan cap, i.e., that product over the cap rounded
+        up; and the same as the floor of that product at one row.
+    """
+
+    # Arrange
+    cap = plan.MAX_GROUP_INPUT_BYTES
+    needed = max(1, -(-size * points // cap))
+
+    # Act
+    floor = plan.group_floor(size, points_per_record=points)
+
+    # Assert
+    assert floor == min(plan.MAX_CONTIG_GROUPS, needed)
+    assert floor == plan.group_floor(size * points)
+
+
+def test_plan_pileup_should_divide_the_scan_cap_by_the_rows_per_record(machine):
+    """Test that the fan-out solver takes the rows per record to the scan floor.
+
+    Given:
+        A 16 GiB input on a machine with memory to spare, at one and at
+        two rows per record.
+    When:
+        `plan_pileup` is asked for a batch count.
+    Then:
+        It should answer the scan floor at that many rows per record:
+        two batches at one row and four at two.
+    """
+
+    # Arrange
+    machine(8, 512 * 1024**3)
+    size = 2 * plan.MAX_GROUP_INPUT_BYTES
+
+    # Act
+    answers = {
+        points: plan.plan_pileup(1, size, points_per_record=points).contig_groups
+        for points in (1, 2)
+    }
+
+    # Assert
+    assert answers == {1: 2, 2: 4}
+
+
+@settings(max_examples=50)
+@given(size=input_bytes, points=st.sampled_from((1, 2)))
+def test_plan_pileup_should_answer_the_scan_floor_for_any_input_when_memory_is_ample(
+    size, points
+):
+    """Test the fan-out solver's batch count where memory binds nothing.
+
+    Given:
+        Any input size, at one or at two rows per record, for one job
+        against a budget every batch count fits.
+    When:
+        `plan_pileup` is asked for a batch count.
+    Then:
+        It should answer the scan floor at that many rows per record.
+    """
+
+    # Act
+    groups = plan.plan_pileup(1, size, AMPLE, points_per_record=points).contig_groups
+
+    # Assert
+    assert groups == plan.group_floor(size, points_per_record=points)
+
+
+def test_memory_floor_should_divide_the_scan_cap_by_the_rows_per_record(machine):
+    """Test that the memory solver takes the rows per record to the scan floor.
+
+    Given:
+        A 16 GiB input on a machine with memory to spare, at one and at
+        two rows per record.
+    When:
+        `memory_floor` is asked for a batch count for one worker.
+    Then:
+        It should answer the scan floor at that many rows per record:
+        two batches at one row and four at two.
+    """
+
+    # Arrange
+    machine(8, 512 * 1024**3)
+    size = 2 * plan.MAX_GROUP_INPUT_BYTES
+
+    # Act
+    answers = {
+        points: plan.memory_floor(size, 1, points_per_record=points).groups
+        for points in (1, 2)
+    }
+
+    # Assert
+    assert answers == {1: 2, 2: 4}
+
+
+@settings(max_examples=50)
+@given(size=input_bytes, points=st.sampled_from((1, 2)))
+def test_memory_floor_should_answer_the_scan_floor_for_any_input_when_memory_is_ample(
+    size, points
+):
+    """Test the memory solver's batch count where memory binds nothing.
+
+    Given:
+        Any input size, at one or at two rows per record, for one
+        worker against a budget every batch count fits.
+    When:
+        `memory_floor` is asked for a batch count.
+    Then:
+        It should answer the scan floor at that many rows per record,
+        and report that it fits.
+    """
+
+    # Act
+    floor = plan.memory_floor(size, 1, AMPLE, points_per_record=points)
+
+    # Assert
+    assert floor == (plan.group_floor(size, points_per_record=points), True)
 
 
 def test_the_two_solvers_should_choose_from_the_same_batch_counts(machine):
@@ -786,6 +1017,95 @@ def test_memory_floor_should_solve_against_a_budget_it_is_handed(machine, mocker
 
     # Assert
     assert floor == plan.MemoryFloor(1, True)
+
+
+@pytest.mark.parametrize(
+    "input_bytes, workers",
+    [(1 * 1024**3, 4), (3 * 1024**3, 6), (6 * 1024**3, 2), (None, 3)],
+)
+def test_memory_floor_should_solve_two_rows_per_record_as_twice_the_bytes(
+    machine, input_bytes, workers
+):
+    """Test that the memory solver sees the rows per record, not only the scan cap.
+
+    Given:
+        Inputs at several sizes, and unsized, each at a concurrency the
+        budget can afford only some batch counts of.
+    When:
+        The batch count is solved at two rows per record, and for twice
+        the bytes at one.
+    Then:
+        The two answers should be the same, so a two-row job is split
+        for memory as a job of twice its bytes would be; an unsized job
+        is the same either way.
+    """
+
+    # Arrange
+    machine(16, 64 * 1024**3)
+    held = budget(plan, 64 * 1024**3, plan.n_cpus())
+    doubled = None if input_bytes is None else 2 * input_bytes
+
+    # Act
+    two_rows = plan.memory_floor(input_bytes, workers, held, points_per_record=2)
+    one_row = plan.memory_floor(doubled, workers, held)
+
+    # Assert
+    assert two_rows == one_row
+
+
+@settings(max_examples=50)
+@given(size=input_bytes, workers=st.integers(1, 64), share=shares)
+def test_memory_floor_should_solve_two_rows_per_record_as_twice_the_bytes_for_any_job(
+    size, workers, share
+):
+    """Test the rows-per-record equivalence over sizes, concurrencies and budgets.
+
+    Given:
+        Any input size, worker count and budget.
+    When:
+        The batch count is solved at two rows per record, and for twice
+        the bytes at one.
+    Then:
+        The two answers should be the same, whether or not either fits.
+    """
+
+    # Arrange
+    held = workers * share
+
+    # Act
+    two_rows = plan.memory_floor(size, workers, held, points_per_record=2)
+    one_row = plan.memory_floor(2 * size, workers, held)
+
+    # Assert
+    assert two_rows == one_row
+
+
+@settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(size=input_bytes, jobs=st.integers(1, 64), share=shares)
+def test_plan_pileup_should_solve_two_rows_per_record_as_twice_the_bytes_for_any_job(
+    machine, size, jobs, share
+):
+    """Test the rows-per-record equivalence in the fan-out solver.
+
+    Given:
+        A 16-core machine, and any job count, input size and budget.
+    When:
+        The fan-out is planned at two rows per record, and for twice
+        the bytes at one.
+    Then:
+        The two plans should be the same.
+    """
+
+    # Arrange
+    machine(16, 64 * 1024**3)
+    held = min(jobs, 16) * share
+
+    # Act
+    two_rows = plan.plan_pileup(jobs, size, held, points_per_record=2)
+    one_row = plan.plan_pileup(jobs, 2 * size, held)
+
+    # Assert
+    assert two_rows == one_row
 
 
 def test_plan_pileup_should_solve_against_a_budget_it_is_handed(machine, mocker):

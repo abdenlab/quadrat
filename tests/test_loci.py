@@ -33,6 +33,8 @@ from tangermeme.io import extract_loci as tangermeme_extract_loci
 from quadrat import loci
 from tests import (
     TWO_CONTIGS,
+    UNREADABLE_IDS,
+    UNREADABLE_RECORDS,
     builders,
     dense,
     one_hot,
@@ -1746,6 +1748,29 @@ def test_require_track_contigs_should_raise_when_no_track_shares_a_contig(corpus
         loci.require_track_contigs(["1", "2"], corpus.tracks)
 
 
+def test_require_track_contigs_should_accept_a_track_of_coverage_deltas(tmp_path):
+    """Test that the contig check reads names, whatever a track's values mean.
+
+    Given:
+        A complete track of coverage deltas on the windows' contig.
+    When:
+        The tracks are required to share a contig with the windows.
+    Then:
+        It should return without raising, since it reads which contigs
+        a track holds and no value.
+    """
+
+    # Arrange
+    root = builders.write_track(
+        str(tmp_path / "deltas.track.parquet"),
+        [("chr1", 10, 1.0), ("chr1", 40, -1.0)],
+        signal="coverage_deltas",
+    )
+
+    # Act & assert
+    assert loci.require_track_contigs(["chr1"], [root]) is None
+
+
 def test_require_track_contigs_should_name_the_label_and_in_memory_tracks():
     """Test how the refusal names tracks that have no path.
 
@@ -2133,6 +2158,40 @@ def test_extract_signal_should_total_a_position_recorded_twice(engine):
     assert signal[0, 0].tolist() == [0.0, 0.0, 5.0, 0.0, 3.0, 0.0]
 
 
+def test_extract_signal_should_read_a_coverage_track_as_its_scaled_coverage(
+    tmp_path, engine
+):
+    """Test the dense read of a track of coverage deltas.
+
+    Given:
+        Two overlapping spans written as the boundary events a
+        ``"span"`` pileup writes, at a scale of a half, beside a track
+        of counts.
+    When:
+        The signal is extracted over a window across both spans.
+    Then:
+        The coverage channel should hold the spans' coverage times the
+        half at every base, and the counts channel its values.
+    """
+
+    # Arrange
+    windows = window_frame([("chr1", 8, 16)], ("sig_start", "sig_end"))
+    deltas = builders.write_track(
+        str(tmp_path / "d.track.parquet"),
+        [("chr1", 9, 1.0), ("chr1", 11, 1.0), ("chr1", 13, -1.0), ("chr1", 20, -1.0)],
+        signal="coverage_deltas",
+        scale=0.5,
+    )
+    counts = builders.track_rows_frame([("chr1", 10, 3.0)])
+
+    # Act
+    signal = loci.extract_signal(windows, [deltas, counts])
+
+    # Assert
+    assert signal[0, 0].tolist() == [0.0, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 0.5]
+    assert signal[0, 1].tolist() == [0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+
 def test_extract_signal_should_read_a_row_on_the_start_and_omit_one_on_the_end(engine):
     """Test that a window is half-open.
 
@@ -2382,6 +2441,33 @@ def test_extract_signal_should_raise_when_a_track_does_not_verify(engine, tmp_pa
     # Act & assert
     with pytest.raises(ValueError, match="t.track.parquet"):
         loci.extract_signal(windows, [str(unverifiable)])
+
+
+@pytest.mark.parametrize("fields, message", UNREADABLE_RECORDS, ids=UNREADABLE_IDS)
+def test_extract_signal_should_raise_when_a_tracks_signal_cannot_be_read(
+    engine, tmp_path, fields, message
+):
+    """Test the refusal for a complete track no reader here can read.
+
+    Given:
+        A complete track whose record names a signal no reader knows,
+        or a known signal at the other's version.
+    When:
+        The signal is extracted from it.
+    Then:
+        It should raise `ValueError` naming what is wrong with the
+        record, rather than place its rows as some signal they may not
+        be.
+    """
+
+    # Arrange
+    root = builders.write_track(str(tmp_path / "t.track.parquet"), [("chr1", 4, 1.0)])
+    builders.relabel_track(root, **fields)
+    windows = window_frame([("chr1", 0, 8)], ("sig_start", "sig_end"))
+
+    # Act & assert
+    with pytest.raises(ValueError, match=message):
+        loci.extract_signal(windows, [root])
 
 
 def test_extract_signal_should_raise_import_error_when_the_extra_is_absent(
@@ -3063,6 +3149,43 @@ def test_extract_loci_should_keep_the_loci_its_three_tests_admit(corpus, engine)
     ]
     assert extracted.sequences.shape == (5, 4, 70)
     assert extracted.signals.shape == (5, 1, 40)
+
+
+def test_extract_loci_should_read_and_count_a_coverage_track(corpus, engine, tmp_path):
+    """Test a track of coverage deltas as the signal an extraction counts on.
+
+    Given:
+        The module's peaks, and one span covering the output window of
+        the chr2 peak alone, written as boundary events at a scale of
+        two.
+    When:
+        The loci are extracted with a count floor of one.
+    Then:
+        It should keep the chr2 peak alone, and its signal should be
+        two at every base of its output window.
+    """
+
+    # Arrange
+    deltas = builders.write_track(
+        str(tmp_path / "d.track.parquet"),
+        [("chr2", 150, 1.0), ("chr2", 300, -1.0)],
+        signal="coverage_deltas",
+        scale=2.0,
+    )
+
+    # Act
+    extracted = loci.extract_loci(
+        corpus.peaks,
+        corpus.fasta,
+        IN_WINDOW,
+        OUT_WINDOW,
+        signals=[deltas],
+        min_counts=1,
+    )
+
+    # Assert
+    assert extracted.kept.tolist() == [True] + [False] * 8
+    assert extracted.signals.tolist() == [[[2.0] * OUT_WINDOW]]
 
 
 def test_extract_loci_should_answer_sequences_alone_when_no_track_is_given(corpus):

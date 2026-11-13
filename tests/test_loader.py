@@ -50,6 +50,7 @@ from tests import (
     drain,
     one_hot,
     parse_fasta,
+    pile_up_spans,
     same_batches,
 )
 
@@ -167,6 +168,29 @@ def corpus(corpus_factory):
         out_window=OUT_WINDOW,
         max_jitter=MAX_JITTER,
     )
+
+
+@pytest.fixture(scope="module")
+def peak_spans(corpus_factory, pysam):
+    """Build seeded alignments and their peaks, and pile them up under ``"span"``.
+
+    Returns ``(corpus, track, depth)``: the corpus, and
+    `tests.pile_up_spans` over it at a scale of a third. The corpus
+    carries one track of counts beside the coverage.
+    """
+
+    corpus = corpus_factory(
+        "loader-spans",
+        CHROM_SIZES,
+        n_bams=2,
+        n_reads=400,
+        index_fasta=True,
+        peaks=PEAKS,
+        tracks=SIGNAL_ROWS[:1],
+        in_window=IN_WINDOW,
+        out_window=OUT_WINDOW,
+    )
+    return (corpus, *pile_up_spans(corpus, "span", pysam, 1 / 3))
 
 
 @pytest.fixture(scope="module")
@@ -1151,6 +1175,78 @@ def test_build_training_loader_should_raise_when_no_signal_shares_a_contig(
     with pytest.raises(ValueError, match="no `signals` track holds a position"):
         loader.build_training_loader(
             **arguments(corpus, signals=[track], chroms=["chr1"])
+        )
+
+
+def test_build_training_loader_should_read_coverage_deltas_as_per_base_depth(
+    peak_spans,
+):
+    """Test a ``"span"`` track as a signal channel and as a control.
+
+    Given:
+        A coverage track piled up at a scale of a third, as the first
+        of two signal channels beside a track of counts, and as the
+        control; a loader that neither shuffles, jitters nor mirrors.
+    When:
+        Every batch of one epoch is drawn.
+    Then:
+        Each draw's coverage channel should equal pysam's per-base
+        depth times the scale over its output window, its counts
+        channel the counts there, and its control the same depth over
+        its input window, to ``float32`` precision.
+    """
+
+    # Arrange
+    corpus, track, depth = peak_spans
+    built = loader.build_training_loader(
+        peaks=corpus.peaks,
+        negatives=None,
+        sequences=corpus.fasta,
+        signals=[track, corpus.tracks[0]],
+        controls=[track],
+        in_window=IN_WINDOW,
+        out_window=OUT_WINDOW,
+        max_jitter=0,
+        negative_ratio=0.0,
+        reverse_complement=False,
+        shuffle=False,
+        random_state=0,
+        batch_size=BATCH_SIZE,
+        num_workers=0,
+        pin_memory=False,
+        cache_dir=False,
+    )
+    counts = dense(SIGNAL_ROWS[0], CHROM_SIZES, numpy.float64)
+    reference = parse_fasta(corpus.fasta)
+    # Each draw is matched to its peak by the sequence it read, so the
+    # check does not depend on which peaks the filters kept.
+    peaks = {}
+    for chrom, start, end in PEAKS:
+        middle = start + (end - start) // 2
+        in_lo = middle - IN_WINDOW // 2
+        key = one_hot(reference[chrom][in_lo : in_lo + IN_WINDOW]).tobytes()
+        peaks[key] = (chrom, middle - OUT_WINDOW // 2, in_lo)
+
+    # Act
+    batches = drain(built, n_epochs=1)
+
+    # Assert
+    sequences, controls, signals, _ = (torch.cat(column) for column in zip(*batches))
+    assert len(signals) > len(PEAKS) // 2 and signals[:, 0].any()
+    for index in range(len(signals)):
+        chrom, out_lo, in_lo = peaks[sequences[index].numpy().tobytes()]
+        numpy.testing.assert_allclose(
+            signals[index, 0].numpy(),
+            depth[chrom][out_lo : out_lo + OUT_WINDOW],
+            rtol=1e-6,
+        )
+        numpy.testing.assert_allclose(
+            signals[index, 1].numpy(), counts[chrom][out_lo : out_lo + OUT_WINDOW]
+        )
+        numpy.testing.assert_allclose(
+            controls[index, 0].numpy(),
+            depth[chrom][in_lo : in_lo + IN_WINDOW],
+            rtol=1e-6,
         )
 
 

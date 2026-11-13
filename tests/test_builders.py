@@ -1659,6 +1659,60 @@ def test_write_track_should_record_the_parameters_it_was_given(tmp_path):
     assert quadrat.read_manifest(root)["parameters"] == {"shift": 4}
 
 
+def test_write_track_should_record_the_signal_it_is_given(tmp_path):
+    """Test that a builder track can hold coverage deltas.
+
+    Given:
+        Rows written with the coverage-deltas signal.
+    When:
+        The written track's record is read back.
+    Then:
+        It should declare that signal at the version it implies, as a
+        pileup's track of the same signal does.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    root = str(tmp_path / "deltas.track.parquet")
+
+    # Act
+    builders.write_track(root, [("chr1", 10, 1.0)], signal="coverage_deltas")
+
+    # Assert
+    record = quadrat.read_manifest(root)
+    assert (record["signal"], record["version"]) == ("coverage_deltas", 2)
+
+
+def test_relabel_track_should_rewrite_the_fields_it_is_given_and_keep_the_rest(
+    tmp_path,
+):
+    """Test that a relabelled track's record carries the new fields over the old.
+
+    Given:
+        A track of counts written by the builder.
+    When:
+        It is relabelled with a ``signal`` and a ``version`` the writer
+        would refuse to record together.
+    Then:
+        Its record should hold those two fields and every other field
+        it was committed with.
+    """
+
+    # Arrange
+    pytest.importorskip("polars")
+    root = builders.write_track(
+        str(tmp_path / "t.track.parquet"), [("chr1", 10, 1.0)], parameters={"a": 1}
+    )
+    before = quadrat.read_manifest(root)
+
+    # Act
+    builders.relabel_track(root, signal="methylation", version=1)
+
+    # Assert
+    after = quadrat.read_manifest(root)
+    assert after == dict(before, signal="methylation", version=1)
+
+
 def test_write_track_should_write_a_track_that_records_nothing(tmp_path):
     """Test the natural spelling of a channel with no rows at all.
 
@@ -1856,7 +1910,7 @@ def test_write_flat_track_should_write_a_track_the_package_reads(tmp_path):
     written = builders.write_flat_track(str(tmp_path / "read.parquet"), rows)
 
     # Act
-    table = stores.track_frame(written).collect()
+    table = stores.track_frame(written)[0].collect()
 
     # Assert
     assert sorted(table.select("chrom", "pos", "value").rows()) == sorted(rows)

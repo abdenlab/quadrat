@@ -34,7 +34,7 @@ import tempfile
 
 import pytest
 
-from tests import TWO_CONTIGS, builders
+from tests import DELTA_ROWS, LAST_BASE_READS, TWO_CONTIGS, builders, pile_up_spans
 
 # Progress bars in a captured suite are noise that also slows it down.
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -446,6 +446,64 @@ def corpus_factory(tmp_path_factory):
             for channel, rows in enumerate(tracks)
         ]
         return corpus
+
+    return build
+
+
+@pytest.fixture(scope="session")
+def span_corpus(corpus_factory):
+    """Two indexed alignments of 300 seeded unspliced records each, both strands.
+
+    Over `TWO_CONTIGS`, for every module that piles records up under
+    ``"span"`` and checks the coverage against pysam's depth. Skips the
+    requesting test without the ``pileup`` extra, which every such
+    pileup needs.
+    """
+
+    pytest.importorskip("polars_bio")
+    return corpus_factory("spans", TWO_CONTIGS, n_bams=2, n_reads=300, index_fasta=True)
+
+
+@pytest.fixture(scope="session")
+def last_base_corpus(corpus_factory):
+    """One indexed alignment of `LAST_BASE_READS` over `TWO_CONTIGS`.
+
+    Records end on the last base of each contig, one per strand, so a
+    ``"span"`` pileup's closing event for each sits at its contig's
+    length.
+    """
+
+    return corpus_factory(
+        "last-base", TWO_CONTIGS, n_bams=1, index_fasta=True, reads=LAST_BASE_READS
+    )
+
+
+@pytest.fixture(scope="session")
+def last_base_spans(last_base_corpus, pysam):
+    """`pile_up_spans` over `last_base_corpus` at a scale of one."""
+
+    return pile_up_spans(last_base_corpus, "span", pysam)
+
+
+@pytest.fixture(scope="session")
+def delta_track(tmp_path_factory):
+    """Write `DELTA_ROWS` as a one-channel track of coverage deltas.
+
+    Called with the scale the track records, and written once per
+    scale for the session.
+    """
+
+    written = {}
+
+    def build(scale=1.0):
+        if scale not in written:
+            written[scale] = builders.write_track(
+                str(tmp_path_factory.mktemp("deltas") / "d.track.parquet"),
+                DELTA_ROWS,
+                signal="coverage_deltas",
+                scale=scale,
+            )
+        return written[scale]
 
     return build
 

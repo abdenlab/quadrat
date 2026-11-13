@@ -17,21 +17,43 @@ ungrouped form rather than anything about the peak: a byte comparison
 is checkable in CI, where a memory figure is not.
 """
 
+import dataclasses
 import logging
 import os
 import pathlib
+import random
 import threading
 import warnings
 
 import numpy
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
-from quadrat import EngineOptionWarning, tables
+from quadrat import Aggregate, EngineOptionWarning, stores, tables
 from quadrat import pileup as pileup_pkg
 from quadrat.pileup import track
-from tests import TWO_CONTIGS, bound, builders, digest_track, oracle_pileup
+from quadrat.pileup.aggregate import DEFAULT_EXCLUDE_FLAGS
+from tests import (
+    FILE_BACKED,
+    TWO_CONTIGS,
+    bound,
+    builders,
+    digest_track,
+    oracle_depth,
+    oracle_pileup,
+)
 
-POS_SHIFT, NEG_SHIFT = 4, -4
+START_SHIFT, END_SHIFT = 4, -4
+
+# A track of coverage deltas may hold a span's closing event at its
+# contig's length, so its rows are densified one base past each contig.
+DELTA_SIZES = {chrom: size + 1 for chrom, size in TWO_CONTIGS.items()}
+
+# The two aggregates most tests pile up under: every default but the
+# strands pooled, and that with ATAC's Tn5 shift.
+UNSTRANDED = Aggregate(unstranded=True)
+ATAC = Aggregate(start_shift=START_SHIFT, end_shift=END_SHIFT, unstranded=True)
 
 
 class EnginePanic(BaseException):
@@ -124,6 +146,130 @@ def shifted_pair(corpus_factory):
     )
 
 
+@pytest.fixture(scope="module")
+def flagged(tmp_path_factory, bam_header):
+    """One record per filter clause, each at a position of its own on ``chr1``.
+
+    100 is a plain primary record; 110, 120, 130 and 140 carry the
+    secondary, QC-failed, duplicate and supplementary flags; 150 is
+    placed but unmapped; 160 and 170 are the first and second mates of
+    one pair, 250 bases apart by template length; and 180 is a primary
+    record of mapping quality 5, the rest being 30.
+    """
+
+    h = bam_header
+    reads = [
+        builders.aligned_read(h, "plain", "chr1", 100, "20M", 0),
+        builders.aligned_read(h, "secondary", "chr1", 110, "20M", 0x100),
+        builders.aligned_read(h, "qc_failed", "chr1", 120, "20M", 0x200),
+        builders.aligned_read(h, "duplicate", "chr1", 130, "20M", 0x400),
+        builders.aligned_read(h, "supplementary", "chr1", 140, "20M", 0x800),
+        builders.aligned_read(h, "unmapped", "chr1", 150, "20M", 0x4),
+        builders.aligned_read(h, "pair", "chr1", 160, "20M", 0x1 | 0x40),
+        builders.aligned_read(h, "pair", "chr1", 170, "20M", 0x1 | 0x80),
+        builders.aligned_read(h, "low_quality", "chr1", 180, "20M", 0, mapq=5),
+    ]
+    reads[6].template_length = 250
+    reads[7].template_length = -250
+    root = tmp_path_factory.mktemp("track-flagged")
+    return builders.write_bam(str(root / "flagged.bam"), reads, h)
+
+
+def mate_pair(header, name, chrom, left, length, positive, flags=(0, 0), mapq=(30, 30)):
+    """Return the two records of one pair spanning ``length`` bases from ``left``.
+
+    The forward mate's 5' end is ``left`` and the reverse mate's is the
+    fragment's last base, each record 20 bases long, so the template
+    length is the distance between the two 5' ends, inclusive.
+    ``positive`` names the mate carrying the positive template length,
+    ``"forward"`` or ``"reverse"``, whatever their order by position.
+    """
+
+    right = left + length - 1
+    forward = builders.aligned_read(
+        header, name, chrom, left, "20M", 0x1 | 0x40 | flags[0], mapq=mapq[0]
+    )
+    reverse = builders.aligned_read(
+        header,
+        name,
+        chrom,
+        right - 19,
+        "20M",
+        0x1 | 0x80 | 0x10 | flags[1],
+        mapq=mapq[1],
+    )
+    sign = 1 if positive == "forward" else -1
+    forward.template_length = sign * length
+    reverse.template_length = -sign * length
+    return [forward, reverse]
+
+
+@pytest.fixture(scope="module")
+def mixed_pairs(tmp_path_factory):
+    """Pairs and unpaired records of every shape the filter and the rules judge.
+
+    Sixty pairs over both contigs, of seeded fragment lengths from 20
+    to 199, with the positive template length on a seeded mate, a
+    seeded flag from the default exclusion mask or none on each mate,
+    and a seeded mapping quality; and ten unpaired records with no
+    template length. Every record is unspliced, so its span is the
+    bases it aligns.
+    """
+
+    rng = random.Random(11)
+    header = builders.alignment_header(TWO_CONTIGS)
+    extras = [0, 0, 0, 0, 0x100, 0x200, 0x400, 0x800]
+    reads = []
+    for index in range(60):
+        chrom = "chr1" if index % 3 else "chr2"
+        length = rng.randrange(20, 200)
+        reads += mate_pair(
+            header,
+            "pair{}".format(index),
+            chrom,
+            rng.randrange(0, TWO_CONTIGS[chrom] - length + 1),
+            length,
+            rng.choice(["forward", "reverse"]),
+            flags=(rng.choice(extras), rng.choice(extras)),
+            mapq=(rng.choice([0, 5, 20, 60]), rng.choice([0, 5, 20, 60])),
+        )
+    for index in range(10):
+        reads.append(
+            builders.aligned_read(
+                header,
+                "single{}".format(index),
+                "chr1",
+                rng.randrange(0, 980),
+                "20M",
+                rng.choice([0, 0x10]),
+            )
+        )
+    root = tmp_path_factory.mktemp("track-mixed")
+    return builders.write_bam(str(root / "mixed.bam"), reads, header)
+
+
+@pytest.fixture(scope="module")
+def long_reference(corpus_factory):
+    """An indexed reference with one 2 kb contig, room for a 300-base fragment at 1000."""
+
+    pytest.importorskip("polars_bio")
+    return corpus_factory("track-long", {"chr1": 2000}, index_fasta=True).fasta
+
+
+def coverage_from_track(paths, chrom_sizes):
+    """Return each channel's dense values per contig, read through the store.
+
+    A channel of coverage deltas comes back as the coverage its prefix
+    sum gives, and a channel of counts as the counts.
+    """
+
+    store = stores.TrackStore(paths)
+    return {
+        chrom: store.window(chrom, 0, size).numpy().astype(numpy.float64)
+        for chrom, size in chrom_sizes.items()
+    }
+
+
 def dense_from_parquet(path, chrom_sizes):
     """Return a track as a dense array per contig, and the frame itself."""
 
@@ -151,9 +297,7 @@ def track_paths(tmp_path_factory, bam_pair, reference_fasta):
         bam_pair,
         reference_fasta,
         str(root / "pair"),
-        pos_shift=POS_SHIFT,
-        neg_shift=NEG_SHIFT,
-        unstranded=True,
+        aggregate=ATAC,
     )
 
 
@@ -189,7 +333,7 @@ def test_pileup_alignments_should_accept_path_objects(
         [pathlib.Path(path) for path in bam_pair],
         pathlib.Path(reference_fasta),
         name,
-        unstranded=True,
+        aggregate=UNSTRANDED,
     )
 
     # Assert
@@ -227,7 +371,7 @@ def test_pileup_alignments_should_accept_bytes_paths(
         [os.fsencode(path) for path in bam_pair],
         os.fsencode(str(reference_fasta)),
         os.fsencode(str(name)),
-        unstranded=True,
+        aggregate=UNSTRANDED,
     )
 
     # Assert
@@ -266,7 +410,7 @@ def test_pileup_alignments_should_refuse_a_name_that_is_not_a_path(
 
     # Act & assert
     with pytest.raises(TypeError, match="name"):
-        pileup_pkg.pileup_alignments(bam_pair, reference_fasta, 42, unstranded=True)
+        pileup_pkg.pileup_alignments(bam_pair, reference_fasta, 42, aggregate=UNSTRANDED)
     registering.assert_not_called()
 
 
@@ -294,7 +438,7 @@ def test_pileup_alignments_should_accept_one_alignment_as_a_bare_path(
 
     # Act
     written = pileup_pkg.pileup_alignments(
-        bam_pair[0], reference_fasta, name, unstranded=True
+        bam_pair[0], reference_fasta, name, aggregate=UNSTRANDED
     )
 
     # Assert
@@ -302,8 +446,10 @@ def test_pileup_alignments_should_accept_one_alignment_as_a_bare_path(
     assert tables.track_contigs(written[0]) <= set(TWO_CONTIGS)
 
 
-def test_pileup_alignments_should_match_bam2bw_semantics(track_paths, bam_pair, pysam):
-    """Test the position every record contributes.
+def test_pileup_alignments_should_count_the_shifted_five_prime_end_of_each_kept_record(
+    track_paths, bam_pair, pysam
+):
+    """Test the position every record contributes under the default filter.
 
     Given:
         Two BAMs carrying secondary, duplicate, unmapped and off-contig
@@ -312,12 +458,13 @@ def test_pileup_alignments_should_match_bam2bw_semantics(track_paths, bam_pair, 
         They are piled up with the ATAC +4/-4 shift, unstranded.
     Then:
         It should match a pysam re-implementation of bam2bw's loop at
-        every position, pooling all files and skipping only the unmapped
-        and unknown-contig reads.
+        every position once the same filter is applied, pooling all
+        files and skipping the secondary, duplicate, unmapped and
+        unknown-contig reads.
     """
 
     # Arrange
-    expected = oracle_pileup(bam_pair, TWO_CONTIGS, pysam, POS_SHIFT, NEG_SHIFT)
+    expected = oracle_pileup(bam_pair, TWO_CONTIGS, pysam, ATAC)
 
     # Act
     dense, frame = dense_from_parquet(track_paths[0], TWO_CONTIGS)
@@ -332,13 +479,13 @@ def test_pileup_alignments_should_match_bam2bw_semantics(track_paths, bam_pair, 
         numpy.testing.assert_array_equal(dense[chrom], expected[chrom])
 
     # Spot checks that pin the semantics independently of the oracle.
-    assert dense["chr1"][100 + POS_SHIFT] == 3  # primary + secondary + duplicate
-    assert dense["chr1"][170 - 1 + NEG_SHIFT] == 1  # reverse read cuts at end - 1
-    assert dense["chr1"][520 - 1 + NEG_SHIFT] == 1  # 10M100N10M spans the skip
-    assert dense["chr1"][315 - 1 + NEG_SHIFT] == 1  # 5S15M: clip is not reference
-    assert dense["chr2"][10 + POS_SHIFT] == 2  # pooled across files
-    assert dense["chr1"][600 + POS_SHIFT] == 0  # placed unmapped skipped
-    assert frame["value"].sum() == 12  # 9 records in file one + 3 in file two
+    assert dense["chr1"][100 + START_SHIFT] == 1  # secondary and duplicate skipped
+    assert dense["chr1"][170 - 1 + END_SHIFT] == 1  # reverse read cuts at end - 1
+    assert dense["chr1"][520 - 1 + END_SHIFT] == 1  # 10M100N10M spans the skip
+    assert dense["chr1"][315 - 1 + END_SHIFT] == 1  # 5S15M: clip is not reference
+    assert dense["chr2"][10 + START_SHIFT] == 2  # pooled across files
+    assert dense["chr1"][600 + START_SHIFT] == 0  # placed unmapped skipped
+    assert frame["value"].sum() == 10  # 7 records in file one + 3 in file two
 
 
 def test_pileup_alignments_should_apply_the_scale_factor(
@@ -351,25 +498,56 @@ def test_pileup_alignments_should_apply_the_scale_factor(
     When:
         The same BAMs are piled up.
     Then:
-        It should halve every value and keep it a float.
+        It should halve every value the oracle counts under the same
+        aggregate.
     """
 
-    # Act
-    paths = pileup_pkg.pileup_alignments(
-        bam_pair,
-        reference_fasta,
-        str(tmp_path / "scaled"),
-        pos_shift=POS_SHIFT,
-        neg_shift=NEG_SHIFT,
+    # Arrange
+    aggregate = Aggregate(
+        start_shift=START_SHIFT,
+        end_shift=END_SHIFT,
         unstranded=True,
         scale_factor=0.5,
     )
 
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        bam_pair, reference_fasta, str(tmp_path / "scaled"), aggregate=aggregate
+    )
+
     # Assert
-    expected = oracle_pileup(bam_pair, TWO_CONTIGS, pysam, POS_SHIFT, NEG_SHIFT, 0.5)
+    expected = oracle_pileup(bam_pair, TWO_CONTIGS, pysam, aggregate)
     dense, _ = dense_from_parquet(paths[0], TWO_CONTIGS)
     for chrom in TWO_CONTIGS:
         numpy.testing.assert_array_equal(dense[chrom], expected[chrom])
+
+
+def test_pileup_alignments_should_write_the_columns_at_the_formats_dtypes(
+    track_paths,
+):
+    """Test the dtypes a written track carries.
+
+    Given:
+        The pair piled up unstranded.
+    When:
+        A contig's file is read.
+    Then:
+        It should hold ``chrom`` as ``Utf8``, ``pos`` as ``Int64`` and
+        ``value`` as ``Float64``, as the track format declares.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+
+    # Act
+    schema = polars.read_parquet(os.path.join(track_paths[0], "chr1.parquet")).schema
+
+    # Assert
+    assert dict(schema) == {
+        "chrom": polars.Utf8,
+        "pos": polars.Int64,
+        "value": polars.Float64,
+    }
 
 
 def test_pileup_alignments_should_split_the_strands(
@@ -392,9 +570,7 @@ def test_pileup_alignments_should_split_the_strands(
         bam_pair,
         reference_fasta,
         str(tmp_path / "stranded"),
-        pos_shift=POS_SHIFT,
-        neg_shift=NEG_SHIFT,
-        unstranded=False,
+        aggregate=Aggregate(start_shift=START_SHIFT, end_shift=END_SHIFT),
     )
 
     # Assert
@@ -405,9 +581,9 @@ def test_pileup_alignments_should_split_the_strands(
 
     plus, _ = dense_from_parquet(paths[0], TWO_CONTIGS)
     minus, _ = dense_from_parquet(paths[1], TWO_CONTIGS)
-    both = oracle_pileup(bam_pair, TWO_CONTIGS, pysam, POS_SHIFT, NEG_SHIFT)
-    assert plus["chr1"][100 + POS_SHIFT] == 3 and minus["chr1"][104] == 0
-    assert minus["chr1"][170 - 1 + NEG_SHIFT] == 1 and plus["chr1"][165] == 0
+    both = oracle_pileup(bam_pair, TWO_CONTIGS, pysam, ATAC)
+    assert plus["chr1"][100 + START_SHIFT] == 1 and minus["chr1"][104] == 0
+    assert minus["chr1"][170 - 1 + END_SHIFT] == 1 and plus["chr1"][165] == 0
     for chrom in TWO_CONTIGS:
         numpy.testing.assert_array_equal(plus[chrom] + minus[chrom], both[chrom])
 
@@ -431,25 +607,23 @@ def test_pileup_alignments_should_drop_sites_outside_their_contig(
         [bam_edges],
         reference_fasta,
         str(tmp_path / "edges"),
-        pos_shift=POS_SHIFT,
-        neg_shift=NEG_SHIFT,
-        unstranded=True,
+        aggregate=ATAC,
     )
 
     # Assert
     dense, frame = dense_from_parquet(paths[0], TWO_CONTIGS)
     assert frame.height == 1
-    assert dense["chr1"][990 + POS_SHIFT] == 1
+    assert dense["chr1"][990 + START_SHIFT] == 1
 
 
-def test_pileup_alignments_should_shift_only_the_forward_site_by_pos_shift(
+def test_pileup_alignments_should_shift_only_the_forward_site_by_start_shift(
     tmp_path, shifted_pair
 ):
     """Test that the forward shift moves the forward site alone.
 
     Given:
         One forward and one reverse read at known positions, and a
-        non-zero ``pos_shift`` with ``neg_shift`` left at its default.
+        non-zero ``start_shift`` with ``end_shift`` left at its default.
     When:
         The alignments are piled up unstranded.
     Then:
@@ -466,7 +640,7 @@ def test_pileup_alignments_should_shift_only_the_forward_site_by_pos_shift(
         shifted_pair.bams,
         shifted_pair.fasta,
         str(tmp_path / "plain"),
-        unstranded=True,
+        aggregate=UNSTRANDED,
     )
 
     # Act
@@ -474,8 +648,7 @@ def test_pileup_alignments_should_shift_only_the_forward_site_by_pos_shift(
         shifted_pair.bams,
         shifted_pair.fasta,
         str(tmp_path / "fwd"),
-        unstranded=True,
-        pos_shift=7,
+        aggregate=Aggregate(unstranded=True, start_shift=7),
     )
 
     # Assert
@@ -483,13 +656,13 @@ def test_pileup_alignments_should_shift_only_the_forward_site_by_pos_shift(
     assert positions(os.path.join(shifted[0], "chr1.parquet")) == [107, 319]
 
 
-def test_pileup_alignments_should_shift_only_the_reverse_site_by_neg_shift(
+def test_pileup_alignments_should_shift_only_the_reverse_site_by_end_shift(
     tmp_path, shifted_pair
 ):
     """Test that the reverse shift moves the reverse site alone.
 
     Given:
-        The same reads, and a non-zero ``neg_shift`` with ``pos_shift``
+        The same reads, and a non-zero ``end_shift`` with ``start_shift``
         left at its default.
     When:
         The alignments are piled up unstranded.
@@ -503,12 +676,667 @@ def test_pileup_alignments_should_shift_only_the_reverse_site_by_neg_shift(
         shifted_pair.bams,
         shifted_pair.fasta,
         str(tmp_path / "rev"),
-        unstranded=True,
-        neg_shift=-9,
+        aggregate=Aggregate(unstranded=True, end_shift=-9),
     )
 
     # Assert
     assert positions(os.path.join(shifted[0], "chr1.parquet")) == [100, 310]
+
+
+@pytest.mark.parametrize(
+    "aggregate, kept",
+    [
+        (Aggregate(), [100, 160, 170, 180]),
+        (Aggregate(exclude_flags=0), [100, 110, 120, 130, 140, 160, 170, 180]),
+        (Aggregate(min_mapq=10), [100, 160, 170]),
+        (Aggregate(require_flags=0x40), [160]),
+        (Aggregate(min_template_length=1), [160, 170]),
+        (Aggregate(max_template_length=100), [100, 180]),
+    ],
+    ids=[
+        "default",
+        "no_mask",
+        "mapq_floor",
+        "first_mate",
+        "template_floor",
+        "template_ceiling",
+    ],
+)
+def test_pileup_alignments_should_count_only_the_records_the_filter_keeps(
+    tmp_path, flagged, reference_fasta, aggregate, kept
+):
+    """Test each clause of the record filter on a record of its own.
+
+    Given:
+        One record carrying each flag the default excludes, a placed
+        unmapped one, the two mates of a pair and one of low mapping
+        quality, each at a position of its own.
+    When:
+        They are piled up under the default filter, with no exclusion
+        mask, with a quality floor, keeping first mates alone, and with
+        a template-length floor and ceiling.
+    Then:
+        It should count exactly the 5' ends of the records that filter
+        keeps, and never the unmapped one.
+    """
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        [flagged],
+        reference_fasta,
+        str(tmp_path / "flagged"),
+        aggregate=dataclasses.replace(aggregate, unstranded=True),
+    )
+
+    # Assert
+    assert positions(os.path.join(paths[0], "chr1.parquet")) == kept
+
+
+@pytest.mark.parametrize("positive", ["forward", "reverse"])
+def test_pileup_alignments_should_count_a_fragments_midpoint_whichever_mate_carries_it(
+    tmp_path, long_reference, positive
+):
+    """Test the midpoint of a fragment of known span.
+
+    Given:
+        One pair spanning bases 1000 to 1299, the positive template
+        length on the forward, leftmost mate or on the reverse,
+        rightmost one.
+    When:
+        It is piled up under the midpoint rule.
+    Then:
+        It should count one fragment, at base 1149: the lower of the
+        two middle bases of a 300-base fragment.
+    """
+
+    # Arrange
+    header = builders.alignment_header({"chr1": 2000})
+    bam = builders.write_bam(
+        str(tmp_path / "pair.bam"),
+        mate_pair(header, "p", "chr1", 1000, 300, positive),
+        header,
+    )
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        [bam],
+        long_reference,
+        str(tmp_path / "mid"),
+        aggregate=Aggregate(position="midpoint", unstranded=True),
+    )
+
+    # Assert
+    dense, frame = dense_from_parquet(paths[0], {"chr1": 2000})
+    assert frame.height == 1
+    assert dense["chr1"][1149] == 1
+
+
+def test_pileup_alignments_should_count_three_prime_ends_with_each_shift_on_its_coordinate(
+    tmp_path, shifted_pair
+):
+    """Test the 3' rule and which coordinate each shift moves under it.
+
+    Given:
+        A forward read on 100-119 and a reverse read on 300-319.
+    When:
+        They are piled up under the 3' rule, with a start shift of 2
+        and an end shift of -3.
+    Then:
+        It should count the forward read at its last base moved by the
+        end shift, 116, and the reverse read at its first base moved by
+        the start shift, 302 -- each shift moving the coordinate it is
+        named for, whichever end of the read that is.
+    """
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        shifted_pair.bams,
+        shifted_pair.fasta,
+        str(tmp_path / "three"),
+        aggregate=Aggregate(
+            position="three_prime", start_shift=2, end_shift=-3, unstranded=True
+        ),
+    )
+
+    # Assert
+    assert positions(os.path.join(paths[0], "chr1.parquet")) == [116, 302]
+
+
+@settings(FILE_BACKED, max_examples=60)
+@given(
+    position=st.sampled_from(["five_prime", "three_prime", "midpoint", "span"]),
+    exclude=st.sets(st.sampled_from([0x100, 0x200, 0x400, 0x800, 0x10])),
+    require=st.sampled_from([0, 0x1, 0x40, 0x80]),
+    min_mapq=st.sampled_from([0, 5, 20, 60]),
+    template=st.sampled_from([(0, None), (1, None), (0, 120), (50, 150)]),
+    shifts=st.tuples(st.integers(-5, 5), st.integers(-5, 5)),
+    unstranded=st.booleans(),
+)
+def test_pileup_alignments_should_agree_with_pysam_under_any_aggregate(
+    tmp_path,
+    mixed_pairs,
+    reference_fasta,
+    pysam,
+    position,
+    exclude,
+    require,
+    min_mapq,
+    template,
+    shifts,
+    unstranded,
+):
+    """Test every rule and every filter clause against pysam.
+
+    Given:
+        Pairs and unpaired records of seeded flags, qualities and
+        fragment lengths, and any combination of an exclusion mask, a
+        required flag, a quality floor, template-length bounds, a
+        position rule, for the 5' and 3' rules shifts, and the strands
+        pooled or, except under the midpoint rule, kept apart.
+    When:
+        They are piled up.
+    Then:
+        Each channel should equal, at every base, what pysam implies
+        for the same records on its strand, or on both when pooled: a
+        count at each kept record's position for the point rules, the
+        midpoint found from the two mates' 5' ends, and per-base depth,
+        after the read-time prefix sum, for ``"span"``.
+    """
+
+    # Arrange
+    point = position in ("five_prime", "three_prime")
+    aggregate = Aggregate(
+        exclude_flags=sum(exclude) | 0x4,
+        require_flags=require,
+        min_mapq=min_mapq,
+        min_template_length=template[0],
+        max_template_length=template[1],
+        position=position,
+        start_shift=shifts[0] if point else 0,
+        end_shift=shifts[1] if point else 0,
+        unstranded=unstranded or position == "midpoint",
+    )
+    oracle = oracle_depth if position == "span" else oracle_pileup
+    pooled = dataclasses.replace(aggregate, unstranded=True)
+    if aggregate.unstranded:
+        channels = [oracle([mixed_pairs], TWO_CONTIGS, pysam, pooled)]
+    else:
+        # The oracle keeps what an aggregate keeps, so a channel's
+        # records are the pooled filter with its strand's flag
+        # required or excluded; a mask excluding 0x10 leaves no reverse
+        # record to require.
+        forward = dataclasses.replace(pooled, exclude_flags=pooled.exclude_flags | 0x10)
+        channels = [oracle([mixed_pairs], TWO_CONTIGS, pysam, forward)]
+        if pooled.exclude_flags & 0x10:
+            channels.append({c: numpy.zeros(n) for c, n in TWO_CONTIGS.items()})
+        else:
+            reverse = dataclasses.replace(
+                pooled, require_flags=pooled.require_flags | 0x10
+            )
+            channels.append(oracle([mixed_pairs], TWO_CONTIGS, pysam, reverse))
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        [mixed_pairs], reference_fasta, str(tmp_path / "any"), aggregate=aggregate
+    )
+
+    # Assert
+    actual = coverage_from_track(paths, TWO_CONTIGS)
+    for chrom in TWO_CONTIGS:
+        assert len(actual[chrom]) == len(channels)
+        for row, expected in zip(actual[chrom], channels):
+            numpy.testing.assert_array_equal(row, expected[chrom])
+
+
+def test_pileup_alignments_should_write_coverage_that_sums_to_per_base_depth(
+    tmp_path, span_corpus, pysam
+):
+    """Test span coverage against pysam's depth, strand by strand.
+
+    Given:
+        Two alignments of unspliced records on both strands.
+    When:
+        They are piled up stranded under ``"span"`` and each channel is
+        read back through the store's prefix sum.
+    Then:
+        The plus channel should equal pysam's per-base depth over the
+        forward records and the minus channel its depth over the
+        reverse ones, at every base.
+    """
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        span_corpus.bams,
+        span_corpus.fasta,
+        str(tmp_path / "span"),
+        aggregate=Aggregate(position="span"),
+    )
+
+    # Assert
+    actual = coverage_from_track(paths, TWO_CONTIGS)
+    plus = oracle_depth(
+        span_corpus.bams,
+        TWO_CONTIGS,
+        pysam,
+        Aggregate(exclude_flags=DEFAULT_EXCLUDE_FLAGS | 0x10, position="span"),
+    )
+    minus = oracle_depth(
+        span_corpus.bams,
+        TWO_CONTIGS,
+        pysam,
+        Aggregate(require_flags=0x10, position="span"),
+    )
+    assert plus["chr1"].any() and minus["chr1"].any()
+    for chrom in TWO_CONTIGS:
+        numpy.testing.assert_array_equal(actual[chrom][0], plus[chrom])
+        numpy.testing.assert_array_equal(actual[chrom][1], minus[chrom])
+
+
+@pytest.fixture(scope="module", params=[0.1, 1 / 3], ids=["tenth", "third"])
+def scaled_spans(request, tmp_path_factory, span_corpus):
+    """`span_corpus` piled up unstranded under ``"span"`` at a scale of a tenth or a third.
+
+    Neither scale is a power of two. Returns ``(aggregate, paths)``.
+    """
+
+    aggregate = Aggregate(position="span", unstranded=True, scale_factor=request.param)
+    paths = pileup_pkg.pileup_alignments(
+        span_corpus.bams,
+        span_corpus.fasta,
+        str(tmp_path_factory.mktemp("track-scaled") / "scaled"),
+        aggregate=aggregate,
+    )
+    return aggregate, paths
+
+
+def test_pileup_alignments_should_write_span_deltas_unscaled_beside_their_scale(
+    scaled_spans,
+):
+    """Test where a span track's scale goes.
+
+    Given:
+        Two alignments of unspliced records piled up unstranded under
+        ``"span"`` at a scale factor of a tenth or a third.
+    When:
+        The written rows and the manifest are read.
+    Then:
+        Every row should hold an integer, the delta unscaled, and the
+        manifest should record the scale.
+    """
+
+    # Arrange
+    aggregate, paths = scaled_spans
+
+    # Act
+    record = tables.read_manifest(paths[0])
+    rows, _ = dense_from_parquet(paths[0], DELTA_SIZES)
+
+    # Assert
+    assert record["scale"] == aggregate.scale_factor
+    assert all((values == numpy.round(values)).all() for values in rows.values())
+
+
+def test_pileup_alignments_should_write_span_coverage_that_scales_without_residue(
+    scaled_spans, span_corpus, pysam
+):
+    """Test span coverage under a scale factor that is not a power of two.
+
+    Given:
+        Two alignments of unspliced records piled up unstranded under
+        ``"span"`` at a scale factor of a tenth or a third.
+    When:
+        The track is read back through the store.
+    Then:
+        Every base past the last record's end should read exactly
+        ``0.0``, and every base should equal pysam's depth times the
+        scale, to ``float32`` precision.
+    """
+
+    # Arrange
+    aggregate, paths = scaled_spans
+    expected = oracle_depth(span_corpus.bams, TWO_CONTIGS, pysam, aggregate)
+
+    # Act
+    actual = coverage_from_track(paths, TWO_CONTIGS)
+
+    # Assert
+    for chrom in TWO_CONTIGS:
+        last = int(numpy.flatnonzero(expected[chrom])[-1])
+        assert (actual[chrom][0][last + 1 :] == 0.0).all()
+        numpy.testing.assert_allclose(actual[chrom][0], expected[chrom], rtol=1e-6)
+
+
+@pytest.mark.parametrize("unstranded", [True, False], ids=["unstranded", "stranded"])
+def test_pileup_alignments_should_close_a_span_that_ends_on_its_contigs_last_base(
+    tmp_path, last_base_corpus, unstranded
+):
+    """Test the closing event of a span that reaches its contig's end.
+
+    Given:
+        A forward record ending on chr1's last base, a reverse one
+        ending on chr2's, and a forward record ending inside chr1.
+    When:
+        They are piled up under ``"span"``, pooled and split by strand.
+    Then:
+        Every track should hold a ``-1`` at the contig's length for
+        each record ending there, and each contig's deltas should sum
+        to zero in every track, so no coverage runs past a contig.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        last_base_corpus.bams,
+        last_base_corpus.fasta,
+        str(tmp_path / "span"),
+        aggregate=Aggregate(position="span", unstranded=unstranded),
+    )
+
+    # Assert
+    frame = polars.concat([polars.read_parquet(path) for path in paths])
+    for chrom, length in TWO_CONTIGS.items():
+        rows = frame.filter(polars.col("chrom") == chrom)
+        assert rows.filter(polars.col("pos") == length)["value"].to_list() == [-1.0]
+    for path in paths:
+        sums = polars.read_parquet(path).group_by("chrom").agg(polars.col("value").sum())
+        assert sums["value"].to_list() == [0.0] * sums.height
+
+
+@pytest.fixture(scope="module")
+def overhang_corpus(corpus_factory):
+    """One alignment whose header declares both contigs longer than the reference.
+
+    On each strand, records end inside a contig, on its last base and
+    past it, and start on its length and past it, so a ``"span"``
+    pileup meets every way a span can leave its contig.
+    """
+
+    pytest.importorskip("polars_bio")
+    return corpus_factory(
+        "overhang",
+        TWO_CONTIGS,
+        n_bams=1,
+        index_fasta=True,
+        header_contigs={"chr1": 1100, "chr2": 600},
+        reads=[
+            ("inside", "chr1", 500, "20M", 0),
+            ("last", "chr1", 980, "20M", 0),
+            ("past", "chr1", 990, "30M", 0),
+            ("past_r", "chr1", 985, "40M", 16),
+            ("at", "chr1", 1000, "20M", 0),
+            ("at_r", "chr1", 1000, "20M", 16),
+            ("beyond", "chr1", 1050, "20M", 0),
+            ("past2", "chr2", 495, "20M", 16),
+            ("at2", "chr2", 500, "10M", 0),
+        ],
+    )
+
+
+@pytest.mark.parametrize("unstranded", [True, False], ids=["unstranded", "stranded"])
+def test_pileup_alignments_should_clip_a_span_to_its_contig_under_a_longer_header(
+    tmp_path, overhang_corpus, unstranded
+):
+    """Test the spans of an alignment whose header outruns the reference.
+
+    Given:
+        Records ending on and past each contig's end and starting on
+        and past its length, under a header declaring both contigs
+        longer than the reference.
+    When:
+        They are piled up under ``"span"``, pooled and split by strand.
+    Then:
+        Each contig's deltas should sum to zero in every track, with no
+        row past the contig's length.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        overhang_corpus.bams,
+        overhang_corpus.fasta,
+        str(tmp_path / "span"),
+        aggregate=Aggregate(position="span", unstranded=unstranded),
+    )
+
+    # Assert
+    for path in paths:
+        frame = polars.read_parquet(path)
+        for chrom, length in TWO_CONTIGS.items():
+            rows = frame.filter(polars.col("chrom") == chrom)
+            assert rows["value"].sum() == 0.0
+            assert (rows["pos"] <= length).all()
+
+
+def test_pileup_alignments_should_read_a_clipped_span_as_depth_inside_its_contig(
+    tmp_path, overhang_corpus, pysam
+):
+    """Test the coverage spans past a contig's end leave inside it.
+
+    Given:
+        The same records under a header longer than the reference.
+    When:
+        They are piled up unstranded under ``"span"`` and read back
+        through the store over each contig and 30 bases past it.
+    Then:
+        It should equal pysam's depth inside each contig and read zero
+        past it.
+    """
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        overhang_corpus.bams,
+        overhang_corpus.fasta,
+        str(tmp_path / "span"),
+        aggregate=Aggregate(position="span", unstranded=True),
+    )
+
+    # Assert
+    store = stores.TrackStore(paths)
+    depth = oracle_depth(
+        overhang_corpus.bams,
+        TWO_CONTIGS,
+        pysam,
+        Aggregate(position="span", unstranded=True),
+    )
+    for chrom, length in TWO_CONTIGS.items():
+        expected = numpy.concatenate((depth[chrom], numpy.zeros(30)))
+        numpy.testing.assert_array_equal(
+            store.window(chrom, 0, length + 30)[0].numpy(), expected
+        )
+
+
+def test_pileup_alignments_should_cover_a_records_whole_span_under_span(
+    tmp_path, bam_pair, reference_fasta
+):
+    """Test what a span is, where it differs from aligned bases.
+
+    Given:
+        A record with a 5-base deletion at 210-214 and one with a
+        100-base reference skip at 410-509.
+    When:
+        They are piled up under ``"span"``.
+    Then:
+        Each base inside the deletion and the skip should be covered,
+        the span running from a record's start to its end, and the
+        written values should be two boundary events per record rather
+        than one row per base.
+    """
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        bam_pair,
+        reference_fasta,
+        str(tmp_path / "span"),
+        aggregate=Aggregate(position="span", unstranded=True),
+    )
+
+    # Assert
+    covered = coverage_from_track(paths, TWO_CONTIGS)["chr1"][0]
+    assert covered[210:215].tolist() == [1.0] * 5
+    assert covered[410:510].tolist() == [1.0] * 100
+    rows, _ = dense_from_parquet(paths[0], DELTA_SIZES)
+    assert rows["chr1"][400] == 1 and rows["chr1"][520] == -1
+    assert numpy.count_nonzero(rows["chr1"][401:520]) == 0
+
+
+@pytest.fixture(
+    scope="module",
+    params=[
+        (Aggregate(unstranded=True), "counts", 1),
+        (Aggregate(position="midpoint", unstranded=True), "counts", 1),
+        (Aggregate(position="span", unstranded=True, min_mapq=3), "coverage_deltas", 2),
+    ],
+    ids=["five_prime", "midpoint", "span"],
+)
+def recorded(request, corpus_factory):
+    """One alignment piled up under a point rule, the midpoint rule or ``"span"``.
+
+    Returns ``(aggregate, signal, version, record)``: the aggregate, the
+    signal and manifest version a track of it should declare, and the
+    record its track was committed with.
+    """
+
+    pytest.importorskip("polars_bio")
+    aggregate, signal, version = request.param
+    corpus = corpus_factory(
+        "recorded",
+        TWO_CONTIGS,
+        n_bams=1,
+        index_fasta=True,
+        reads=[("fwd", "chr1", 100, "20M", 0), ("rev", "chr1", 300, "20M", 16)],
+    )
+    paths = pileup_pkg.pileup_alignments(
+        corpus.bams, corpus.fasta, corpus.path("m"), aggregate=aggregate
+    )
+    return aggregate, signal, version, tables.read_manifest(paths[0])
+
+
+def test_pileup_alignments_should_record_what_the_values_mean(recorded):
+    """Test the manifest's signal and the version it implies.
+
+    Given:
+        A point rule, the midpoint rule, and ``"span"``.
+    When:
+        Alignments are piled up under each and the manifest is read.
+    Then:
+        It should declare counts at version 1 for the first two and
+        coverage deltas at version 2 for the third.
+    """
+
+    # Arrange
+    _, signal, version, record = recorded
+
+    # Act
+    declared = (record["signal"], record["version"])
+
+    # Assert
+    assert declared == (signal, version)
+
+
+def test_pileup_alignments_should_record_the_aggregate_it_counted_by(recorded):
+    """Test the aggregate's provenance in the manifest.
+
+    Given:
+        A point rule, the midpoint rule, and ``"span"``.
+    When:
+        Alignments are piled up under each and the manifest is read.
+    Then:
+        It should record every field of the aggregate under
+        ``parameters``, as `dataclasses.asdict` gives them.
+    """
+
+    # Arrange
+    aggregate, _, _, record = recorded
+
+    # Act
+    provenance = record["parameters"]["aggregate"]
+
+    # Assert
+    assert provenance == dataclasses.asdict(aggregate)
+
+
+@pytest.mark.parametrize("position, queries", [("five_prime", 1), ("span", 2)])
+def test_pileup_alignments_should_split_by_the_scan_its_rule_implies(
+    tmp_path, shifted_pair, machine, sized, mocker, position, queries
+):
+    """Test that a direct call sizes its batches by the rows per record.
+
+    Given:
+        An alignment reported as 6 GB on a machine with memory to
+        spare, piled up under the 5' rule and under ``"span"``.
+    When:
+        The batch count is left to the planner.
+    Then:
+        The 5' pileup should run as one aggregate, its bytes under the
+        scan cap, and the span pileup as two, one per contig, its two
+        rows per record taking it over: each should ask the engine as
+        many queries as the same pileup run at that batch count.
+    """
+
+    # Arrange
+    pb = pytest.importorskip("polars_bio")
+    machine(64, 1024 * 1024**3)
+    sized(6 * 1024**3)
+    spy = mocker.spy(pb, "sql")
+    aggregate = Aggregate(position=position, unstranded=True)
+
+    # Act
+    pileup_pkg.pileup_alignments(
+        shifted_pair.bams,
+        shifted_pair.fasta,
+        str(tmp_path / "planned"),
+        aggregate=aggregate,
+        target_partitions=1,
+    )
+    planned = spy.call_count
+    spy.reset_mock()
+    pileup_pkg.pileup_alignments(
+        shifted_pair.bams,
+        shifted_pair.fasta,
+        str(tmp_path / "named"),
+        aggregate=aggregate,
+        target_partitions=1,
+        contig_groups=queries,
+    )
+
+    # Assert
+    assert planned == spy.call_count
+
+
+@pytest.mark.parametrize("aggregate", [None, {"unstranded": True}, "span"])
+def test_pileup_alignments_should_refuse_an_aggregate_that_is_not_one(
+    tmp_path, shifted_pair, mocker, aggregate
+):
+    """Test the type the aggregate is held to.
+
+    Given:
+        ``None``, a mapping of the record's fields, or a rule's name in
+        place of an `Aggregate`.
+    When:
+        A pileup is called with it.
+    Then:
+        It should raise `TypeError`, and `register_alignments` should
+        never have been called.
+    """
+
+    # Arrange
+    registering = mocker.patch.object(
+        track, "register_alignments", wraps=track.register_alignments
+    )
+
+    # Act & assert
+    with pytest.raises(TypeError, match="takes what to count as an Aggregate"):
+        pileup_pkg.pileup_alignments(
+            shifted_pair.bams,
+            shifted_pair.fasta,
+            str(tmp_path / "x"),
+            aggregate=aggregate,
+        )
+    registering.assert_not_called()
 
 
 def test_pileup_alignments_should_write_the_same_table_at_a_named_partition_count(
@@ -543,13 +1371,16 @@ def test_pileup_alignments_should_write_the_same_table_at_a_named_partition_coun
 
     # Act
     chosen = pileup_pkg.pileup_alignments(
-        shifted_pair.bams, shifted_pair.fasta, str(tmp_path / "chosen"), unstranded=True
+        shifted_pair.bams,
+        shifted_pair.fasta,
+        str(tmp_path / "chosen"),
+        aggregate=UNSTRANDED,
     )
     named = pileup_pkg.pileup_alignments(
         shifted_pair.bams,
         shifted_pair.fasta,
         str(tmp_path / "named"),
-        unstranded=True,
+        aggregate=UNSTRANDED,
         target_partitions=1,
     )
 
@@ -585,7 +1416,7 @@ def test_pileup_alignments_should_warn_when_the_engine_rejects_the_partition_cou
     # Arrange
     pb = pytest.importorskip("polars_bio")
     accepted = pileup_pkg.pileup_alignments(
-        shifted_pair.bams, shifted_pair.fasta, str(tmp_path / "ok"), unstranded=True
+        shifted_pair.bams, shifted_pair.fasta, str(tmp_path / "ok"), aggregate=UNSTRANDED
     )
     mocker.patch.object(
         pb, "set_option", side_effect=EnginePanic("not found on ExecutionOptions")
@@ -597,7 +1428,7 @@ def test_pileup_alignments_should_warn_when_the_engine_rejects_the_partition_cou
             shifted_pair.bams,
             shifted_pair.fasta,
             str(tmp_path / "refused"),
-            unstranded=True,
+            aggregate=UNSTRANDED,
         )
 
     # Assert
@@ -629,7 +1460,7 @@ def test_pileup_alignments_should_not_warn_when_the_engine_takes_the_setting(
             shifted_pair.bams,
             shifted_pair.fasta,
             str(tmp_path / "quiet"),
-            unstranded=True,
+            aggregate=UNSTRANDED,
         )
 
 
@@ -664,7 +1495,7 @@ def test_pileup_alignments_should_propagate_an_interrupt_from_the_engine(
             shifted_pair.bams,
             shifted_pair.fasta,
             str(tmp_path / "interrupted"),
-            unstranded=True,
+            aggregate=UNSTRANDED,
         )
 
 
@@ -693,7 +1524,7 @@ def test_pileup_alignments_should_raise_when_the_partition_count_is_not_a_number
             shifted_pair.bams,
             shifted_pair.fasta,
             str(tmp_path / "bad"),
-            unstranded=True,
+            aggregate=UNSTRANDED,
             target_partitions="all of them",
         )
 
@@ -717,7 +1548,7 @@ def test_pileup_alignments_should_report_each_channel_when_verbose(
         shifted_pair.bams,
         shifted_pair.fasta,
         str(tmp_path / "loud"),
-        unstranded=True,
+        aggregate=UNSTRANDED,
         verbose=True,
     )
 
@@ -746,7 +1577,7 @@ def test_pileup_alignments_should_print_nothing_when_verbose_is_defaulted(
         shifted_pair.bams,
         shifted_pair.fasta,
         str(tmp_path / "quiet"),
-        unstranded=True,
+        aggregate=UNSTRANDED,
     )
 
     # Assert
@@ -808,7 +1639,7 @@ def test_pileup_alignments_should_refuse_one_of_two_concurrent_callers(
         ready.wait(10)
         try:
             pileup_pkg.pileup_alignments(
-                bam_pair, reference_fasta, str(tmp_path / label), unstranded=True
+                bam_pair, reference_fasta, str(tmp_path / label), aggregate=UNSTRANDED
             )
             outcomes.append("wrote")
         except RuntimeError as error:
@@ -842,8 +1673,59 @@ def test_pileup_alignments_should_succeed_after_a_refused_overlapping_call(
 
     # Act & assert
     assert pileup_pkg.pileup_alignments(
-        bam_pair, reference_fasta, str(tmp_path / "after"), unstranded=True
+        bam_pair, reference_fasta, str(tmp_path / "after"), aggregate=UNSTRANDED
     )
+
+
+def test_pileup_alignments_should_refuse_an_alignment_that_is_neither_bam_nor_sam(
+    tmp_path, reference_fasta
+):
+    """Test the suffix an alignment is held to.
+
+    Given:
+        An alignment path ending in ``.txt``.
+    When:
+        A pileup is requested.
+    Then:
+        It should raise `ValueError` quoting the path.
+    """
+
+    # Arrange
+    path = tmp_path / "reads.txt"
+    path.write_text("not an alignment")
+
+    # Act & assert
+    with pytest.raises(ValueError, match="reads.txt"):
+        pileup_pkg.pileup_alignments([str(path)], reference_fasta, str(tmp_path / "t"))
+
+
+@pytest.mark.parametrize(
+    "value, error", [("two", ValueError), ([2], TypeError)], ids=["string", "list"]
+)
+def test_pileup_alignments_should_raise_when_the_batch_count_is_not_a_number(
+    tmp_path, shifted_pair, value, error
+):
+    """Test the batch count's refusals.
+
+    Given:
+        A ``contig_groups`` that is a string ``int`` cannot parse, or a
+        list.
+    When:
+        A pileup runs.
+    Then:
+        It should raise `ValueError` for the string and `TypeError` for
+        the list.
+    """
+
+    # Act & assert
+    with pytest.raises(error):
+        pileup_pkg.pileup_alignments(
+            shifted_pair.bams,
+            shifted_pair.fasta,
+            str(tmp_path / "bad"),
+            aggregate=UNSTRANDED,
+            contig_groups=value,
+        )
 
 
 @pytest.mark.xfail(
@@ -954,7 +1836,7 @@ def test_pileup_alignments_should_write_fixed_size_row_groups(corpus_factory, tm
 
     # Act
     written = pileup_pkg.pileup_alignments(
-        corpus.bams, corpus.fasta, str(tmp_path / "grouped"), unstranded=True
+        corpus.bams, corpus.fasta, str(tmp_path / "grouped"), aggregate=UNSTRANDED
     )
     metadata = pq.ParquetFile(tables.track_chrom_path(written[0], "chr1")).metadata
     groups = [metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)]
@@ -989,18 +1871,14 @@ def test_pileup_alignments_should_write_the_same_table_at_any_batch_count(
         [bam_pair[0]],
         reference_fasta,
         str(tmp_path / "whole"),
-        unstranded=True,
-        pos_shift=POS_SHIFT,
-        neg_shift=NEG_SHIFT,
+        aggregate=ATAC,
         contig_groups=1,
     )
     many = pileup_pkg.pileup_alignments(
         [bam_pair[0]],
         reference_fasta,
         str(tmp_path / "split"),
-        unstranded=True,
-        pos_shift=POS_SHIFT,
-        neg_shift=NEG_SHIFT,
+        aggregate=ATAC,
         contig_groups=groups,
     )
 
@@ -1038,10 +1916,10 @@ def test_pileup_alignments_should_tolerate_a_reference_contig_the_bam_omits(
 
     # Act
     whole = pileup_pkg.pileup_alignments(
-        [bam_pair[0]], extra, str(tmp_path / "w"), unstranded=True, contig_groups=1
+        [bam_pair[0]], extra, str(tmp_path / "w"), aggregate=UNSTRANDED, contig_groups=1
     )
     split = pileup_pkg.pileup_alignments(
-        [bam_pair[0]], extra, str(tmp_path / "s"), unstranded=True, contig_groups=3
+        [bam_pair[0]], extra, str(tmp_path / "s"), aggregate=UNSTRANDED, contig_groups=3
     )
 
     # Assert
@@ -1081,10 +1959,18 @@ def test_pileup_alignments_should_keep_every_record_when_headers_differ(
 
     # Act
     whole = pileup_pkg.pileup_alignments(
-        pooled, reference_fasta, str(tmp_path / "w"), unstranded=True, contig_groups=1
+        pooled,
+        reference_fasta,
+        str(tmp_path / "w"),
+        aggregate=UNSTRANDED,
+        contig_groups=1,
     )
     split = pileup_pkg.pileup_alignments(
-        pooled, reference_fasta, str(tmp_path / "s"), unstranded=True, contig_groups=2
+        pooled,
+        reference_fasta,
+        str(tmp_path / "s"),
+        aggregate=UNSTRANDED,
+        contig_groups=2,
     )
 
     # Assert
@@ -1121,7 +2007,10 @@ def test_pileup_alignments_should_emit_progress_to_the_package_logger(
 
     # Act
     pileup_pkg.pileup_alignments(
-        shifted_pair.bams, shifted_pair.fasta, str(tmp_path / "logged"), unstranded=True
+        shifted_pair.bams,
+        shifted_pair.fasta,
+        str(tmp_path / "logged"),
+        aggregate=UNSTRANDED,
     )
 
     # Assert
@@ -1161,7 +2050,7 @@ def test_pileup_alignments_should_leave_the_root_logger_unconfigured(
         shifted_pair.bams,
         shifted_pair.fasta,
         str(tmp_path / "verbose-root"),
-        unstranded=True,
+        aggregate=UNSTRANDED,
         verbose=True,
     )
 
@@ -1264,7 +2153,10 @@ def test_pileup_alignments_should_release_its_tables_when_it_finishes(
 
     # Act
     pileup_pkg.pileup_alignments(
-        shifted_pair.bams, shifted_pair.fasta, str(tmp_path / "done"), unstranded=True
+        shifted_pair.bams,
+        shifted_pair.fasta,
+        str(tmp_path / "done"),
+        aggregate=UNSTRANDED,
     )
 
     # Assert
@@ -1347,7 +2239,7 @@ def test_pileup_alignments_should_restore_the_partition_count_it_found(
         shifted_pair.bams,
         shifted_pair.fasta,
         str(tmp_path / "restored"),
-        unstranded=True,
+        aggregate=UNSTRANDED,
         target_partitions=2,
     )
 
