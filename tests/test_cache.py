@@ -220,10 +220,9 @@ thresholds = st.floats(allow_nan=False, allow_infinity=False)
 def inputs(root, *, peaks=(("chr1", 8, 16),), track_rows=None):
     """Return a key's full input set of a track, a reference and two locus files.
 
-    The reference is indexed, because the key hashes the index rather
-    than the sequence: without one, every spelling of the path hashes
-    as absent and a test comparing two spellings would agree for the
-    wrong reason.
+    The reference is written with its index, because the key hashes
+    the index rather than the sequence, so the index the key reads is
+    the one written here rather than one the key writes.
     """
 
     pytest.importorskip("polars")
@@ -490,6 +489,79 @@ def test_window_columns_should_partition_the_rows_by_contig_for_any_window_set(r
         assert all(rows[index][0] == str(chrom) for index in indices)
     held = [int(index) for _, indices in groups for index in indices]
     assert sorted(held) == list(range(len(rows)))
+
+
+@pytest.mark.parametrize(
+    "chosen,platform_methods,expected",
+    [
+        ("fork", ["fork", "spawn"], "memory"),
+        ("spawn", ["fork", "spawn"], "mapped"),
+        ("forkserver", ["fork", "spawn"], "mapped"),
+        (None, ["fork", "spawn"], "memory"),
+        (None, ["spawn", "fork"], "mapped"),
+    ],
+)
+def test_resolve_residency_should_resolve_none_by_the_start_method(
+    mocker, chosen, platform_methods, expected
+):
+    """Test what ``None`` resolves to.
+
+    Given:
+        A start method chosen, or none chosen on a platform whose
+        default is ``fork`` or ``spawn``.
+    When:
+        ``None`` is resolved.
+    Then:
+        It should answer ``"memory"`` under ``fork``, chosen or the
+        platform's default, and ``"mapped"`` under any other.
+    """
+
+    # Arrange
+    mocker.patch.object(multiprocessing, "get_start_method", return_value=chosen)
+    mocker.patch.object(
+        multiprocessing, "get_all_start_methods", return_value=platform_methods
+    )
+
+    # Act
+    resolved = cache.resolve_residency(None)
+
+    # Assert
+    assert resolved == expected
+
+
+@pytest.mark.parametrize("residency", cache.RESIDENCIES)
+def test_resolve_residency_should_answer_a_residency_as_given(residency):
+    """Test that a named residency is kept.
+
+    Given:
+        A member of `RESIDENCIES`.
+    When:
+        It is resolved.
+    Then:
+        It should answer it unchanged.
+    """
+
+    # Act
+    resolved = cache.resolve_residency(residency)
+
+    # Assert
+    assert resolved == residency
+
+
+def test_resolve_residency_should_raise_value_error_for_an_unknown_residency():
+    """Test the refusal of a residency that is no residency.
+
+    Given:
+        A residency outside the legal domain.
+    When:
+        It is resolved.
+    Then:
+        It should raise `ValueError` naming the legal values.
+    """
+
+    # Act & assert
+    with pytest.raises(ValueError, match="residency must be one of 'memory', 'mapped'"):
+        cache.resolve_residency("disk")
 
 
 def test_group_track_should_index_its_offsets_by_window_alone(tracks):
@@ -1804,6 +1876,7 @@ class TestWindowSignalCache:
         # Assert
         assert os.path.dirname(made.mapped_dir) == tempfile.gettempdir()
 
+    @pytest.mark.workers
     def test_from_arrays_should_leave_its_scratch_when_a_forked_child_exits(self):
         """Test that a forked child exiting does not delete the arrays.
 
@@ -3197,34 +3270,55 @@ def test_window_cache_key_should_notice_a_reference_with_another_index(tmp_path)
     assert cache.window_cache_key(**given) != before
 
 
-def test_window_cache_key_should_notice_a_reference_with_no_index(tmp_path):
-    """Test two unindexed references at different paths.
+def test_window_cache_key_should_index_a_reference_before_hashing_it(tmp_path):
+    """Test a reference written without a FASTA index.
 
     Given:
-        Two references with no FASTA index beside either, and the same
-        reference once an index is written for it.
+        A reference with no index beside it.
     When:
-        Keys are taken for each.
+        A key is taken, and taken again now that an index may exist.
     Then:
-        The two paths should key differently and indexing one should
-        move its key, so an unindexed reference is still identified by
-        where it is -- the index being what identifies it better.
+        An index should be beside the reference after the first key,
+        and the two keys should agree, so a build that indexes the
+        reference does not leave its entry under a key no later run
+        takes.
     """
 
     # Arrange
-    first = builders.write_fasta(str(tmp_path / "a.fa"), {"chr1": 600}, index=False)
-    second = builders.write_fasta(str(tmp_path / "b.fa"), {"chr1": 600}, index=False)
-    arguments = inputs(tmp_path)
+    reference = builders.write_fasta(str(tmp_path / "a.fa"), {"chr1": 600}, index=False)
+    arguments = dict(inputs(tmp_path), sequences=reference)
 
     # Act
-    one = cache.window_cache_key(**dict(arguments, sequences=first))
-    other = cache.window_cache_key(**dict(arguments, sequences=second))
-    builders.write_fasta(str(tmp_path / "a.fa"), {"chr1": 600}, index=True)
-    indexed = cache.window_cache_key(**dict(arguments, sequences=first))
+    first = cache.window_cache_key(**arguments)
+    second = cache.window_cache_key(**arguments)
 
     # Assert
-    assert one != other
-    assert one != indexed
+    assert os.path.exists(reference + ".fai")
+    assert first == second
+
+
+def test_window_cache_key_should_raise_when_the_reference_cannot_be_indexed(
+    tmp_path, unindexable_fasta
+):
+    """Test a reference with no index in a directory nothing can be written to.
+
+    Given:
+        A reference that has no index and can be given none.
+    When:
+        A key is taken.
+    Then:
+        It should raise `OSError` naming the reference and the command
+        that indexes it, rather than key an entry no training read can
+        use.
+    """
+
+    # Arrange
+    arguments = dict(inputs(tmp_path), sequences=unindexable_fasta)
+
+    # Act & assert
+    with pytest.raises(OSError, match="samtools faidx") as raised:
+        cache.window_cache_key(**arguments)
+    assert unindexable_fasta in str(raised.value)
 
 
 def test_window_cache_key_should_change_when_the_bound_columns_do(tmp_path):
@@ -3796,6 +3890,155 @@ def test_window_cache_key_should_take_no_argument_that_cannot_change_an_entry():
     )
 
 
+@pytest.mark.parametrize("label", ["peaks", "negatives", "exclusion_lists"])
+def test_window_cache_key_should_read_a_single_path_as_one_file(tmp_path, label):
+    """Test that one locus path is one file, never its characters.
+
+    Given:
+        A key's inputs, and for one locus argument a single path and a
+        one-element list of the same path.
+    When:
+        Keys are taken for each.
+    Then:
+        They should be equal, and differ from the key taken without
+        the file.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    path = builders.write_bed(str(tmp_path / "regions.bed"), [("chr1", 40, 60)])
+    without = dict(given, **{label: None})
+
+    # Act
+    single = cache.window_cache_key(**dict(given, **{label: path}))
+    listed = cache.window_cache_key(**dict(given, **{label: [path]}))
+
+    # Assert
+    assert single == listed
+    assert single != cache.window_cache_key(**without)
+
+
+@pytest.mark.parametrize("label", ["signals", "controls"])
+def test_window_cache_key_should_raise_type_error_for_a_single_track(tmp_path, label):
+    """Test that a track argument refuses one track by type.
+
+    Given:
+        A key's inputs with one track argument given as a bare path.
+    When:
+        A key is taken.
+    Then:
+        It should raise `TypeError` naming the argument and saying it
+        reads one track per channel, as a build over the same argument
+        would, rather than key the path as a one-track list.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+
+    # Act & assert
+    with pytest.raises(TypeError, match="one track per channel: `{}`".format(label)):
+        cache.window_cache_key(**dict(given, **{label: given["signals"][0]}))
+
+
+@pytest.mark.parametrize("label", ["signals", "controls"])
+def test_window_cache_key_should_take_a_generator_of_tracks_as_its_list(tmp_path, label):
+    """Test a track argument that can be walked only once.
+
+    Given:
+        A key's inputs with one track argument given as a generator of
+        track paths, and as the list of the same paths.
+    When:
+        A key is taken for each.
+    Then:
+        They should be equal, as a build reads the two alike.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    paths = given["signals"] * 2
+
+    # Act
+    generated = cache.window_cache_key(
+        **dict(given, **{label: (path for path in paths)})
+    )
+    listed = cache.window_cache_key(**dict(given, **{label: paths}))
+
+    # Assert
+    assert generated == listed
+
+
+def test_window_cache_key_should_follow_the_content_of_a_single_exclusion_path(
+    tmp_path,
+):
+    """Test that a lone exclusion list is hashed by what it holds.
+
+    Given:
+        An exclusion list given as a single path.
+    When:
+        A key is taken, the file is rewritten with another region, and
+        a key is taken again.
+    Then:
+        The keys should differ, because an entry built under one
+        exclusion list describes other windows than one built under
+        another.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    path = builders.write_bed(str(tmp_path / "regions.bed"), [("chr1", 40, 60)])
+    before = cache.window_cache_key(**given, exclusion_lists=path)
+
+    # Act
+    builders.write_bed(path, [("chr1", 300, 360)])
+    after = cache.window_cache_key(**given, exclusion_lists=path)
+
+    # Assert
+    assert before != after
+
+
+@pytest.mark.parametrize(
+    "label", ["peaks", "negatives", "exclusion_lists", "signals", "controls"]
+)
+def test_window_cache_key_should_raise_type_error_for_an_input_held_in_memory(
+    tmp_path, label
+):
+    """Test the refusal of an input that is no file.
+
+    Given:
+        A key's inputs with one file argument given as a polars frame,
+        as a pandas frame, and as a list holding a frame.
+    When:
+        A key is taken for each.
+    Then:
+        It should raise `TypeError` naming the argument, rather than
+        hash a frame's column names as paths: a frame inside a list as
+        no file, saying ``cache_dir=False`` reads it, and a bare frame
+        the same way for a locus argument and as no sequence of tracks
+        for a track argument.
+    """
+
+    # Arrange
+    pandas = pytest.importorskip("pandas")
+    given = inputs(tmp_path)
+    columns = {"chrom": ["chr1"], "start": [8], "end": [16]}
+    no_file = "`{}` must be a str.*cache_dir=False".format(label)
+    bare = (
+        "`{}` must be a sequence".format(label)
+        if label in ("signals", "controls")
+        else no_file
+    )
+    held = [
+        (polars.DataFrame(columns), bare),
+        (pandas.DataFrame(columns), bare),
+        ([polars.DataFrame(columns)], no_file),
+    ]
+
+    # Act & assert
+    for value, message in held:
+        with pytest.raises(TypeError, match=message):
+            cache.window_cache_key(**dict(given, **{label: value}))
+
+
 def test_write_window_cache_should_commit_an_entry_the_package_verifies(
     tmp_path, tracks
 ):
@@ -4333,3 +4576,445 @@ def test_read_window_cache_should_miss_a_track_parked_where_an_entry_goes(
 
     # Act & assert
     assert cache.read_window_cache(str(tmp_path), "akey") is None
+
+
+def bounded_windows(rows, margin=4):
+    """Return a window frame carrying both bound pairs a cache is built over.
+
+    Each row's ``(chrom, start, end)`` is its output window, and its
+    input window is ``margin`` wider on both sides.
+    """
+
+    return window_frame(rows).with_columns(
+        (polars.col("sig_start") - margin).alias("in_start"),
+        (polars.col("sig_end") + margin).alias("in_end"),
+    )
+
+
+def test_joint_windows_should_put_the_peaks_first_and_the_negatives_after():
+    """Test the row order of the one window set a cache is built over.
+
+    Given:
+        Two peak windows and three negative windows.
+    When:
+        They are joined.
+    Then:
+        The frame should hold the peaks in their order and then the
+        negatives in theirs.
+    """
+
+    # Arrange
+    peaks = window_frame([("chr1", 8, 16), ("chr2", 0, 8)])
+    negatives = window_frame([("chr1", 100, 108), ("chr1", 200, 208), ("chr2", 40, 48)])
+
+    # Act
+    joint = cache.joint_windows(peaks, negatives)
+
+    # Assert
+    assert joint.rows() == peaks.rows() + negatives.rows()
+    assert joint.schema == peaks.schema
+
+
+def test_window_cache_should_build_once_and_read_the_entry_afterwards(tmp_path, tracks):
+    """Test the two paths of the one call for a persisted cache.
+
+    Given:
+        An empty cache directory, a key, and a window callable that
+        counts its calls.
+    When:
+        The cache is asked for twice.
+    Then:
+        The first call should take the windows, commit an entry under
+        the key and answer the callable's report, the second should
+        answer without calling for the windows and with no report, and
+        both should answer the same frames and the same signal at
+        every window.
+    """
+
+    # Arrange
+    peaks = bounded_windows([("chr1", 8, 16)])
+    negatives = bounded_windows([("chr2", 0, 8), ("chr1", 396, 404)])
+    calls = []
+
+    def windows():
+        calls.append(1)
+        return peaks, negatives, "built"
+
+    # Act
+    built = cache.window_cache("akey", windows, tracks, cache_dir=str(tmp_path))
+    read = cache.window_cache("akey", windows, tracks, cache_dir=str(tmp_path))
+
+    # Assert
+    assert len(calls) == 1
+    assert quadrat.require_complete(str(tmp_path / "akey")) == str(tmp_path / "akey")
+    assert (built[4], read[4]) == ("built", None)
+    for entry in (built, read):
+        assert entry[0].equals(peaks)
+        assert entry[1].equals(negatives)
+        assert entry[3] is None
+    for index in range(3):
+        assert torch.equal(built[2].window(index, 0, 8), read[2].window(index, 0, 8))
+    assert built[2].window(0, 0, 8)[:, 2:5].tolist() == [
+        [1.0, 0.0, 3.0],
+        [0.0, 5.0, 0.0],
+    ]
+
+
+def test_window_cache_should_address_a_negative_by_its_joint_row(tracks):
+    """Test that the caches are built over the joined window set.
+
+    Given:
+        One peak window, and one negative window on another contig.
+    When:
+        The cache is built and read at the negative's joint row.
+    Then:
+        It should answer the signal the tracks hold at the negative.
+    """
+
+    # Arrange
+    peaks = bounded_windows([("chr1", 8, 16)])
+    negatives = bounded_windows([("chr2", 0, 8)])
+
+    # Act
+    _, _, signal, _, _ = cache.window_cache(
+        None, lambda: (peaks, negatives, None), tracks
+    )
+    read = signal.window(len(peaks), 0, 8)
+
+    # Assert
+    assert read[0].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0]
+    assert not read[1].any()
+
+
+@pytest.mark.parametrize("residency", cache.RESIDENCIES)
+def test_window_cache_should_group_controls_over_the_input_window(
+    tmp_path, tracks, residency
+):
+    """Test which bounds each of the two caches is built between.
+
+    Given:
+        A window whose input bounds reach four bases past its output
+        bounds, over tracks with a row inside the wider span only, and
+        the same tracks given as controls.
+    When:
+        The cache is built, and read back from its entry, in either
+        residency.
+    Then:
+        The control cache should hold the row over the input window,
+        at its offset from the input start, and the signal cache
+        should hold nothing over the output window.
+    """
+
+    # Arrange
+    peaks = bounded_windows([("chr1", 13, 21)])
+    negatives = bounded_windows([])
+
+    # Act
+    entries = [
+        cache.window_cache(
+            "ckey",
+            lambda: (peaks, negatives, None),
+            tracks,
+            controls=tracks,
+            cache_dir=str(tmp_path),
+            residency=residency,
+        )
+        for _ in range(2)
+    ]
+
+    # Assert
+    for _, _, signal, control, _ in entries:
+        assert not signal.window(0, 0, 8).any()
+        assert control.n_channels == 2
+        assert control.window(0, 0, 16)[0].tolist() == [0.0, 1.0, 0.0, 3.0] + [0.0] * 12
+        assert control.window(0, 0, 16)[1].tolist() == [0.0, 0.0, 5.0] + [0.0] * 13
+
+
+def test_window_cache_should_neither_read_nor_write_when_the_key_is_none(
+    tmp_path, tracks, monkeypatch
+):
+    """Test the path that persists nothing.
+
+    Given:
+        A default cache directory that does not exist, and no key.
+    When:
+        The cache is asked for twice.
+    Then:
+        The windows should be taken both times, the caches should
+        read the tracks, and no directory should have been made.
+    """
+
+    # Arrange
+    root = tmp_path / "untouched"
+    monkeypatch.setenv("QUADRAT_CACHE_DIR", str(root))
+    peaks = bounded_windows([("chr1", 8, 16)])
+    calls = []
+
+    def windows():
+        calls.append(1)
+        return peaks, bounded_windows([]), None
+
+    # Act
+    first = cache.window_cache(None, windows, tracks, residency="memory")
+    cache.window_cache(None, windows, tracks, residency="memory")
+
+    # Assert
+    assert len(calls) == 2
+    assert first[2].window(0, 0, 8)[0].tolist() == [
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        3.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+    assert not root.exists()
+
+
+def test_window_cache_should_use_the_default_directory_when_none_is_named(
+    tmp_path, tracks, monkeypatch
+):
+    """Test where an entry goes when the caller names no directory.
+
+    Given:
+        A default cache directory named through the environment.
+    When:
+        The cache is asked for with a key and no directory.
+    Then:
+        The entry should verify complete under the default directory.
+    """
+
+    # Arrange
+    monkeypatch.setenv("QUADRAT_CACHE_DIR", str(tmp_path / "default"))
+    peaks = bounded_windows([("chr1", 8, 16)])
+
+    # Act
+    cache.window_cache("dkey", lambda: (peaks, bounded_windows([]), None), tracks)
+
+    # Assert
+    root = os.path.join(cache.default_cache_dir(), "dkey")
+    assert quadrat.require_complete(root) == root
+
+
+def test_window_cache_should_answer_the_build_when_the_entry_cannot_be_written(
+    tmp_path, tracks
+):
+    """Test a cache directory nothing can be committed to.
+
+    Given:
+        A cache directory whose path runs through a regular file.
+    When:
+        The cache is asked for.
+    Then:
+        It should answer the caches it built, reading the tracks,
+        because an unwritable cache is a slower run and not an error.
+    """
+
+    # Arrange
+    blocker = tmp_path / "file"
+    blocker.write_text("not a directory")
+    peaks = bounded_windows([("chr1", 8, 16)])
+
+    # Act
+    _, _, signal, control, _ = cache.window_cache(
+        "wkey",
+        lambda: (peaks, bounded_windows([]), None),
+        tracks,
+        cache_dir=str(blocker / "entries"),
+    )
+
+    # Assert
+    assert control is None
+    assert signal.window(0, 0, 8)[1].tolist() == [0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0]
+    assert blocker.read_text() == "not a directory"
+
+
+def test_window_cache_should_raise_value_error_for_an_unknown_residency(
+    tmp_path, tracks
+):
+    """Test the refusal of a residency that is no residency.
+
+    Given:
+        A residency outside the legal domain, a key, and a window
+        callable that counts its calls.
+    When:
+        The cache is asked for.
+    Then:
+        It should raise `ValueError` naming the argument, before the
+        windows are taken or anything is written.
+    """
+
+    # Arrange
+    calls = []
+
+    def windows():
+        calls.append(1)
+        return bounded_windows([("chr1", 8, 16)]), bounded_windows([]), None
+
+    # Act & assert
+    with pytest.raises(ValueError, match="residency must be one of"):
+        cache.window_cache(
+            "rkey", windows, tracks, cache_dir=str(tmp_path), residency="disk"
+        )
+    assert calls == []
+    assert os.listdir(str(tmp_path)) == []
+
+
+def test_window_cache_should_raise_type_error_when_the_factory_is_not_callable(
+    tmp_path, tracks
+):
+    """Test the refusal of window frames given where their factory belongs.
+
+    Given:
+        An entry already written under a key, and the window frame pair
+        itself given in place of the callable that returns it.
+    When:
+        The cache is asked for under that key.
+    Then:
+        It should raise `TypeError` naming the factory, although the
+        entry would have answered without calling it.
+    """
+
+    # Arrange
+    pair = (bounded_windows([("chr1", 8, 16)]), bounded_windows([]))
+    cache.window_cache("fkey", lambda: pair + (None,), tracks, cache_dir=str(tmp_path))
+
+    # Act & assert
+    with pytest.raises(TypeError, match="windows_factory .* callable; got tuple"):
+        cache.window_cache("fkey", pair, tracks, cache_dir=str(tmp_path))
+
+
+def test_window_cache_should_group_the_signal_over_the_bound_columns_given(tracks):
+    """Test that the signal bounds are the caller's to name.
+
+    Given:
+        A window whose input bounds reach four bases past its output
+        bounds, over tracks with a row inside the wider span only.
+    When:
+        The cache is built over the default bounds and over the input
+        bounds.
+    Then:
+        The first signal cache should hold nothing and the second the
+        row at its offset from the input start.
+    """
+
+    # Arrange
+    peaks = bounded_windows([("chr1", 13, 21)])
+
+    def windows():
+        return peaks, bounded_windows([]), None
+
+    # Act
+    narrow = cache.window_cache(None, windows, tracks, residency="memory")[2]
+    wide = cache.window_cache(
+        None,
+        windows,
+        tracks,
+        residency="memory",
+        bound_columns=("in_start", "in_end"),
+    )[2]
+
+    # Assert
+    assert not narrow.window(0, 0, 8).any()
+    assert wide.window(0, 0, 16)[0].tolist() == [0.0, 1.0, 0.0, 3.0] + [0.0] * 12
+
+
+def test_window_cache_should_make_its_scratch_directory_where_it_is_told(
+    tmp_path, tracks
+):
+    """Test that a mapped build without an entry honours ``scratch_dir``.
+
+    Given:
+        No key, the mapped residency, and a scratch directory named.
+    When:
+        The cache is built with controls.
+    Then:
+        Both caches should be mapped from directories inside the one
+        named.
+    """
+
+    # Arrange
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    peaks = bounded_windows([("chr1", 8, 16)])
+
+    # Act
+    _, _, signal, control, _ = cache.window_cache(
+        None,
+        lambda: (peaks, bounded_windows([]), None),
+        tracks,
+        controls=tracks,
+        residency="mapped",
+        scratch_dir=str(scratch),
+    )
+
+    # Assert
+    for built in (signal, control):
+        assert os.path.dirname(built.mapped_dir) == str(scratch)
+
+
+def test_window_cache_should_answer_a_memory_build_without_reading_its_entry(
+    tmp_path, tracks, mocker
+):
+    """Test that a build held in memory is not loaded a second time.
+
+    Given:
+        An empty cache directory, a key, and the in-memory residency.
+    When:
+        The cache is built, and then asked for again.
+    Then:
+        The build should load no array, answering the arrays it
+        grouped, and a hit on the entry it committed should load them
+        and read the same signal.
+    """
+
+    # Arrange
+    loads = mocker.spy(numpy, "load")
+    peaks = bounded_windows([("chr1", 8, 16)])
+
+    def windows():
+        return peaks, bounded_windows([]), None
+
+    # Act
+    built = cache.window_cache(
+        "mkey", windows, tracks, cache_dir=str(tmp_path), residency="memory"
+    )
+    loaded_on_build = loads.call_count
+    hit = cache.window_cache(
+        "mkey", windows, tracks, cache_dir=str(tmp_path), residency="memory"
+    )
+
+    # Assert
+    assert loaded_on_build == 0
+    assert loads.call_count > 0
+    assert torch.equal(built[2].window(0, 0, 8), hit[2].window(0, 0, 8))
+
+
+def test_window_cache_should_map_a_mapped_build_from_its_entry(tmp_path, tracks):
+    """Test where a mapped build's arrays live once its entry is written.
+
+    Given:
+        An empty cache directory, a key, and the mapped residency.
+    When:
+        The cache is built.
+    Then:
+        The signal cache should be mapped from the committed entry, as
+        a hit would be, rather than from a scratch copy.
+    """
+
+    # Arrange
+    peaks = bounded_windows([("chr1", 8, 16)])
+
+    # Act
+    signal = cache.window_cache(
+        "pkey",
+        lambda: (peaks, bounded_windows([]), None),
+        tracks,
+        cache_dir=str(tmp_path),
+        residency="mapped",
+    )[2]
+
+    # Assert
+    assert signal.mapped_dir == os.path.join(str(tmp_path), "pkey", "signal")

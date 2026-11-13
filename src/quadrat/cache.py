@@ -2,7 +2,10 @@
 
 Provides `WindowSignalCache`, `group_track` that produces the arrays a
 cache holds, `window_group_sums` for per-window totals over the same
-rows, the functions that key, write and read a persisted entry, and
+rows, the functions that key, write and read a persisted entry,
+`window_cache` that reads an entry or builds it, `joint_windows` that
+lays peaks and negatives out as one window set,
+`resolve_residency` that decides where a cache keeps its arrays, and
 `require_windows`, `track_list` and `window_columns`, the argument
 checks and the window decomposition this package's readers of window
 sets share.
@@ -29,10 +32,11 @@ from quadrat._engine import (
     WINDOWS_TABLE,
     fspath_or_none,
     import_on_first_use,
+    item_list,
     registered_frames,
     transpile_intervals,
 )
-from quadrat.stores import ProcessLocalHandles, track_frame
+from quadrat.stores import ProcessLocalHandles, SequenceStore, track_frame
 from quadrat.tables import (
     MANIFEST_VERSION,
     commit_directory,
@@ -107,6 +111,11 @@ _ARRAY_NAMES = tuple(name for name, _, _ in _ARRAY_WIDTHS)
 
 
 _NPY_HEADER_BYTES = 128
+
+#: The bounds a control is grouped over, i.e., the input window, where
+#: `group_track` defaults to the output window a signal is grouped
+#: over.
+_CONTROL_BOUND_COLUMNS = ("in_start", "in_end")
 
 #: Prefixed to every key. `window_cache_key`'s notes say why.
 _KEY_DOMAIN = b"quadrat-window-cache\x00"
@@ -290,7 +299,7 @@ class WindowSignalCache(ProcessLocalHandles):
         growth `default_cache_dir` documents.
         """
 
-        resolved = _resolve_residency(residency)
+        resolved = resolve_residency(residency)
         offsets, pos, val, chan, n_channels = arrays
         _refuse_inconsistent_arrays(offsets, pos, val, chan, n_channels)
         if resolved == "memory":
@@ -432,9 +441,9 @@ class WindowSignalCache(ProcessLocalHandles):
         if perm is not None:
             perm = numpy.asarray(perm)
             # Checked rather than trusted; the notes say why.
-            if perm.shape != (self.n_channels,) or sorted(
-                int(value) for value in perm
-            ) != list(range(self.n_channels)):
+            if perm.shape != (self.n_channels,) or not numpy.array_equal(
+                numpy.sort(perm), numpy.arange(self.n_channels)
+            ):
                 raise ValueError(
                     "perm must be a permutation of range({}), got {!r}.".format(
                         self.n_channels, numpy.asarray(perm).tolist()
@@ -560,20 +569,38 @@ def window_cache_key(
     ``signals`` and ``controls`` is part of the identity because it is
     the channel axis.
 
-    :param signals: The signal tracks, in channel order.
+    Every input is a file, and one held in memory, whether a locus
+    set, an exclusion list or a track, is refused rather than keyed.
+
+    **The reference is indexed before it is hashed.** A reference with
+    no FASTA index has one written beside it, as
+    `quadrat.stores.SequenceStore.contig_lengths` writes it, so the key
+    is the one a build over the reference, which indexes it, leaves
+    behind. A reference that exists and cannot be indexed, nothing
+    being writable beside it, is refused, since a training read takes
+    its sequence through the index. A reference that does not exist is
+    keyed by its path and an absent index, and left for whatever reads
+    it to refuse.
+
+    :param signals: The signal tracks, in channel order, as
+        `track_list` takes them, each a path. A single path is refused
+        rather than read as one track.
     :param sequences: The reference, as a `str`, `bytes` or
-        `os.PathLike`.
-    :param peaks: The peak locus file, or an iterable of them.
-    :param negatives: The background locus file, or an iterable.
+        `os.PathLike`, indexed as stated above.
+    :param peaks: The peak locus file, as a `str`, `bytes` or
+        `os.PathLike`, or a `list` or `tuple` of them. A single path
+        is one file, never its characters. ``None`` is no file.
+    :param negatives: The background locus file or files, as
+        ``peaks``.
     :param chroms: The contig subset, or ``None`` for all.
     :param in_window: The input window's width, in bases.
     :param out_window: The output window's width, in bases.
-    :param max_jitter: The largest offset a draw may be shifted by, in
-        bases.
+    :param max_jitter: The jitter margin, in bases, as
+        `quadrat.loci.load_windows` takes it.
     :param summits: Whether the windows are centred on the peaks'
         summits.
-    :param exclusion_lists: The exclusion locus files, or ``None``.
-        Each is hashed by content, as a peak file is.
+    :param exclusion_lists: The exclusion locus file or files, as
+        ``peaks``. Each is hashed by content, as a peak file is.
     :param min_counts: The lower count threshold, or ``None``. A
         number, a per-group sequence, or anything `numpy.asarray`
         reads as either, so a threshold taken from
@@ -581,7 +608,7 @@ def window_cache_key(
     :param max_counts: The upper count threshold, as ``min_counts``.
     :param signal_groups: How the signal channels are grouped, or
         ``None``.
-    :param controls: The control tracks, in channel order, or ``None``.
+    :param controls: The control tracks, as ``signals``, or ``None``.
     :param control_groups: How the control channels are grouped, as
         ``signal_groups``.
     :param bound_columns: The window's start and end column names, as
@@ -590,7 +617,11 @@ def window_cache_key(
         from the same inputs over different windows are different
         entries.
     :returns: The key, as a hex `str`.
-    :raises TypeError: if ``sequences`` is not a path.
+    :raises TypeError: if ``sequences`` is not a path; if a locus set,
+        an exclusion list or a track is given as anything but a path; or
+        if ``signals`` or ``controls`` is anything `track_list` refuses.
+    :raises OSError: if the reference exists and has no usable index,
+        and none can be written beside it, or cannot be read.
 
     .. rubric:: Implementation notes
 
@@ -604,6 +635,11 @@ def window_cache_key(
     The reference is hashed through its index, not its sequence --
     tens of kilobytes against gigabytes -- and `chrom_lengths` reads
     the index too, so it is the part that decides anything here.
+
+    It is indexed first because the build writes an index where there
+    is none, after the key is taken: a key over the absent index would
+    file the first build's entry under a key no later run, which finds
+    the index, ever takes again.
 
     The domain tag `_KEY_DOMAIN` names this package, so two packages
     that group the same tracks the same way never read each other's
@@ -628,13 +664,15 @@ def window_cache_key(
 
     for label, loci in (("peaks", peaks), ("negatives", negatives)):
         digest.update(label.encode())
-        named = fspath_or_none(loci)
-        for path in [named] if named is not None else list(loci or ()):
+        for path in _key_paths(label, [] if loci is None else item_list(loci)):
             digest.update(os.path.abspath(path).encode())
             _hash_file(digest, path)
 
     digest.update(b"sequences")
     digest.update(os.path.abspath(reference).encode())
+    # Indexed first, as the docstring states.
+    if os.path.exists(reference):
+        SequenceStore(reference).contig_lengths()
     # The index rather than `reference` itself, for the reason in the
     # notes, and through the normalized path: a name spelled with `str`
     # from a `bytes` reference is a repr naming no file, and every
@@ -661,13 +699,15 @@ def window_cache_key(
     )
 
     digest.update(b"exclusion")
-    for path in list(exclusion_lists or ()):
+    excluded = [] if exclusion_lists is None else item_list(exclusion_lists)
+    for path in _key_paths("exclusion_lists", excluded):
         digest.update(os.path.abspath(path).encode())
         _hash_file(digest, path)
 
     for label, tracks in (("signals", signals), ("controls", controls)):
         digest.update(label.encode())
-        for path in list(tracks or ()):
+        listed = [] if tracks is None else track_list("window_cache_key", label, tracks)
+        for path in _key_paths(label, listed):
             _hash_track(digest, path)
 
     return digest.hexdigest()
@@ -855,6 +895,149 @@ def write_window_cache(
         return None
 
 
+def window_cache(
+    key,
+    windows_factory,
+    signals,
+    controls=None,
+    cache_dir=None,
+    residency=None,
+    bound_columns=("sig_start", "sig_end"),
+    scratch_dir=None,
+):
+    """Return the entry ``key`` names, read where one is persisted and built where not.
+
+    A verifiable entry under ``key`` is answered as `read_window_cache`
+    answers it, and ``windows_factory`` is not called. Otherwise the
+    two window frames are taken from ``windows_factory``, the tracks
+    are grouped over their `joint_windows`, and the result is committed
+    as `write_window_cache` commits it. A build answers the values a
+    later hit on its entry answers, in the residency ``residency``
+    resolves to: ``"memory"`` holds the arrays it grouped, and
+    ``"mapped"`` maps the committed entry as a hit would, or, where the
+    commit fails or ``key`` is ``None``, a scratch directory as
+    `WindowSignalCache.from_arrays` makes one. Nothing is persisted
+    where the commit fails.
+
+    The signals are grouped over each window's ``bound_columns`` and
+    the controls over its ``in_start`` and ``in_end``.
+
+    A hit needs nothing of the ``pileup`` extra. A build needs it, and
+    is unsupported concurrently in one process, as `group_track` states.
+
+    Whatever ``windows_factory`` or `group_track` raises on a build
+    propagates.
+
+    :param key: The key, from `window_cache_key` over the same
+        ``bound_columns``, or ``None`` to neither read nor write an
+        entry.
+    :param windows_factory: A callable taking no argument and returning
+        ``(peak_windows, negative_windows, report)``: two frames with
+        the columns `quadrat.loci.load_windows` returns, and whatever
+        the caller wants back from a build. Called once, and only where
+        no entry is read.
+    :param signals: One track per signal channel, in channel order, as
+        `group_track` takes them. Read only where no entry is.
+    :param controls: The same for the controls, or ``None``.
+    :param cache_dir: The directory holding entries, or ``None`` for
+        `default_cache_dir`. Unused where ``key`` is ``None``.
+    :param residency: As `WindowSignalCache.build` takes it.
+    :param bound_columns: The window's start and end column names the
+        signals are grouped over, as `group_track` takes them.
+    :param scratch_dir: As `WindowSignalCache.build` takes it, for a
+        build answered from a scratch directory.
+    :returns: ``(peak_windows, negative_windows, signal_cache,
+        control_cache, report)``: the fourth ``None`` without controls,
+        and the fifth the ``report`` ``windows_factory`` returned, or
+        ``None`` where an entry was read. Window ``i`` of either cache
+        is row ``i`` of the `joint_windows` of the two frames.
+    :raises TypeError: if ``windows_factory`` is not callable.
+    :raises ValueError: if ``residency`` is neither a member of
+        `RESIDENCIES` nor ``None``.
+
+    .. rubric:: Implementation notes
+
+    A ``"memory"`` build is not read back from the entry it wrote,
+    because reading loads every array again while the grouped ones are
+    still held, which doubles the peak for nothing the grouped arrays
+    do not already answer.
+    """
+
+    # Both ahead of the read, which would otherwise answer a factory
+    # that is not one on a hit and an unknown residency as a miss.
+    if not callable(windows_factory):
+        raise TypeError(
+            "windows_factory is called for the window frames on a build, "
+            "so it must be callable; got {}.".format(type(windows_factory).__name__)
+        )
+    resolved = resolve_residency(residency)
+    if key is not None:
+        if cache_dir is None:
+            cache_dir = default_cache_dir()
+        entry = read_window_cache(cache_dir, key, residency=resolved)
+        if entry is not None:
+            return entry + (None,)
+
+    peak_windows, negative_windows, report = windows_factory()
+    joint = joint_windows(peak_windows, negative_windows)
+    signal_arrays = group_track(joint, signals, bound_columns=bound_columns)
+    control_arrays = (
+        None
+        if controls is None
+        else group_track(joint, controls, bound_columns=_CONTROL_BOUND_COLUMNS)
+    )
+
+    committed = key is not None and (
+        write_window_cache(
+            cache_dir,
+            key,
+            peak_windows,
+            negative_windows,
+            signal_arrays,
+            control_arrays,
+        )
+        is not None
+    )
+    if committed and resolved == "mapped":
+        entry = read_window_cache(cache_dir, key, residency=resolved)
+        if entry is not None:
+            return entry + (report,)
+
+    return (
+        peak_windows,
+        negative_windows,
+        WindowSignalCache.from_arrays(
+            signal_arrays, residency=resolved, scratch_dir=scratch_dir
+        ),
+        (
+            None
+            if control_arrays is None
+            else WindowSignalCache.from_arrays(
+                control_arrays, residency=resolved, scratch_dir=scratch_dir
+            )
+        ),
+        report,
+    )
+
+
+def joint_windows(peak_windows, negative_windows):
+    """Return peak and negative windows as the one window set a cache is built over.
+
+    The peaks come first, in row order, and the negatives follow in
+    theirs, so negative ``i`` is row ``len(peak_windows) + i``.
+
+    :param peak_windows: The peak window frame, as a
+        `polars.DataFrame`.
+    :param negative_windows: The negative window frame, of the same
+        columns and dtypes.
+    :returns: A `polars.DataFrame` of ``len(peak_windows) +
+        len(negative_windows)`` rows.
+    """
+
+    polars = import_on_first_use("polars")
+    return polars.concat([peak_windows, negative_windows])
+
+
 def array_meta(arrays):
     """Return what a reader can learn about grouped arrays without reading them.
 
@@ -923,7 +1106,7 @@ def track_list(caller, label, tracks):
 
     This is where a track argument's answer to a single item is
     decided, and it is the opposite of a locus argument's, for the
-    reason `quadrat.loci._locus_sources` gives. Tracks are taken as any
+    reason `quadrat._engine.item_list` gives. Tracks are taken as any
     ordered iterable, and how many there are is the channel axis of everything
     read from them, so one track is written ``[track]``, as
     `quadrat.stores.TrackStore` also requires. It has to be refused by
@@ -1353,6 +1536,93 @@ def window_group_sums(
     return torch.from_numpy(totals.astype(numpy.float32))
 
 
+def resolve_residency(residency=None):
+    """Return where a cache keeps its arrays, resolving ``None`` from the start method.
+
+    `WindowSignalCache.build` states, under ``residency``, the rule
+    ``None`` resolves by.
+
+    :param residency: A member of `RESIDENCIES`, or ``None`` to
+        resolve from the start method.
+    :returns: A member of `RESIDENCIES`.
+    :raises ValueError: if ``residency`` is neither and not ``None``.
+
+    .. rubric:: Implementation notes
+
+    Both residencies are correct and which is faster depends entirely
+    on how loader workers start, so ``None`` asks the start method
+    rather than making the caller state it.
+
+    Under ``fork`` the parent's arrays are already shared
+    copy-on-write, so keeping them in memory costs nothing extra and
+    avoids the page-fault indirection a mapping adds: 210 us per sample
+    against 267 us mapped, on a ten-channel set. Under ``spawn`` there
+    is no sharing to inherit and the arrays would be pickled into every
+    worker, once each -- flat for a mapped cache and linear in cache
+    size otherwise, 9.4 s against 34.7 s to the first batch at four
+    channels, diverging from there.
+
+    Per call rather than frozen at import, because
+    ``multiprocessing.set_start_method`` is idiomatically called from
+    inside ``if __name__ == "__main__":``, after the import that pulled
+    this package in, so a frozen answer samples the platform default
+    and a program that deliberately chose ``fork`` to get the sharing
+    is handed the mapped form anyway.
+
+    The read is ``allow_none=True``, which is a correctness
+    requirement rather than a preference: ``allow_none=False``
+    *assigns* the default context when none has been chosen, so asking
+    the question would answer it, and a caller who had not yet reached
+    their ``set_start_method`` could no longer call it.
+
+    The platform's default, for a method not yet chosen, is read from
+    `multiprocessing.get_all_start_methods`, which documents its first
+    entry as that default and binds nothing. So the answer follows how
+    the program will in fact start its workers even before the program
+    has said so, and asking still does not decide it. The alternative
+    -- treating unchosen as unknown and taking the residency that is
+    correct under either method -- is only slower, but it is slower on
+    the default path of every program that never calls
+    ``set_start_method``, which is most of them.
+    """
+
+    if residency is None:
+        method = multiprocessing.get_start_method(allow_none=True)
+        if method is None:
+            method = multiprocessing.get_all_start_methods()[0]
+        return "memory" if method == "fork" else "mapped"
+    if residency not in RESIDENCIES:
+        raise ValueError(
+            "residency must be one of {} or None, got {!r}.".format(
+                ", ".join(repr(value) for value in RESIDENCIES), residency
+            )
+        )
+    return residency
+
+
+def _key_paths(label, items):
+    """A key's file argument, already a list of items, as a list of path strings.
+
+    :param label: The name of the argument, for the message.
+    :param items: The argument's items, as `quadrat._engine.item_list`
+        or `track_list` answers them.
+    :raises TypeError: if an item is anything but a path.
+    """
+
+    paths = []
+    for item in items:
+        path = fspath_or_none(item)
+        if path is None:
+            raise TypeError(
+                "a persisted window cache is keyed by files, so every item "
+                "of `{}` must be a str, bytes or os.PathLike; got {}. An "
+                "input held in memory has no key: pass cache_dir=False to "
+                "build without an entry.".format(label, type(item).__name__)
+            )
+        paths.append(path)
+    return paths
+
+
 def _threshold(value):
     """A count threshold as the plain floats the key hashes.
 
@@ -1513,7 +1783,7 @@ def _adopted(root, kind, manifest, residency=None):
     directory = os.path.join(root, kind)
     meta = manifest.get("{}_meta".format(kind))
 
-    if _resolve_residency(residency) == "memory":
+    if resolve_residency(residency) == "memory":
         # What `adopt` does on the other branch, less the mapping.
         # Only the size half is wanted here: a header numpy refuses
         # raises out of the `numpy.load` below by itself.
@@ -1590,69 +1860,6 @@ def _reap_scratch(root, owner_pid):
     if os.getpid() != owner_pid:
         return
     shutil.rmtree(root, ignore_errors=True)
-
-
-def _resolve_residency(residency=None):
-    """Where a cache should keep its arrays, resolved on every call.
-
-    `WindowSignalCache.build` states, under ``residency``, the rule
-    ``None`` resolves by; this says why it is that rule.
-
-    Both residencies are correct and which is faster depends entirely
-    on how loader workers start, so ``None`` asks the start method
-    rather than making the caller state it.
-
-    Under ``fork`` the parent's arrays are already shared
-    copy-on-write, so keeping them in memory costs nothing extra and
-    avoids the page-fault indirection a mapping adds: 210 us per sample
-    against 267 us mapped, on a ten-channel set. Under ``spawn`` there
-    is no sharing to inherit and the arrays would be pickled into every
-    worker, once each -- flat for a mapped cache and linear in cache
-    size otherwise, 9.4 s against 34.7 s to the first batch at four
-    channels, diverging from there.
-
-    Per call rather than frozen at import, because
-    ``multiprocessing.set_start_method`` is idiomatically called from
-    inside ``if __name__ == "__main__":``, after the import that pulled
-    this package in, so a frozen answer samples the platform default
-    and a program that deliberately chose ``fork`` to get the sharing
-    is handed the mapped form anyway. The cache directory is read from
-    the environment on every call for the same reason.
-
-    The read is ``allow_none=True``, which is a correctness
-    requirement rather than a preference: ``allow_none=False``
-    *assigns* the default context when none has been chosen, so asking
-    the question would answer it, and a caller who had not yet reached
-    their ``set_start_method`` could no longer call it.
-
-    The platform's default, for a method not yet chosen, is read from
-    `multiprocessing.get_all_start_methods`, which documents its first
-    entry as that default and binds nothing. So the answer follows how
-    the program will in fact start its workers even before the program
-    has said so, and asking still does not decide it. The alternative
-    -- treating unchosen as unknown and taking the residency that is
-    correct under either method -- is only slower, but it is slower on
-    the default path of every program that never calls
-    ``set_start_method``, which is most of them.
-
-    :param residency: A member of `RESIDENCIES`, or ``None`` to
-        resolve from the start method.
-    :returns: A member of `RESIDENCIES`.
-    :raises ValueError: if ``residency`` is neither and not ``None``.
-    """
-
-    if residency is None:
-        method = multiprocessing.get_start_method(allow_none=True)
-        if method is None:
-            method = multiprocessing.get_all_start_methods()[0]
-        return "memory" if method == "fork" else "mapped"
-    if residency not in RESIDENCIES:
-        raise ValueError(
-            "residency must be one of {} or None, got {!r}.".format(
-                ", ".join(repr(value) for value in RESIDENCIES), residency
-            )
-        )
-    return residency
 
 
 @functools.cache
