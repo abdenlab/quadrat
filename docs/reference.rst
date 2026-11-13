@@ -1,7 +1,7 @@
 Reference
 =========
 
-The published surface, in the order a caller meets it: alignments become tracks, and a track is verified before it is read.
+The published surface, in the order a caller meets it: alignments become tracks, a track is verified before it is read, and a specification of how channels are grouped can be checked for being usable.
 
 The pileup
 ----------
@@ -65,6 +65,11 @@ The dtypes are deliberately not narrowed. ``pos`` as ``Int32`` and ``value`` as 
 .. autofunction:: quadrat.track_chrom_path
 
 .. autofunction:: quadrat.read_manifest
+
+Signal groups
+-------------
+
+.. autofunction:: quadrat.validate_signal_groups
 
 The package
 -----------
