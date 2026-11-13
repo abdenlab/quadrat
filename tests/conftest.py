@@ -72,7 +72,8 @@ class Corpus:
     :param in_window: The input window span, or ``None`` where the
         caller asked for no geometry.
     :param out_window: The output window span, or ``None``.
-    :param max_jitter: The largest offset a draw may be shifted by.
+    :param max_jitter: The jitter margin, in bases, as
+        `quadrat.loci.load_windows` takes it.
 
     .. rubric:: Implementation notes
 
@@ -321,9 +322,9 @@ def corpus_factory(tmp_path_factory):
         It must not exceed ``in_window``; the output window sits inside
         the input one, and a swapped pair is otherwise only visible as
         a wrong-shaped tensor much later.
-    :param max_jitter: The largest offset a draw may be shifted by,
-        recorded on the corpus and counted on both sides of the
-        placement check above.
+    :param max_jitter: The jitter margin, in bases, as
+        `quadrat.loci.load_windows` takes it, recorded on the corpus and
+        counted on both sides of the placement check above.
 
     Requesting an alignment or a FASTA index needs ``pysam``, so a call
     that asks for either skips without it. The rest of the surface has

@@ -29,7 +29,7 @@ import pytest
 from quadrat import EngineOptionWarning, tables
 from quadrat import pileup as pileup_pkg
 from quadrat.pileup import track
-from tests import TWO_CONTIGS, bound, builders, digest_track
+from tests import TWO_CONTIGS, bound, builders, digest_track, oracle_pileup
 
 POS_SHIFT, NEG_SHIFT = 4, -4
 
@@ -122,27 +122,6 @@ def shifted_pair(corpus_factory):
             ("rev", "chr1", 300, "20M", 16),
         ],
     )
-
-
-def oracle_pileup(bam_paths, chrom_sizes, pysam, pos_shift, neg_shift, scale=1.0):
-    """bam2bw's loop, densified.
-
-    Every mapped record on a known contig contributes its shifted 5'
-    end; out-of-range sites are dropped.
-    """
-
-    dense = {c: numpy.zeros(n, dtype=numpy.float64) for c, n in chrom_sizes.items()}
-    for path in bam_paths:
-        with pysam.AlignmentFile(path, "rb") as bam:
-            for read in bam.fetch(until_eof=True):
-                if read.is_unmapped or read.reference_name not in dense:
-                    continue
-                start = read.reference_start + pos_shift
-                end = read.reference_end + neg_shift
-                pos = start if read.is_forward else end - 1
-                if 0 <= pos < chrom_sizes[read.reference_name]:
-                    dense[read.reference_name][pos] += 1
-    return {c: v * scale for c, v in dense.items()}
 
 
 def dense_from_parquet(path, chrom_sizes):

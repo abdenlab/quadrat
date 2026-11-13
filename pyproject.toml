@@ -145,6 +145,7 @@ addopts = ["--strict-markers"]
 testpaths = ["tests"]
 markers = [
     "packaging: spawns a fresh interpreter or a real build to observe import-time, exit-time or artifact state",
+    "workers: starts real worker processes, a loader's or a forked child, to observe what crosses the process boundary",
 ]
 
 # Scoped rather than blanket: a deprecation raised inside `quadrat` is a

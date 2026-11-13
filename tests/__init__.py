@@ -5,9 +5,11 @@ drift, and the geometries immutably so a corpus built from one cannot
 alter the geometry a later corpus is built from.
 
 `builders` writes the suite's synthetic data; what lives here is what
-reads it back, states what a reader should answer for it, locates the
-project, or runs a child process, none of which belongs to any one
-module.
+reads it back, states what a reader should answer for it, drains a
+loader, locates the project, or runs a child process, none of which
+belongs to any one module. The sampler configurations the golden digests are recorded
+over are here for the same reason: the plan digests and the batch
+digests are pinned in different modules over one set.
 """
 
 import hashlib
@@ -37,6 +39,51 @@ TWO_CONTIGS = MappingProxyType({"chr1": 1000, "chr2": 500})
 THREE_CONTIGS = MappingProxyType({"chr1": 1000, "chr2": 500, "chr3": 400})
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# The sampler arguments every golden digest is recorded over. The set
+# is not arbitrary: a plan skips its permutation without ``shuffle``,
+# its jitter draw at a ``max_jitter`` of 0 and its orientation draw
+# without ``reverse_complement``, and each skipped call shifts every
+# later one, so each branch has a configuration of its own. Every
+# configuration but ``grouped_ctl`` is the baseline with the arguments
+# of its branch changed. ``grouped_ctl`` changes only the ratio and the
+# seed: the golden corpus has no controls and no group of more than
+# one channel, and the name is upstream's, kept for provenance.
+GOLDEN_BASELINE = MappingProxyType(
+    {
+        "n_peaks": 24,
+        "n_negatives": 8,
+        "negative_ratio": 0.5,
+        "max_jitter": 2,
+        "reverse_complement": True,
+        "shuffle": True,
+        "random_state": 0,
+    }
+)
+GOLDEN_CONFIGS = MappingProxyType(
+    {
+        "baseline": GOLDEN_BASELINE,
+        "grouped_ctl": MappingProxyType(
+            dict(GOLDEN_BASELINE, negative_ratio=0.25, random_state=7)
+        ),
+        "no_jitter": MappingProxyType(dict(GOLDEN_BASELINE, max_jitter=0)),
+        "no_negatives": MappingProxyType(dict(GOLDEN_BASELINE, negative_ratio=0.0)),
+        "no_rc": MappingProxyType(dict(GOLDEN_BASELINE, reverse_complement=False)),
+        "sequential": MappingProxyType(dict(GOLDEN_BASELINE, shuffle=False)),
+    }
+)
+
+# The golden configurations in a fixed order, as test ids.
+CONFIG_IDS = tuple(sorted(GOLDEN_CONFIGS))
+
+# How long a loader with workers may wait on one, so a worker that
+# never answers fails its test rather than stalling the run.
+WORKER_TIMEOUT = 120
+
+#: How long `run_child` waits. A child that never exits would otherwise
+#: hold the whole run until the CI job is cancelled, with the test that
+#: hung named nowhere in the log.
+CHILD_TIMEOUT = 300
 
 # The settings every property test that writes real files runs under.
 # Two decisions live here rather than once per test: the health check
@@ -158,6 +205,49 @@ def one_hot(residues, alphabet="ACGT"):
     return out
 
 
+def dense(rows, sizes=TWO_CONTIGS, dtype=numpy.float32):
+    """Return the per-contig dense arrays one channel's rows imply.
+
+    Rows landing on one position add, as every reader of a track adds
+    them.
+    """
+
+    arrays = {chrom: numpy.zeros(size, dtype=dtype) for chrom, size in sizes.items()}
+    for chrom, pos, value in rows:
+        arrays[chrom][pos] += value
+    return arrays
+
+
+def drain(loader, n_epochs=2):
+    """Return every batch a loader yields over ``n_epochs`` passes, in order.
+
+    Each batch is a tuple of its tensors, cloned, so a batch that is a
+    view of a fetch a loader goes on to reuse is still what it was when
+    it was yielded.
+    """
+
+    batches = []
+    for _ in range(n_epochs):
+        for batch in loader:
+            batches.append(tuple(tensor.clone() for tensor in batch))
+    return batches
+
+
+def same_batches(first, second):
+    """Return whether two drained streams hold equal tensors, batch for batch.
+
+    Equal means the same number of batches, the same number of tensors
+    in each, and every pair of tensors equal in shape, dtype and value.
+    """
+
+    if len(first) != len(second):
+        return False
+    return all(
+        len(a) == len(b) and all(p.dtype == q.dtype and p.equal(q) for p, q in zip(a, b))
+        for a, b in zip(first, second)
+    )
+
+
 def budget(plan, ram_bytes, cores):
     """Return the bytes the workers may share on a machine of this size.
 
@@ -196,10 +286,26 @@ def record_placements(path, pysam, until_eof=False):
         ]
 
 
-#: How long `run_child` waits. A child that never exits would otherwise
-#: hold the whole run until the CI job is cancelled, with the test that
-#: hung named nowhere in the log.
-CHILD_TIMEOUT = 300
+def oracle_pileup(bam_paths, chrom_sizes, pysam, pos_shift, neg_shift, scale=1.0):
+    """Return the dense track per contig that alignments imply, read with pysam.
+
+    bam2bw's loop, densified: every mapped record on a known contig
+    contributes its shifted 5' end, and a site outside its contig is
+    dropped. ``pysam`` is passed in, as it is to `record_placements`.
+    """
+
+    dense = {c: numpy.zeros(n, dtype=numpy.float64) for c, n in chrom_sizes.items()}
+    for path in bam_paths:
+        with pysam.AlignmentFile(path, "rb") as bam:
+            for read in bam.fetch(until_eof=True):
+                if read.is_unmapped or read.reference_name not in dense:
+                    continue
+                start = read.reference_start + pos_shift
+                end = read.reference_end + neg_shift
+                pos = start if read.is_forward else end - 1
+                if 0 <= pos < chrom_sizes[read.reference_name]:
+                    dense[read.reference_name][pos] += 1
+    return {c: v * scale for c, v in dense.items()}
 
 
 def run_child(command, failure, cwd=None, environment=None):
