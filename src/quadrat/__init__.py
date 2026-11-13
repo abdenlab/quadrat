@@ -25,11 +25,11 @@ The vocabulary used throughout:
     Parquet table of ``(position, value)`` pairs for one channel,
     written once by the pileup and read many times by the loader.
 
-    One position per read rather than coverage over the read's span,
-    so *which* position -- a 5' end for ATAC or DNase, a fragment
-    midpoint for ChIP -- is the caller's choice through ``pos_shift``
-    and ``neg_shift`` rather than this package's. The format carries
-    no assay.
+    Which records count and what each contributes (e.g., a 5' end
+    for ATAC or DNase, a fragment midpoint for ChIP, a 3' end for 3'
+    RNA-seq, or coverage over the span) is the caller's choice through
+    an `Aggregate` rather than this package's. The format carries no
+    assay, only what its values mean.
 
 ``draw``
     One ``(locus, jitter offset, strand)`` triple the sampler emits, so
@@ -50,10 +50,24 @@ Anything that joins intervals through it needs it, e.g., building
 tracks from alignments, grouping a track's rows by window, or joining
 windows against exclusion lists; reading a track or a reference by
 coordinate does not.
+
+Three kinds of signal are declined rather than unbuilt. Splice
+junctions and contact maps are not tracks: a junction is a ``(donor,
+acceptor, count)`` relation and a contact map a pairwise matrix,
+neither has a ``(chrom, pos, value)`` shape, and contact maps already
+have a format of their own in ``cooler``. Methylation is declined for
+want of a model that trains on it rather than for want of a way to
+write it: its two counts per position do not fit one ``value``, but a
+sum and a count would fit as two channels. Writing them is what the
+channel split cannot do, since ``quadrat.tables.strand_slices`` and
+``quadrat.tables.track_paths`` name exactly two channels, ``+`` and
+``-``, or one when unstranded; widening that to a list of channels is
+the change that would reopen it.
 """
 
 __all__ = [
     "MANIFEST_VERSION",
+    "Aggregate",
     "EngineOptionWarning",
     "TRACK_SUFFIX",
     "__version__",
@@ -74,7 +88,7 @@ from importlib.metadata import version
 from quadrat._engine import EngineOptionWarning
 from quadrat.alignments import bam_contigs
 from quadrat.groups import validate_signal_groups
-from quadrat.pileup import pileup_alignments, pileup_many
+from quadrat.pileup import Aggregate, pileup_alignments, pileup_many
 from quadrat.reference import chrom_lengths
 from quadrat.tables import (
     MANIFEST_VERSION,
