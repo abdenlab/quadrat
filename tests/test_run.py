@@ -29,9 +29,9 @@ import types
 import joblib
 import pytest
 
-from quadrat import tables
+from quadrat import Aggregate, tables
 from quadrat.pileup import plan, run
-from tests import TWO_CONTIGS, budget, digest_track
+from tests import TWO_CONTIGS, budget, builders, digest_track
 
 
 @pytest.fixture(scope="module")
@@ -40,6 +40,29 @@ def corpus(corpus_factory):
 
     pytest.importorskip("polars_bio")
     return corpus_factory("run", TWO_CONTIGS, n_bams=4, index_fasta=True)
+
+
+@pytest.fixture(scope="module")
+def paired(tmp_path_factory, pysam):
+    """One indexed alignment of forward-reverse mate pairs over two contigs.
+
+    Each mate carries the pair's template length, positive on the
+    forward one, so a midpoint pileup over it counts every pair.
+    """
+
+    header = builders.alignment_header(TWO_CONTIGS)
+    reads = []
+    for i, (chrom, left) in enumerate([("chr1", 100), ("chr1", 400), ("chr2", 50)]):
+        forward = builders.aligned_read(
+            header, "p{}".format(i), chrom, left, "20M", 0x41
+        )
+        reverse = builders.aligned_read(
+            header, "p{}".format(i), chrom, left + 80, "20M", 0x91
+        )
+        forward.template_length, reverse.template_length = 100, -100
+        reads += [forward, reverse]
+    root = tmp_path_factory.mktemp("run-paired")
+    return builders.write_bam(str(root / "paired.bam"), reads, header)
 
 
 @pytest.fixture
@@ -77,9 +100,7 @@ def jobs_for(corpus, out, prefix, unstranded=True):
             "alignments": [bam],
             "sequences": corpus.fasta,
             "name": os.path.join(str(out), "{}{}".format(prefix, i)),
-            "unstranded": unstranded,
-            "pos_shift": 4,
-            "neg_shift": -4,
+            "aggregate": Aggregate(start_shift=4, end_shift=-4, unstranded=unstranded),
         }
         for i, bam in enumerate(corpus.bams)
     ]
@@ -546,6 +567,31 @@ def test_pileup_many_should_raise_when_two_jobs_share_a_name(corpus, tmp_path):
     with pytest.raises(ValueError, match="jobs 1 and 3"):
         run.pileup_many(jobs, backend="process", workers=4)
 
+    assert not os.listdir(tmp_path)
+
+
+def test_pileup_many_should_raise_when_two_names_write_one_channel(corpus, tmp_path):
+    """Test the refusal of two jobs whose names differ and whose tables do not.
+
+    Given:
+        A stranded job named ``a`` and an unstranded one named ``a.+``,
+        both of which write ``a.+.track.parquet``.
+    When:
+        The pileups are run.
+    Then:
+        It should name both job indices and the table they share, and
+        refuse before writing anything.
+    """
+
+    # Arrange
+    jobs = jobs_for(corpus, tmp_path, "a")[:2]
+    jobs[0]["aggregate"] = Aggregate()
+    jobs[0]["name"] = str(tmp_path / "a")
+    jobs[1]["name"] = str(tmp_path / "a.+")
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"jobs 0 and 1 both write .*a\.\+\.track"):
+        run.pileup_many(jobs, backend="serial")
     assert not os.listdir(tmp_path)
 
 
@@ -1161,6 +1207,131 @@ def test_pileup_many_should_write_byte_identical_tables_across_backends(
         for left, right in zip(lhs, rhs):
             assert digest_track(left) == digest_track(right)
             assert digest_track(left), "table wrote no Parquet files"
+
+
+@pytest.mark.workers
+def test_pileup_many_should_carry_an_aggregate_across_the_process_boundary(
+    corpus, paired, tmp_path
+):
+    """Test that the record a job carries is the one its worker counts by.
+
+    Given:
+        Jobs carrying aggregates that between them set every field away
+        from its default, one per job, stranded and unstranded, one of
+        them ``"span"`` and the midpoint one over mate pairs.
+    When:
+        They are run serially and across a process pool.
+    Then:
+        Each pair of runs should write byte-identical tables, none of
+        them empty, carrying the same manifest signal and the same
+        recorded aggregate, so the record crossed into each worker
+        whole.
+    """
+
+    # Arrange
+    aggregates = [
+        Aggregate(
+            exclude_flags=0x404,
+            require_flags=0,
+            min_mapq=1,
+            position="three_prime",
+            start_shift=3,
+            end_shift=-2,
+            scale_factor=0.25,
+        ),
+        Aggregate(position="span", unstranded=True, scale_factor=2.0),
+        Aggregate(
+            position="midpoint",
+            unstranded=True,
+            min_template_length=1,
+            max_template_length=500,
+        ),
+        Aggregate(require_flags=0x10, unstranded=True),
+    ]
+    a, b = tmp_path / "serial", tmp_path / "process"
+    a.mkdir()
+    b.mkdir()
+
+    def jobs(out):
+        listed = jobs_for(corpus, out, "x")
+        for job, aggregate in zip(listed, aggregates):
+            job["aggregate"] = aggregate
+        # The corpus carries no template lengths, under which the
+        # midpoint table would be empty on both sides.
+        listed[2]["alignments"] = [paired]
+        return listed
+
+    # Act
+    serial = run.pileup_many(jobs(a), backend="serial")
+    parallel = run.pileup_many(jobs(b), backend="process", workers=2)
+
+    # Assert
+    for aggregate, lhs, rhs in zip(aggregates, serial, parallel):
+        assert len(lhs) == len(rhs) == (1 if aggregate.unstranded else 2)
+        for left, right in zip(lhs, rhs):
+            assert digest_track(left), "table wrote no Parquet files"
+            assert digest_track(left) == digest_track(right)
+            record = tables.read_manifest(right)
+            assert record["signal"] == aggregate.signal
+            assert (
+                record["parameters"]["aggregate"]
+                == (tables.read_manifest(left)["parameters"]["aggregate"])
+            )
+
+
+@pytest.mark.parametrize("aggregate", [None, {"position": "span"}])
+def test_pileup_many_should_refuse_a_job_whose_aggregate_is_not_one(
+    corpus, tmp_path, dispatched, aggregate
+):
+    """Test that a job's aggregate is vetted before any worker starts.
+
+    Given:
+        A job whose ``aggregate`` is ``None`` or a mapping of the
+        record's fields.
+    When:
+        The fan-out is run.
+    Then:
+        It should raise `TypeError` naming the job, and dispatch
+        nothing.
+    """
+
+    # Arrange
+    jobs = plain_jobs(corpus, tmp_path, ["a", "b"])
+    jobs[1]["aggregate"] = aggregate
+
+    # Act & assert
+    with pytest.raises(TypeError, match="job 1 has aggregate set to"):
+        run.pileup_many(jobs, backend="process", workers=2)
+    assert dispatched["jobs"] == []
+
+
+def test_pileup_many_should_size_each_jobs_batches_by_its_rows_per_record(
+    corpus, tmp_path, dispatched, machine, sized
+):
+    """Test that the scan cap reaches the fan-out per job.
+
+    Given:
+        Two jobs reading 6 GB each on a machine with memory to spare,
+        one counting 5' ends and one writing span coverage.
+    When:
+        The fan-out is planned.
+    Then:
+        The 5' job should run in one batch, its bytes under the scan
+        cap, and the span job in two, its two rows per record taking
+        it over.
+    """
+
+    # Arrange
+    machine(64, 1024 * 1024**3)
+    sized(6 * 1024**3)
+    jobs = plain_jobs(corpus, tmp_path, ["points", "span"])
+    jobs[1]["aggregate"] = Aggregate(position="span")
+
+    # Act
+    run.pileup_many(jobs, backend="process", workers=2)
+
+    # Assert
+    assert [job["contig_groups"] for job in dispatched["jobs"]] == [1, 2]
 
 
 def test_pileup_many_should_leave_every_table_verifiable_after_a_parallel_run(

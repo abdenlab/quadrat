@@ -29,7 +29,17 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from quadrat import stores, tables
-from tests import FILE_BACKED, TWO_CONTIGS, builders, one_hot
+from tests import (
+    DELTA_ROWS,
+    FILE_BACKED,
+    SPANS,
+    TWO_CONTIGS,
+    UNREADABLE_IDS,
+    UNREADABLE_RECORDS,
+    builders,
+    coverage,
+    one_hot,
+)
 
 # Two channels over two contigs, with chr2 absent from channel 1, which
 # is the contig-missing-from-a-channel case every reader has to answer
@@ -93,6 +103,13 @@ def edge_store(corpus_factory):
 def duplicate_store(corpus_factory):
     corpus = corpus_factory("stores-duplicates", TWO_CONTIGS, tracks=[DUPLICATE_ROWS])
     return stores.TrackStore(corpus.tracks)
+
+
+@pytest.fixture(scope="module")
+def deltas(delta_track):
+    """`tests.DELTA_ROWS` as a one-channel coverage track at a scale of one."""
+
+    return delta_track()
 
 
 @pytest.fixture
@@ -711,7 +728,7 @@ def test_chrom_track_should_answer_positions_in_order(tmp_path):
     ).write_parquet(path)
 
     # Act
-    positions, values = stores.chrom_track(path, "chr1")
+    positions, values = stores.chrom_track(stores.chrom_plan(path, "chr1"))
 
     # Assert
     assert positions.tolist() == [8, 10, 12]
@@ -750,7 +767,7 @@ def test_chrom_track_should_answer_none_for_a_contig_with_no_rows(tmp_path, layo
         ).write_parquet(source)
 
     # Act & assert
-    assert stores.chrom_track(source, "chr2") is None
+    assert stores.chrom_track(stores.chrom_plan(source, "chr2")) is None
 
 
 @settings(FILE_BACKED, max_examples=25)
@@ -774,7 +791,7 @@ def test_chrom_track_should_answer_sorted_rows_for_any_input(tmp_path, rows):
     builders.write_track(path, [("chr1", pos, value) for pos, value in rows])
 
     # Act
-    answer = stores.chrom_track(path, "chr1")
+    answer = stores.chrom_track(stores.chrom_plan(path, "chr1"))
 
     # Assert
     if not rows:
@@ -785,6 +802,201 @@ def test_chrom_track_should_answer_sorted_rows_for_any_input(tmp_path, rows):
     assert Counter(zip(positions.tolist(), values.tolist())) == Counter(
         (pos, numpy.float64(value)) for pos, value in rows
     )
+
+
+def test_chrom_track_should_answer_the_stored_deltas_of_a_coverage_track(deltas):
+    """Test that a contig of deltas is handed back as it is stored.
+
+    Given:
+        A track whose manifest declares coverage deltas.
+    When:
+        One of its contigs is collected.
+    Then:
+        It should answer the deltas themselves, unsummed and unscaled,
+        because summing them is `coverage_levels`' to do and a caller
+        that reads values knows the signal.
+    """
+
+    # Act
+    positions, values = stores.chrom_track(stores.chrom_plan(deltas, "chr1"))
+
+    # Assert
+    assert positions.tolist() == [pos for _, pos, _ in DELTA_ROWS]
+    assert values.tolist() == [value for _, _, value in DELTA_ROWS]
+
+
+def test_coverage_levels_should_step_through_the_running_total_then_scale():
+    """Test the levels a contig's deltas step through.
+
+    Given:
+        Deltas that rise, fall and rise again, a scale, and an unscaled
+        total carried in from before them.
+    When:
+        Their levels are asked for.
+    Then:
+        Element ``i`` should be the carried total plus the first ``i``
+        deltas, multiplied by the scale.
+    """
+
+    # Arrange
+    deltas = [1.0, 1.0, -1.0, 1.0, -1.0, -1.0]
+
+    # Act
+    levels = stores.coverage_levels(deltas, 0.5, before=2.0)
+
+    # Assert
+    assert levels.tolist() == [1.0, 1.5, 2.0, 1.5, 2.0, 1.5, 1.0]
+
+
+@pytest.mark.parametrize("scale", [0.1, 1 / 3, 1e6 / 7])
+def test_coverage_levels_should_be_exactly_zero_once_the_deltas_cancel(scale):
+    """Test that the scale cannot leave residue where coverage has ended.
+
+    Given:
+        Deltas ``+3, +2, +1, -1, -3, -2``, which cancel, and a scale
+        that is not a power of two.
+    When:
+        Their levels are asked for.
+    Then:
+        The last level should be exactly ``0.0``, because the deltas
+        are summed before anything is scaled; scaling each delta first
+        leaves a residue such as ``-5.55e-17`` at ``0.1``.
+    """
+
+    # Act
+    levels = stores.coverage_levels([3.0, 2.0, 1.0, -1.0, -3.0, -2.0], scale)
+
+    # Assert
+    assert levels[-1] == 0.0
+    assert levels[3] == pytest.approx(6 * scale)
+
+
+@settings(max_examples=50)
+@given(
+    deltas=st.lists(st.integers(-1000, 1000), max_size=40),
+    before=st.integers(-1000, 1000),
+    scale=st.floats(-1e6, 1e6, allow_nan=False, allow_infinity=False),
+)
+def test_coverage_levels_should_step_through_the_running_total_for_any_deltas(
+    deltas, before, scale
+):
+    """Test the levels any whole-number deltas step through.
+
+    Given:
+        Any whole-number deltas, an unscaled total carried in from
+        before them, and any finite scale.
+    When:
+        Their levels are asked for.
+    Then:
+        There should be one more level than deltas, and element ``i``
+        should be the carried total plus the first ``i`` deltas,
+        multiplied by the scale.
+    """
+
+    # Arrange
+    expected = [(before + sum(deltas[:i])) * scale for i in range(len(deltas) + 1)]
+
+    # Act
+    levels = stores.coverage_levels([float(delta) for delta in deltas], scale, before)
+
+    # Assert
+    assert levels.tolist() == expected
+
+
+@settings(max_examples=50)
+@given(
+    magnitudes=st.lists(st.integers(1, 1000), min_size=1, max_size=20),
+    scale=st.floats(1e-6, 1e6, allow_nan=False, allow_infinity=False),
+    data=st.data(),
+)
+def test_coverage_levels_should_be_exactly_zero_once_any_deltas_cancel(
+    magnitudes, scale, data
+):
+    """Test that no scale leaves residue where any spans have all ended.
+
+    Given:
+        Any spans' whole-number deltas, each rise matched by a fall of
+        the same size, in any order that never takes the running total
+        below zero, and any positive finite scale.
+    When:
+        Their levels are asked for.
+    Then:
+        The last level should be exactly ``0.0``.
+    """
+
+    # Arrange
+    rises = [float(size) for size in magnitudes]
+    falls = data.draw(st.permutations([-size for size in rises]))
+    deltas, running = [], 0.0
+    while rises or falls:
+        if rises and (not falls or running + falls[0] < 0 or data.draw(st.booleans())):
+            deltas.append(rises.pop(0))
+        else:
+            deltas.append(falls.pop(0))
+        running += deltas[-1]
+
+    # Act
+    levels = stores.coverage_levels(deltas, scale)
+
+    # Assert
+    assert levels[-1] == 0.0
+
+
+@settings(max_examples=50)
+@given(data=st.data())
+def test_coverage_runs_should_tile_each_window_at_the_coverage_in_force(data):
+    """Test the runs any deltas and windows are cut into.
+
+    Given:
+        Any ascending delta positions on a contig, possibly repeated,
+        any levels one longer than them, and any windows, empty ones
+        included.
+    When:
+        The windows are cut into runs.
+    Then:
+        Each window's runs should be ordered, non-empty and contiguous,
+        start at its first base and end at its end, an empty window
+        having none, and each run's level should be the one in force at
+        its first base, i.e., the level after every delta at or before
+        that base.
+    """
+
+    # Arrange
+    positions = numpy.array(
+        sorted(data.draw(st.lists(st.integers(0, 200), max_size=30))), dtype=numpy.int64
+    )
+    levels = numpy.array(
+        data.draw(
+            st.lists(
+                st.integers(-5, 5),
+                min_size=len(positions) + 1,
+                max_size=len(positions) + 1,
+            )
+        ),
+        dtype=numpy.float64,
+    )
+    bounds = data.draw(
+        st.lists(st.tuples(st.integers(0, 220), st.integers(0, 40)), max_size=8)
+    )
+    starts = numpy.array([lo for lo, _ in bounds], dtype=numpy.int64)
+    ends = numpy.array([lo + width for lo, width in bounds], dtype=numpy.int64)
+
+    # Act
+    window, left, right, level = stores.coverage_runs(positions, levels, starts, ends)
+
+    # Assert
+    assert window.tolist() == sorted(window.tolist())
+    for index, (lo, hi) in enumerate(zip(starts.tolist(), ends.tolist())):
+        mine = window == index
+        lefts, rights = left[mine].tolist(), right[mine].tolist()
+        if hi == lo:
+            assert lefts == []
+            continue
+        assert lefts[0] == lo and rights[-1] == hi
+        assert lefts[1:] == rights[:-1]
+        assert all(a < b for a, b in zip(lefts, rights))
+        in_force = levels[numpy.searchsorted(positions, left[mine], side="right")]
+        assert level[mine].tolist() == in_force.tolist()
 
 
 @pytest.mark.parametrize("shape", ["directory", "single_file", "eager", "lazy"])
@@ -817,9 +1029,11 @@ def test_track_frame_should_read_every_shape_a_track_takes(tmp_path, shape):
         source = frame if shape == "eager" else frame.lazy()
 
     # Act
-    table = stores.track_frame(source).collect().sort("chrom")
+    frame, signal, scale = stores.track_frame(source)
+    table = frame.collect().sort("chrom")
 
     # Assert
+    assert (signal, scale) == ("counts", None)
     assert table["chrom"].to_list() == ["chr1", "chr2"]
     assert table["pos"].to_list() == [5, 7]
     assert table["value"].to_list() == [2.0, 3.0]
@@ -903,6 +1117,60 @@ def test_track_frame_should_refuse_a_directory_that_does_not_verify(tmp_path):
         stores.track_frame(path)
 
 
+@pytest.mark.parametrize("fields, message", UNREADABLE_RECORDS, ids=UNREADABLE_IDS)
+def test_track_frame_should_refuse_a_track_whose_signal_it_cannot_read(
+    tmp_path, fields, message
+):
+    """Test a whole-table read of a complete track no reader here can read.
+
+    Given:
+        A complete track whose record names a signal no reader knows,
+        or a known signal at the other's version.
+    When:
+        It is read as a whole frame.
+    Then:
+        It should raise `ValueError` naming what is wrong with the
+        record, rather than hand back rows whose meaning it cannot say.
+    """
+
+    # Arrange
+    path = builders.write_track(str(tmp_path / "t.track.parquet"), [("chr1", 5, 2.0)])
+    builders.relabel_track(path, **fields)
+
+    # Act & assert
+    with pytest.raises(ValueError, match=message):
+        stores.track_frame(path)
+
+
+def test_track_frame_should_answer_the_signal_and_scale_of_a_coverage_track(tmp_path):
+    """Test that the whole-track reader opens coverage deltas and says so.
+
+    Given:
+        A track of coverage deltas recorded at a scale of ``0.1``.
+    When:
+        It is opened as one frame.
+    Then:
+        It should answer the stored deltas, with the signal and the
+        scale beside them, so a caller reads the rows as coverage
+        rather than as counts.
+    """
+
+    # Arrange
+    path = builders.write_track(
+        str(tmp_path / "d.track.parquet"),
+        DELTA_ROWS,
+        signal="coverage_deltas",
+        scale=0.1,
+    )
+
+    # Act
+    frame, signal, scale = stores.track_frame(path)
+
+    # Assert
+    assert (signal, scale) == ("coverage_deltas", 0.1)
+    assert frame.collect().sort("pos")["value"].to_list() == [1.0, 1.0, -1.0, -1.0]
+
+
 class TestTrackStore:
     """The dense signal reader over one track per channel."""
 
@@ -963,6 +1231,32 @@ class TestTrackStore:
 
         # Act & assert
         with pytest.raises(ValueError, match="cannot be verified complete"):
+            stores.TrackStore([corpus.tracks[0], root])
+
+    @pytest.mark.parametrize("fields, message", UNREADABLE_RECORDS, ids=UNREADABLE_IDS)
+    def test___init___should_refuse_a_track_whose_signal_it_cannot_read(
+        self, tmp_path, corpus, fields, message
+    ):
+        """Test that a channel no reader here can read is refused up front.
+
+        Given:
+            A channel set holding a complete track whose record names a
+            signal no reader knows, or a known signal at the other's
+            version.
+        When:
+            A store is built from it.
+        Then:
+            It should raise `ValueError` naming what is wrong with the
+            record, rather than read its rows as some signal they may
+            not be.
+        """
+
+        # Arrange
+        root = builders.write_track(str(tmp_path / "t.track.parquet"), CHANNEL_0)
+        builders.relabel_track(root, **fields)
+
+        # Act & assert
+        with pytest.raises(ValueError, match=message):
             stores.TrackStore([corpus.tracks[0], root])
 
     def test_n_channels_should_count_the_channels(self, store):
@@ -1110,6 +1404,315 @@ class TestTrackStore:
         assert window[0][2] == 5.0
         assert window[0][4] == 3.0
 
+    def test_window_should_read_zero_past_a_span_closing_on_its_contigs_last_base(
+        self, last_base_spans
+    ):
+        """Test a coverage read past spans that end on their contigs' last bases.
+
+        Given:
+            A ``"span"`` track of records ending on each contig's last
+            base.
+        When:
+            A window per contig reaching 30 bases past its end is read.
+        Then:
+            It should equal pysam's depth inside the contig and read
+            zero past it, the closing event at the contig's length
+            ending the coverage there.
+        """
+
+        # Arrange
+        track, depth = last_base_spans
+        store = stores.TrackStore([track])
+
+        # Act
+        windows = [
+            store.window(chrom, length - 40, length + 30)
+            for chrom, length in TWO_CONTIGS.items()
+        ]
+
+        # Assert
+        for window, (chrom, length) in zip(windows, TWO_CONTIGS.items()):
+            expected = numpy.concatenate((depth[chrom][length - 40 :], numpy.zeros(30)))
+            numpy.testing.assert_array_equal(window[0].numpy(), expected)
+
+    def test_window_should_answer_the_coverage_a_channel_of_deltas_sums_to(self, deltas):
+        """Test the prefix sum a channel of coverage deltas is read through.
+
+        Given:
+            A track of coverage deltas for three spans, two overlapping
+            and two abutting.
+        When:
+            Windows are read across, inside and beyond the spans, and one
+        ending before the first of them.
+        Then:
+            It should answer the coverage those spans imply at every
+            base, built here one base at a time, rather than the deltas.
+        """
+
+        # Arrange
+        store = stores.TrackStore([deltas])
+
+        # Act
+        windows = {
+            bounds: store.window("chr1", *bounds).numpy()[0]
+            for bounds in [(0, 40), (16, 18), (25, 33), (34, 50), (-5, 12), (0, 5)]
+        }
+
+        # Assert
+        for (start, end), window in windows.items():
+            numpy.testing.assert_array_equal(
+                window, coverage(SPANS, start, end, dtype=numpy.float32)
+            )
+
+    def test_window_should_read_counts_and_deltas_side_by_side(self, corpus, deltas):
+        """Test that each channel is read as its own manifest declares.
+
+        Given:
+            A store over a channel of counts and a channel of coverage
+            deltas.
+        When:
+            A window is read.
+        Then:
+            It should answer the counts as they are and the deltas as
+            the coverage they sum to.
+        """
+
+        # Arrange
+        store = stores.TrackStore([corpus.tracks[0], deltas])
+
+        # Act
+        window = store.window("chr1", 8, 24).numpy()
+
+        # Assert
+        numpy.testing.assert_array_equal(window[0], dense(CHANNEL_0, 8, 24))
+        numpy.testing.assert_array_equal(
+            window[1], coverage(SPANS, 8, 24, dtype=numpy.float32)
+        )
+
+    def test_window_should_answer_the_same_coverage_after_a_pickle_round_trip(
+        self, deltas
+    ):
+        """Test that a channel of deltas survives the crossing into a worker.
+
+        Given:
+            A store over coverage deltas that has already read a window,
+            so its sums are built.
+        When:
+            It is pickled, restored, and asked again.
+        Then:
+            It should answer the same coverage.
+        """
+
+        # Arrange
+        store = stores.TrackStore([deltas])
+        expected = store.window("chr1", 0, 40).tolist()
+
+        # Act
+        restored = pickle.loads(pickle.dumps(store))
+
+        # Assert
+        assert restored.window("chr1", 0, 40).tolist() == expected
+
+    @settings(FILE_BACKED, max_examples=25)
+    @given(
+        spans=st.lists(
+            st.tuples(st.integers(0, 999), st.integers(1, 60)), min_size=0, max_size=20
+        ),
+        bounds=st.tuples(st.integers(-10, 1010), st.integers(-10, 1010)),
+    )
+    def test_window_should_equal_the_coverage_any_spans_imply(
+        self, tmp_path, spans, bounds
+    ):
+        """Test the coverage read against an independently built array.
+
+        Given:
+            Any spans over one contig, overlapping, nested, abutting or
+            repeated, written as the boundary events a pileup writes for
+            them, and any window, including one reaching past the
+            contig.
+        When:
+            A window is read over that span.
+        Then:
+            It should equal the coverage those spans imply, built here
+            one base at a time.
+        """
+
+        # Arrange
+        start, end = min(bounds), max(bounds)
+        spans = [(lo, lo + width) for lo, width in spans]
+        rows = [("chr1", lo, 1.0) for lo, _ in spans]
+        rows += [("chr1", hi, -1.0) for _, hi in spans]
+        path = str(tmp_path / "deltas.track.parquet")
+        builders.write_track(path, rows, signal="coverage_deltas")
+        store = stores.TrackStore([path])
+
+        # Act
+        window = store.window("chr1", start, end).numpy()
+
+        # Assert
+        numpy.testing.assert_array_equal(
+            window[0], coverage(spans, start, end, dtype=numpy.float32)
+        )
+
+    @pytest.mark.parametrize("scale", [0.1, 1 / 3])
+    def test_window_should_read_coverage_exactly_zero_where_every_span_has_ended(
+        self, tmp_path, scale
+    ):
+        """Test the scale against the prefix sum, past and inside the spans.
+
+        Given:
+            Deltas ``+3, +2, +1, -1, -3, -2`` on six positions, written
+            unscaled with a scale that is not a power of two.
+        When:
+            A window running from before the first delta to well past
+            the last is read.
+        Then:
+            Every base past the last delta should be exactly ``0.0``,
+            and every base inside should be the coverage times the
+            scale, to ``float32`` precision.
+        """
+
+        # Arrange
+        positions = [10, 12, 14, 16, 18, 20]
+        rows = [
+            ("chr1", pos, value)
+            for pos, value in zip(positions, [3.0, 2.0, 1.0, -1.0, -3.0, -2.0])
+        ]
+        path = builders.write_track(
+            str(tmp_path / "d.track.parquet"),
+            rows,
+            signal="coverage_deltas",
+            scale=scale,
+        )
+        expected = numpy.zeros(40, dtype=numpy.float64)
+        for pos, value in zip(positions, [3, 2, 1, -1, -3, -2]):
+            expected[pos:] += value
+
+        # Act
+        window = stores.TrackStore([path]).window("chr1", 0, 40).numpy()[0]
+
+        # Assert
+        assert (window[20:] == 0.0).all()
+        numpy.testing.assert_allclose(window, expected * scale, rtol=1e-6)
+
+    def test_window_should_read_coverage_across_checkpoints(self, tmp_path):
+        """Test windows whose prefix runs back past several checkpoints.
+
+        Given:
+            A coverage track of 15,000 seeded spans, i.e., 30,000 delta
+            rows on one contig and so several row groups' worth of
+            checkpoints.
+        When:
+            Windows are read before, across and after checkpoint
+            boundaries, and past the last span.
+        Then:
+            Each should equal the coverage the spans imply, built here
+            with numpy.
+        """
+
+        # Arrange
+        rng = numpy.random.default_rng(10)
+        starts = rng.integers(0, 200_000, 15_000)
+        ends = starts + rng.integers(1, 300, 15_000)
+        rows = [("chr1", int(lo), 1.0) for lo in starts]
+        rows += [("chr1", int(hi), -1.0) for hi in ends]
+        path = builders.write_track(
+            str(tmp_path / "d.track.parquet"), rows, signal="coverage_deltas"
+        )
+        expected = numpy.zeros(201_000, dtype=numpy.float64)
+        numpy.add.at(expected, starts, 1)
+        numpy.add.at(expected, ends, -1)
+        expected = numpy.cumsum(expected)
+        store = stores.TrackStore([path])
+        bounds = [(0, 500), (66_000, 68_000), (133_000, 133_400), (199_800, 201_000)]
+
+        # Act
+        windows = [store.window("chr1", lo, hi).numpy()[0] for lo, hi in bounds]
+
+        # Assert
+        for (lo, hi), window in zip(bounds, windows):
+            numpy.testing.assert_array_equal(window, expected[lo:hi])
+
+    def test_window_should_read_a_rewritten_contig_rather_than_rows_it_held(
+        self, tmp_path
+    ):
+        """Test that a store holds checkpoints of a coverage contig and not its rows.
+
+        Given:
+            A coverage track of three row groups of alternating ``+1``
+            and ``-1`` deltas on one contig, a store that has read a
+            window in the first row group, and the contig's file then
+            rewritten in place with every delta negated, which keeps
+            every row group's positions and total and so every
+            checkpoint the store took.
+        When:
+            A window in the last row group is read.
+        Then:
+            It should read the rewritten deltas, ``-1`` where the
+            original read ``1``, because each window's deltas are read
+            from the file rather than from rows the store kept.
+        """
+
+        # Arrange
+        rows = [
+            ("chr1", pos, 1.0 if pos % 2 == 0 else -1.0)
+            for pos in range(3 * tables.ROW_GROUP_SIZE)
+        ]
+        path = builders.write_track(
+            str(tmp_path / "d.track.parquet"), rows, signal="coverage_deltas"
+        )
+        store = stores.TrackStore([path])
+        store.window("chr1", 100, 104)
+        builders.track_rows_frame(
+            [(chrom, pos, -value) for chrom, pos, value in rows]
+        ).write_parquet(
+            tables.track_chrom_path(path, "chr1"),
+            row_group_size=tables.ROW_GROUP_SIZE,
+            statistics=True,
+        )
+
+        # Act
+        window = store.window("chr1", 25_000, 25_004)
+
+        # Assert
+        assert window[0].tolist() == [-1.0, 0.0, -1.0, 0.0]
+
+    def test_window_should_read_coverage_whose_deltas_repeat_across_a_row_group(
+        self, tmp_path
+    ):
+        """Test checkpoints over a position recorded across a row-group boundary.
+
+        Given:
+            A coverage track recording one position more times than a
+            row group holds, then a second position as many times, so
+            two checkpoints fall on each.
+        When:
+            Windows are read before, between and after the two.
+        Then:
+            Each should read the coverage every delta implies: zero
+            before the first, their count between, and zero after the
+            second.
+        """
+
+        # Arrange
+        repeats = tables.ROW_GROUP_SIZE + 5
+        rows = [("chr1", 100, 1.0)] * repeats + [("chr1", 200, -1.0)] * repeats
+        path = builders.write_track(
+            str(tmp_path / "d.track.parquet"), rows, signal="coverage_deltas"
+        )
+        store = stores.TrackStore([path])
+
+        # Act
+        windows = [
+            store.window("chr1", lo, hi).numpy()[0]
+            for lo, hi in ((90, 110), (150, 160), (195, 205))
+        ]
+
+        # Assert
+        assert windows[0].tolist() == [0.0] * 10 + [float(repeats)] * 10
+        assert windows[1].tolist() == [float(repeats)] * 10
+        assert windows[2].tolist() == [float(repeats)] * 5 + [0.0] * 5
+
     def test_window_should_refuse_a_span_that_runs_backwards(self, store):
         """Test a window whose end is before its start.
 
@@ -1229,10 +1832,11 @@ class TestTrackStore:
         path = str(tmp_path / "property.track.parquet")
         builders.write_track(path, [("chr1", pos, value) for pos, value in rows])
         store = stores.TrackStore([path])
-        expected = numpy.zeros(end - start, dtype=numpy.float32)
+        expected = numpy.zeros(end - start, dtype=numpy.float64)
         for pos, value in rows:
             if start <= pos < end:
-                expected[pos - start] += numpy.float32(value)
+                expected[pos - start] += value
+        expected = expected.astype(numpy.float32)
 
         # Act
         window = store.window("chr1", start, end).numpy()

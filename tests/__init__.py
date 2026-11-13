@@ -76,6 +76,42 @@ GOLDEN_CONFIGS = MappingProxyType(
 # The golden configurations in a fixed order, as test ids.
 CONFIG_IDS = tuple(sorted(GOLDEN_CONFIGS))
 
+# Three records' spans on chr1, two overlapping and the third abutting
+# the second, and the boundary events a ``"span"`` pileup writes for
+# them: ``+1`` at each start and ``-1`` at each end, the abutting pair's
+# end and start cancelling on one position.
+SPANS = ((10, 20), (15, 30), (30, 34))
+DELTA_ROWS = (
+    ("chr1", 10, 1.0),
+    ("chr1", 15, 1.0),
+    ("chr1", 20, -1.0),
+    ("chr1", 34, -1.0),
+)
+
+# Record fields that make a complete track one no reader can read,
+# each with the words of its refusal: a ``signal`` no reader knows, and
+# each documented ``signal`` at the other's version. Every reader of
+# values is handed each, as `quadrat.tables.track_signal` refuses it.
+UNREADABLE_RECORDS = (
+    ({"signal": "methylation", "version": 2}, "whose signal is 'methylation'"),
+    ({"signal": "counts", "version": 2}, "declares signal 'counts' at manifest"),
+    (
+        {"signal": "coverage_deltas", "version": 1, "scale": 1.0},
+        "declares signal 'coverage_deltas' at manifest",
+    ),
+)
+UNREADABLE_IDS = ("unknown-signal", "counts-at-2", "coverage-deltas-at-1")
+
+# Records placed so a span ends on each contig's last base of
+# `TWO_CONTIGS`, one forward and one reverse, beside one that ends
+# well inside chr1: ``(name, chrom, pos, cigar, flag)``, as
+# ``corpus_factory`` places them.
+LAST_BASE_READS = (
+    ("inside", "chr1", 50, "20M", 0),
+    ("last1", "chr1", 980, "20M", 0),
+    ("last2", "chr2", 470, "30M", 16),
+)
+
 # How long a loader with workers may wait on one, so a worker that
 # never answers fails its test rather than stalling the run.
 WORKER_TIMEOUT = 120
@@ -205,6 +241,16 @@ def one_hot(residues, alphabet="ACGT"):
     return out
 
 
+def coverage(spans, start, end, dtype=numpy.float64):
+    """Return the ``chr1`` coverage ``[start, end)`` spans imply, one base at a time."""
+
+    out = numpy.zeros(end - start, dtype=dtype)
+    for lo, hi in spans:
+        for base in range(max(lo, start), min(hi, end)):
+            out[base - start] += 1
+    return out
+
+
 def dense(rows, sizes=TWO_CONTIGS, dtype=numpy.float32):
     """Return the per-contig dense arrays one channel's rows imply.
 
@@ -286,26 +332,124 @@ def record_placements(path, pysam, until_eof=False):
         ]
 
 
-def oracle_pileup(bam_paths, chrom_sizes, pysam, pos_shift, neg_shift, scale=1.0):
+def oracle_kept(read, aggregate):
+    """Return whether a record passes an aggregate's filter, judged by pysam.
+
+    Read off pysam's own fields for each clause the aggregate names,
+    so it agrees with the pileup only where both read a record alike.
+    """
+
+    length = abs(read.template_length)
+    return not (
+        read.is_unmapped
+        or read.flag & aggregate.exclude_flags
+        or read.flag & aggregate.require_flags != aggregate.require_flags
+        or read.mapping_quality < aggregate.min_mapq
+        or length < aggregate.min_template_length
+        or (
+            aggregate.max_template_length is not None
+            and length > aggregate.max_template_length
+        )
+        or (aggregate.position == "midpoint" and read.template_length <= 0)
+    )
+
+
+def oracle_pileup(bam_paths, chrom_sizes, pysam, aggregate):
     """Return the dense track per contig that alignments imply, read with pysam.
 
-    bam2bw's loop, densified: every mapped record on a known contig
-    contributes its shifted 5' end, and a site outside its contig is
-    dropped. ``pysam`` is passed in, as it is to `record_placements`.
+    bam2bw's loop, densified and filtered: every record `oracle_kept`
+    keeps on a known contig contributes the one position its rule
+    names, and a position outside its contig is dropped. The midpoint
+    is found from the two mates' 5' ends, paired by name, rather than
+    from the template length, so it is a second derivation of the
+    fragment and not a restatement of the first. ``"span"`` is
+    `oracle_depth`'s. ``pysam`` is passed in, as it is to
+    `record_placements`.
+    """
+
+    def five_prime(read, shift=(0, 0)):
+        if read.is_forward:
+            return read.reference_start + shift[0]
+        return read.reference_end + shift[1] - 1
+
+    shifts = (aggregate.start_shift, aggregate.end_shift)
+    dense = {c: numpy.zeros(n, dtype=numpy.float64) for c, n in chrom_sizes.items()}
+    for path in bam_paths:
+        with pysam.AlignmentFile(path, "rb") as bam:
+            reads = list(bam.fetch(until_eof=True))
+        mates = {}
+        for read in reads:
+            mates.setdefault(read.query_name, []).append(read)
+        for read in reads:
+            if not oracle_kept(read, aggregate) or read.reference_name not in dense:
+                continue
+            if aggregate.position == "five_prime":
+                pos = five_prime(read, shifts)
+            elif aggregate.position == "three_prime":
+                if read.is_forward:
+                    pos = read.reference_end + aggregate.end_shift - 1
+                else:
+                    pos = read.reference_start + aggregate.start_shift
+            else:
+                (mate,) = [
+                    other for other in mates[read.query_name] if other is not read
+                ]
+                ends = sorted((five_prime(read), five_prime(mate)))
+                pos = ends[0] + (ends[1] - ends[0]) // 2
+            if 0 <= pos < chrom_sizes[read.reference_name]:
+                dense[read.reference_name][pos] += 1
+    return {c: v * aggregate.scale_factor for c, v in dense.items()}
+
+
+def oracle_depth(bam_paths, chrom_sizes, pysam, aggregate):
+    """Return per-base depth per contig over the records an aggregate keeps.
+
+    What ``samtools depth`` reports, read through pysam's
+    ``count_coverage`` with no base-quality floor: a base counts where
+    a record aligns a query base to it, so a deletion or a skipped
+    region is not covered. On records with neither, that is the
+    coverage of their span. ``pysam`` is passed in, as it is to
+    `record_placements`.
     """
 
     dense = {c: numpy.zeros(n, dtype=numpy.float64) for c, n in chrom_sizes.items()}
     for path in bam_paths:
         with pysam.AlignmentFile(path, "rb") as bam:
-            for read in bam.fetch(until_eof=True):
-                if read.is_unmapped or read.reference_name not in dense:
+            for chrom in dense:
+                if chrom not in bam.references:
                     continue
-                start = read.reference_start + pos_shift
-                end = read.reference_end + neg_shift
-                pos = start if read.is_forward else end - 1
-                if 0 <= pos < chrom_sizes[read.reference_name]:
-                    dense[read.reference_name][pos] += 1
-    return {c: v * scale for c, v in dense.items()}
+                counts = bam.count_coverage(
+                    chrom,
+                    0,
+                    chrom_sizes[chrom],
+                    quality_threshold=0,
+                    read_callback=lambda read: oracle_kept(read, aggregate),
+                )
+                dense[chrom] += numpy.sum(counts, axis=0)
+    return {c: v * aggregate.scale_factor for c, v in dense.items()}
+
+
+def pile_up_spans(corpus, name, pysam, scale_factor=1.0):
+    """Pile a corpus's alignments up unstranded under ``"span"``, beside pysam's depth.
+
+    The track is written at ``scale_factor`` as ``name`` inside the
+    corpus's own directory, and the depth is `oracle_depth`'s over the
+    same records at the same scale, per contig of the corpus. Skips the
+    requesting test without the ``pileup`` extra. ``pysam`` is passed
+    in, as it is to `record_placements`.
+
+    :returns: ``(track, depth)``.
+    """
+
+    pytest.importorskip("polars_bio")
+    pileup = pytest.importorskip("quadrat.pileup")
+    aggregate = pileup.Aggregate(
+        position="span", unstranded=True, scale_factor=scale_factor
+    )
+    (track,) = pileup.pileup_alignments(
+        corpus.bams, corpus.fasta, corpus.path(name), aggregate=aggregate
+    )
+    return track, oracle_depth(corpus.bams, corpus.chrom_sizes, pysam, aggregate)
 
 
 def run_child(command, failure, cwd=None, environment=None):

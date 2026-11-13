@@ -8,18 +8,18 @@ for before a second pileup starts. The curve rises steeply to about a
 dozen workers and then flattens.
 
 The backends are verified byte-identical rather than merely
-equivalent. The aggregate is an exact integer count with the scale
-applied once afterwards, so there is no partition-order-dependent float
+equivalent. The grouping accumulates exact integers, scaled once
+afterwards if at all, so there is no partition-order-dependent float
 accumulation to diverge.
 
 A job is a mapping of `quadrat.pileup.pileup_alignments` keyword
 arguments, copied into a plain dict here so that it serialises by
 value and needs no class definition on the far side of a process
 boundary. What this module reads out of one is bounded:
-``alignments`` to size it, ``name`` to catch two jobs writing one
-table, and ``contig_groups`` and ``target_partitions`` to fill in the
-defaults the fan-out computes. Everything else is passed through
-untouched.
+``alignments`` and ``aggregate`` to size it, ``name`` to catch two
+jobs writing one table, and ``contig_groups`` and
+``target_partitions`` to fill in the defaults the fan-out computes.
+Everything else is passed through untouched.
 
 How the jobs are mapped is the caller's: `pileup_many` takes a
 ``map``-shaped ``runner`` and bundles two of them under `BACKENDS`,
@@ -45,6 +45,7 @@ import os
 import warnings
 
 from quadrat._engine import fspath_or_none, import_on_first_use
+from quadrat.pileup.aggregate import Aggregate
 from quadrat.pileup.plan import (
     MAX_CONTIG_GROUPS,
     default_partitions,
@@ -54,6 +55,7 @@ from quadrat.pileup.plan import (
     projected_peak,
 )
 from quadrat.pileup.track import log, pileup_alignments
+from quadrat.tables import track_paths
 
 #: The runners this package bundles, by the name ``backend`` selects
 #: them with, both verified byte-identical to each other and to any
@@ -67,6 +69,11 @@ BACKENDS = ("serial", "process")
 #: rather than restated here, so adding or removing a parameter of
 #: `pileup_alignments` cannot leave this behind.
 _JOB_KEYS = frozenset(inspect.signature(pileup_alignments).parameters)
+
+
+#: What a job without an ``aggregate`` runs, read off the signature for
+#: the reason `_JOB_KEYS` is.
+_DEFAULT_AGGREGATE = inspect.signature(pileup_alignments).parameters["aggregate"].default
 
 
 #: Job keys this module fills in a default for. A ``None`` against one
@@ -103,11 +110,14 @@ def pileup_many(
     committed atomically on its own, so a partial run leaves complete
     tables and absent ones, never a half-written table.
 
+    Needs the ``pileup`` extra for every job it runs, as
+    `pileup_alignments` does.
+
     :param jobs: Keyword arguments for `pileup_alignments`, one
         `collections.abc.Mapping` per pileup, each copied before
         anything is filled in. ``alignments``, ``sequences`` and
-        ``name`` are required. Jobs must be independent: two jobs
-        writing the same ``name`` race, and nothing here detects it.
+        ``name`` are required. Jobs must be independent, and two jobs
+        writing one table are refused.
     :param backend: One of ``"serial"`` or ``"process"``, naming one of
         the two bundled runners. ``None`` with no ``runner`` means
         ``"serial"``.
@@ -145,6 +155,19 @@ def pileup_many(
         whole-machine default.
     :returns: Each job's written table paths, in channel order, in job
         order.
+    :raises ValueError: before any job runs, if both ``backend`` and
+        ``runner`` are given, if ``backend`` is none of `BACKENDS`, if
+        a job has ``alignments``, ``sequences`` or ``name`` set to
+        ``None``, if a job names no alignments, or if two jobs write
+        one table, whether under one ``name`` or under two whose
+        channels collide, e.g., a stranded ``"a"`` and an unstranded
+        ``"a.+"``.
+    :raises TypeError: before any job runs, if a job is not a
+        `collections.abc.Mapping`, names a key `pileup_alignments` does
+        not take, has a ``name`` that is not a path, or has an
+        ``aggregate`` that is not an `Aggregate`.
+    :raises KeyError: before any job runs, if a job lacks
+        ``alignments``, ``sequences`` or ``name``.
     """
 
     if backend is not None and runner is not None:
@@ -186,13 +209,23 @@ def pileup_many(
     # or NFS mounts these corpora live on a cold `stat` is milliseconds.
     sizes = [_job_bytes(job) for job in jobs]
     bytes_per_job = _bytes_per_job(sizes)
+    # Rows per record, which divides the scan cap; see
+    # `quadrat.pileup.plan.group_floor`. The fan-out-wide plan takes the
+    # most any job contributes rather than a mean: the value is 1 or 2,
+    # so the largest is never far from typical, and the per-job pass
+    # below re-sizes each job from its own anyway.
+    points = [
+        job.get("aggregate", _DEFAULT_AGGREGATE)._points_per_record for job in jobs
+    ]
     # Read once for the same reason. `memory_budget` opens two cgroup
     # paths, reads the SLURM environment, calls `sysconf` twice and
     # queries the affinity mask, none of which can change during the
     # planning below.
     budget = memory_budget()
     if workers is None:
-        plan = plan_pileup(len(jobs), bytes_per_job, budget)
+        plan = plan_pileup(
+            len(jobs), bytes_per_job, budget, points_per_record=max(points)
+        )
         workers, groups = plan.workers, plan.contig_groups
         # Then lowered, if the mean hid a job the chosen concurrency
         # cannot afford. The plan solves from `bytes_per_job`, and a
@@ -216,7 +249,8 @@ def pileup_many(
         # make. That branch still warns.
         if budget is not None:
             ceiling = max(
-                projected_peak(job_bytes, MAX_CONTIG_GROUPS) for job_bytes in sizes
+                projected_peak(job_bytes, MAX_CONTIG_GROUPS, job_points)
+                for job_bytes, job_points in zip(sizes, points)
             )
             workers = max(1, min(workers, budget // ceiling))
     else:
@@ -237,7 +271,9 @@ def pileup_many(
         # answered 2 batches for `workers` of 16, 32 and 64 alike,
         # projecting 80, 160 and 320 GB against a 49.7 GB budget.
         workers = max(1, min(int(workers), len(jobs)))
-        groups = memory_floor(bytes_per_job, workers, budget).groups
+        groups = memory_floor(
+            bytes_per_job, workers, budget, points_per_record=max(points)
+        ).groups
     if target_partitions is None:
         target_partitions = default_partitions(workers)
     # The planner saw the mean, which says nothing about a set holding
@@ -258,7 +294,7 @@ def pileup_many(
     # badly: once the mean itself crossed `MAX_GROUP_INPUT_BYTES`,
     # `plan_pileup` seeded its search at the mean's scan floor and
     # every job in the set was raised to it. An 80 GB alignment beside
-    # a 1 MB one made the small job run six genome-wide aggregates
+    # a 1 MB one made the small job run six genome-wide groupings
     # where one was required -- about 3.5x one ungrouped pass on an
     # unindexed BAM, bought for nothing. Both tests that look closest
     # use sets whose mean stays under the cap, where the larger-of-two
@@ -270,8 +306,8 @@ def pileup_many(
     # the better-informed guess of the two whenever the rest of the set
     # could be measured.
     over = []
-    for index, (job, job_bytes) in enumerate(zip(jobs, sizes)):
-        floor = memory_floor(job_bytes, workers, budget)
+    for index, (job, job_bytes, job_points) in enumerate(zip(jobs, sizes, points)):
+        floor = memory_floor(job_bytes, workers, budget, points_per_record=job_points)
         own = floor.groups if job_bytes is not None else max(groups, floor.groups)
         resolved = int(job.setdefault("contig_groups", own))
         job.setdefault("target_partitions", target_partitions)
@@ -470,20 +506,36 @@ def _normalize(jobs):
                 "signal".format(i)
             )
 
+        # Refused here rather than in the worker, for the reason every
+        # refusal in this function is, and because the plan above reads
+        # it before any worker exists.
+        if "aggregate" in job and not isinstance(job["aggregate"], Aggregate):
+            raise TypeError(
+                "job {} has aggregate set to {}, which is not an Aggregate.".format(
+                    i, type(job["aggregate"]).__name__
+                )
+            )
+
         # A `None` spelled out loud is the parameter's own default, so
         # it must mean the same thing as leaving the key out.
         for key in _DEFAULTED_KEYS:
             if key in job and job[key] is None:
                 del job[key]
 
-        owner = owners.setdefault(job["name"], i)
-        if owner != i:
-            raise ValueError(
-                "jobs {} and {} both write {!r}. Two pileups on one name "
-                "race, and the loser does not merely lose a rename: the "
-                "later writer reaps every staging sibling of that path, "
-                "so it destroys the earlier one mid-write.".format(owner, i, job["name"])
-            )
+        # Keyed on the tables a job writes rather than on its name: a
+        # stranded "a" and an unstranded "a.+" both write
+        # "a.+.track.parquet".
+        unstranded = job.get("aggregate", _DEFAULT_AGGREGATE).unstranded
+        for path in track_paths(job["name"], unstranded):
+            owner = owners.setdefault(path, i)
+            if owner != i:
+                raise ValueError(
+                    "jobs {} and {} both write {!r}. Two pileups on one "
+                    "table race, and the loser does not merely lose a "
+                    "rename: the later writer reaps every staging sibling "
+                    "of that path, so it destroys the earlier one "
+                    "mid-write.".format(owner, i, path)
+                )
     return jobs
 
 

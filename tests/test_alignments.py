@@ -26,7 +26,7 @@ import warnings
 
 import pytest
 
-from quadrat import alignments, tables
+from quadrat import Aggregate, alignments, tables
 from quadrat import pileup as pileup_pkg
 from tests import TWO_CONTIGS, builders, digest_track
 
@@ -631,7 +631,11 @@ def test_pileup_alignments_should_raise_when_the_reference_shares_no_contig(
     # Act & assert
     with pytest.raises(ValueError, match="would write an empty table"):
         pileup_pkg.pileup_alignments(
-            [solo], corpus.fasta, name, unstranded=True, contig_groups=groups
+            [solo],
+            corpus.fasta,
+            name,
+            aggregate=Aggregate(unstranded=True),
+            contig_groups=groups,
         )
 
     assert not os.path.exists(name + tables.TRACK_SUFFIX)
@@ -659,7 +663,10 @@ def test_pileup_alignments_should_name_the_alignment_and_both_conventions(
     # Act
     with pytest.raises(ValueError) as error:
         pileup_pkg.pileup_alignments(
-            [solo], corpus.fasta, str(tmp_path / "out"), unstranded=True
+            [solo],
+            corpus.fasta,
+            str(tmp_path / "out"),
+            aggregate=Aggregate(unstranded=True),
         )
 
     # Assert
@@ -693,7 +700,7 @@ def test_pileup_alignments_should_raise_when_one_pooled_alignment_cannot_match(
             [corpus.bams[0], solo],
             corpus.fasta,
             str(tmp_path / "out"),
-            unstranded=True,
+            aggregate=Aggregate(unstranded=True),
             contig_groups=2,
         )
 
@@ -722,7 +729,7 @@ def test_pileup_alignments_should_let_the_engine_report_an_unreadable_header(
             [str(tmp_path / "missing.bam")],
             corpus.fasta,
             str(tmp_path / "out"),
-            unstranded=True,
+            aggregate=Aggregate(unstranded=True),
         )
 
     # Assert
@@ -756,7 +763,7 @@ def test_pileup_alignments_should_warn_and_still_match_without_an_index(
         [corpus.bams[0]],
         corpus.fasta,
         str(tmp_path / "i"),
-        unstranded=True,
+        aggregate=Aggregate(unstranded=True),
         contig_groups=2,
     )
     with pytest.warns(UserWarning, match="samtools index"):
@@ -764,7 +771,7 @@ def test_pileup_alignments_should_warn_and_still_match_without_an_index(
             [bare],
             corpus.fasta,
             str(tmp_path / "b"),
-            unstranded=True,
+            aggregate=Aggregate(unstranded=True),
             contig_groups=2,
         )
 
@@ -792,7 +799,7 @@ def test_pileup_alignments_should_not_warn_when_the_alignment_is_indexed(
             [corpus.bams[0]],
             corpus.fasta,
             str(tmp_path / "ok"),
-            unstranded=True,
+            aggregate=Aggregate(unstranded=True),
             contig_groups=2,
         )
 
@@ -825,7 +832,7 @@ def test_pileup_alignments_should_not_warn_when_an_unindexed_run_is_not_split(
             [bare],
             corpus.fasta,
             str(tmp_path / "one"),
-            unstranded=True,
+            aggregate=Aggregate(unstranded=True),
             contig_groups=1,
         )
 
@@ -858,7 +865,7 @@ def test_pileup_alignments_should_not_warn_for_either_htslib_index_spelling(
             [alignment],
             corpus.fasta,
             str(tmp_path / "out"),
-            unstranded=True,
+            aggregate=Aggregate(unstranded=True),
             contig_groups=2,
         )
 
@@ -889,6 +896,6 @@ def test_pileup_alignments_should_warn_when_only_a_csi_index_is_present(
             [alignment],
             corpus.fasta,
             str(tmp_path / "out"),
-            unstranded=True,
+            aggregate=Aggregate(unstranded=True),
             contig_groups=2,
         )

@@ -10,6 +10,7 @@ imports without either.
 """
 
 import gzip
+import json
 import os
 import random
 
@@ -277,7 +278,7 @@ def scattered_rows(chrom_sizes, seed):
     return [(chrom, pos, float(rng.randint(1, 4))) for chrom, pos in positions]
 
 
-def write_track(path, rows, *, parameters=None):
+def write_track(path, rows, *, parameters=None, signal="counts", scale=None):
     """Write ``(chrom, pos, value)`` rows as one track directory.
 
     The track equivalent of `write_bed`: a builder that takes the rows
@@ -291,6 +292,11 @@ def write_track(path, rows, *, parameters=None):
     handed ungrouped, which is the one thing a hand-written row list
     reliably is.
 
+    ``signal`` reaches the writer unchanged, so a track of coverage
+    deltas is built the way a pileup commits one. So does ``scale``,
+    except that a track of coverage deltas given none records ``1.0``,
+    the scale a pileup at its default records.
+
     The writer is not imported until this is called: ``conftest``
     assigns ``QUADRAT_CACHE_DIR`` at its own import time and a
     module-level ``quadrat`` import here would land before it.
@@ -298,8 +304,31 @@ def write_track(path, rows, *, parameters=None):
 
     from quadrat.tables import TrackWriter
 
-    with TrackWriter(str(path), parameters=parameters) as writer:
+    if signal == "coverage_deltas" and scale is None:
+        scale = 1.0
+    with TrackWriter(
+        str(path), parameters=parameters, signal=signal, scale=scale
+    ) as writer:
         writer.write(track_rows_frame(rows))
+    return str(path)
+
+
+def relabel_track(path, **fields):
+    """Rewrite the record beside a track so its ``fields`` replace or join its own.
+
+    The one way the suite builds a track whose record says something
+    `quadrat.tables.TrackWriter` refuses to write, e.g., a ``signal``
+    no reader knows or a ``version`` its ``signal`` does not imply,
+    over rows the writer did commit. Returns ``path``.
+    """
+
+    from quadrat.tables import manifest_path
+
+    with open(manifest_path(str(path))) as handle:
+        record = json.load(handle)
+    record.update(fields)
+    with open(manifest_path(str(path)), "w") as handle:
+        json.dump(record, handle)
     return str(path)
 
 

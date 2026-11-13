@@ -20,6 +20,7 @@ dependency the module split exists to remove.
 
 import collections
 import contextlib
+import dataclasses
 import logging
 import os
 import sys
@@ -42,6 +43,7 @@ from quadrat.alignments import (
     require_reference_contigs,
     warn_unindexed_split,
 )
+from quadrat.pileup.aggregate import Aggregate
 from quadrat.pileup.plan import n_cpus, plan_pileup
 from quadrat.pileup.sql import pileup_sql
 from quadrat.reference import chrom_lengths
@@ -111,20 +113,19 @@ def pileup_alignments(
     sequences,
     name,
     *,
-    pos_shift=0,
-    neg_shift=0,
-    unstranded=False,
-    scale_factor=1.0,
+    aggregate=Aggregate(),
     target_partitions=None,
     contig_groups=None,
     verbose=False,
 ):
     """Convert BAM/SAM files into ``{name}.track.parquet`` tracks.
 
-    One position per record rather than coverage over the record's
-    span, so which position -- a 5' end, a shifted one -- is the
-    caller's choice through ``pos_shift`` and ``neg_shift``. The
-    written table carries no assay.
+    What is counted, and where, is the caller's choice through
+    ``aggregate``; the written table carries no assay, only what its
+    values mean, which its manifest records as ``signal``.
+
+    Needs the ``pileup`` extra, which installs the engine the pileup
+    runs on; building the ``aggregate`` does not.
 
     :param alignments: BAM/SAM paths, or one path on its own. All files
         are pooled into the same channel(s).
@@ -133,15 +134,13 @@ def pileup_alignments(
     :param name: Output prefix. Unstranded data yields
         ``{name}.track.parquet``; stranded data yields
         ``{name}.+.track.parquet`` and ``{name}.-.track.parquet``.
-    :param pos_shift: Shift applied to forward-strand 5' ends
-        (bam2bw's ``-ps``).
-    :param neg_shift: Shift applied to reverse-strand 5' ends
-        (bam2bw's ``-ns``).
-    :param unstranded: Pool both strands into a single table.
-    :param scale_factor: Multiplier applied to every count.
+    :param aggregate: Which records count, the positions each
+        contributes, and whether the strands are pooled, as an
+        `Aggregate`. The default counts the 5' end of every primary,
+        mapped, non-duplicate, QC-passing record, one track per strand.
     :param target_partitions: DataFusion's
         ``execution.target_partitions`` for this pileup, which bounds
-        how many threads the scan and aggregate use. ``None`` uses
+        how many threads the scan and grouping use. ``None`` uses
         every core, which is right for one pileup on an idle machine
         and wrong for several at once -- the setting is session-global
         and process-wide, so K concurrent pileups would otherwise ask
@@ -149,12 +148,13 @@ def pileup_alignments(
         from the worker count. Set for the duration of the call and
         restored afterwards.
     :param contig_groups: How many contig batches to run the genome in.
-        One batch is the whole genome in a single aggregate. Splitting
+        One batch is the whole genome in a single grouping. Splitting
         it bounds the peak, because only one batch's positions are
         ever live, and the output is byte-identical at any count.
         ``None`` solves for this machine *and* for the bytes this job
         reads: one batch on a small input, more when a single batch
-        would scan past 8 GB however much memory the machine has, and
+        would scan past 8 GB -- 4 GB under ``"span"``, which contributes
+        two rows per record -- however much memory the machine has, and
         more again when one batch would project past what memory is
         free, and never more than eight. Eight is the solver's ceiling
         and not the parameter's: a count you pass is honoured as
@@ -178,11 +178,20 @@ def pileup_alignments(
         two threads is therefore an error rather than a way to go
         faster -- the engine is already internally multithreaded, which
         is what ``target_partitions`` bounds.
+    :raises TypeError: If ``aggregate`` is not an `Aggregate`, if
+        ``name`` is not a `str`, `bytes` or `os.PathLike`, or if
+        ``target_partitions`` or ``contig_groups`` is of a type `int`
+        does not convert.
+    :raises ValueError: If ``alignments`` is ``None`` or an empty
+        collection, if an alignment's path ends in neither ``.bam`` nor
+        ``.sam``, if an alignment whose header can be read names no
+        contig the reference does, or if ``target_partitions`` or
+        ``contig_groups`` is a string `int` cannot parse.
 
     .. rubric:: Implementation notes
 
     The batch count's effect was measured on a 3.9 GB ENCODE
-    alignment, before the aggregate fix: the peak falls from 12.65 GB
+    alignment, before the grouping fix: the peak falls from 12.65 GB
     at one batch to 5.95 GB at four and 3.06 GB at eight, with
     byte-identical output. Two and four are also *faster* than one;
     past eight the peak stops falling while the per-group overhead
@@ -214,11 +223,20 @@ def pileup_alignments(
     if fspath_or_none(alignments) is not None:
         alignments = [alignments]
 
+    # Before anything is registered, like every refusal of an argument.
+    if not isinstance(aggregate, Aggregate):
+        raise TypeError(
+            "pileup_alignments takes what to count as an Aggregate, got "
+            "{}. Build one, e.g., Aggregate(unstranded=True).".format(
+                type(aggregate).__name__
+            )
+        )
+
     if not alignments:
         raise ValueError(
             "pileup_alignments was given no alignments. A pileup over "
             "none of them reaches none of the guards -- no header to "
-            "check against the reference, no contig batch to aggregate "
+            "check against the reference, no contig batch to group "
             "-- and still writes a manifest listing no files, which "
             "require_complete passes because every file it lists does "
             "exist. Training reads the result as a genome with no "
@@ -342,7 +360,7 @@ def pileup_alignments(
                 "the engine rejected target_partitions={} ({}: {}). This "
                 "pileup will run at whatever parallelism the session "
                 "already had. The table is unaffected -- the setting "
-                "bounds how many threads the scan and aggregate use, not "
+                "bounds how many threads the scan and grouping use, not "
                 "what they count -- so this costs time rather than "
                 "correctness. Check that the installed polars-bio still "
                 "accepts datafusion.execution.target_partitions.".format(
@@ -354,14 +372,11 @@ def pileup_alignments(
 
         log.info("GIQL engine: piling up from %s", ", ".join(alignments))
 
-        paths = track_paths(name, unstranded)
+        paths = track_paths(name, aggregate.unstranded)
         parameters = {
             "alignments": [os.path.abspath(a) for a in alignments],
             "sequences": os.path.abspath(sequences),
-            "pos_shift": int(pos_shift),
-            "neg_shift": int(neg_shift),
-            "unstranded": bool(unstranded),
-            "scale_factor": float(scale_factor),
+            "aggregate": dataclasses.asdict(aggregate),
         }
 
         available = collections.OrderedDict(
@@ -383,7 +398,9 @@ def pileup_alignments(
                 total = sum(os.path.getsize(a) for a in alignments)
             except OSError:
                 total = None
-            contig_groups = plan_pileup(1, total).contig_groups
+            contig_groups = plan_pileup(
+                1, total, points_per_record=aggregate._points_per_record
+            ).contig_groups
         batches = contig_batches(lengths, available, contig_groups)
         warn_unindexed_split(alignments, available, batches)
 
@@ -396,24 +413,17 @@ def pileup_alignments(
             writers = [
                 writing.enter_context(
                     TrackWriter(
-                        path, parameters=dict(parameters, channel=os.path.basename(path))
+                        path,
+                        parameters=dict(parameters, channel=os.path.basename(path)),
+                        signal=aggregate.signal,
+                        scale=aggregate._manifest_scale,
                     )
                 )
                 for path in paths
             ]
 
             for batch in batches:
-                _pileup_group(
-                    pb,
-                    writers,
-                    tables,
-                    batch,
-                    unstranded,
-                    pos_shift,
-                    neg_shift,
-                    scale_factor,
-                    verbose,
-                )
+                _pileup_group(pb, writers, tables, batch, aggregate)
 
             for path, writer in zip(paths, writers):
                 log.info("GIQL engine: wrote %s positions to %s", writer.rows, path)
@@ -421,10 +431,8 @@ def pileup_alignments(
         return paths
 
 
-def _pileup_group(
-    pb, writers, tables, batch, unstranded, pos_shift, neg_shift, scale_factor, verbose
-):
-    """Aggregate one contig group and stage it.
+def _pileup_group(pb, writers, tables, batch, aggregate):
+    """Group one contig batch and stage it.
 
     A function rather than the body of a loop, and deliberately so. The
     slices `strand_slices` hands back are views over ``frame``, so any
@@ -436,14 +444,7 @@ def _pileup_group(
 
     polars = import_on_first_use("polars")
 
-    sql = pileup_sql(
-        tables,
-        pos_shift=pos_shift,
-        neg_shift=neg_shift,
-        unstranded=unstranded,
-        scale_factor=scale_factor,
-        contigs=batch,
-    )
+    sql = pileup_sql(tables, aggregate, contigs=batch)
     if sql is None:
         # No alignment in this job has anything in this group.
         return
@@ -464,5 +465,5 @@ def _pileup_group(
     if casts:
         frame = frame.with_columns(casts)
 
-    for writer, part in zip(writers, strand_slices(frame, unstranded)):
+    for writer, part in zip(writers, strand_slices(frame, aggregate.unstranded)):
         writer.write(part)

@@ -8,6 +8,9 @@ The pileup
 
 .. autofunction:: quadrat.pileup_alignments
 
+.. autoclass:: quadrat.Aggregate
+   :members: signal
+
 .. autofunction:: quadrat.pileup_many
 
 .. autoclass:: quadrat.EngineOptionWarning
@@ -46,8 +49,10 @@ column     dtype        contents
 =========  ===========  ===========================================
 ``chrom``  ``Utf8``     the contig, repeated on every row
 ``pos``    ``Int64``    0-based position, ascending within the file
-``value``  ``Float64``  the count at that position, scaled
+``value``  ``Float64``  the value at that position; see below
 =========  ===========  ===========================================
+
+What ``value`` means is the track's ``signal``, which the completeness record states; ``quadrat.read_manifest`` documents each one. Every signal shares the columns, the dtypes and the sort order, so the record is the only place a reader can tell them apart.
 
 One file per contig the table holds at least one row for, and none for a contig it does not -- so an absent contig and an empty one are the same thing here, which is what makes the completeness record necessary. The filename is what ``quadrat.track_chrom_path`` derives. Rows are sorted by ``pos`` within each file, which is what a windowed read depends on; the whole directory globbed back into one frame is therefore sorted by contig and then by position.
 

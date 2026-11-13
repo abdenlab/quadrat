@@ -11,13 +11,17 @@ format is stated once, in the tests of those two functions.
 
 import importlib
 import json
+import math
 import os
 import pathlib
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 import quadrat
 from quadrat import tables
+from tests import FILE_BACKED
 
 
 def manifest_for(table, rows, files):
@@ -45,6 +49,21 @@ def truncated_table(root, suffix=None):
     absent = os.path.basename(tables.track_chrom_path(str(table), "chr2"))
     manifest_for(table, 2, {present: 1, absent: 1})
     return table
+
+
+def declared_table(root, **fields):
+    """A complete one-contig track directory whose record carries ``fields``.
+
+    The fields replace or join the ones `manifest_for` writes, so a test
+    can give a record any ``version`` and any ``signal``, or none.
+    """
+
+    table = root / ("declared" + tables.TRACK_SUFFIX)
+    table.mkdir()
+    record = manifest_for(table, 1, {chrom_file(table, "chr1"): 1})
+    record.update(fields)
+    pathlib.Path(tables.manifest_path(str(table))).write_text(json.dumps(record))
+    return str(table)
 
 
 def listed_table(root, chroms, rows=None, suffix=None):
@@ -765,6 +784,513 @@ def test_require_complete_should_accept_a_table_built_from_the_published_rules(
     # Act & assert
     assert quadrat.require_complete(str(table)) == str(table)
     assert quadrat.track_contigs(str(table)) == set(heights)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"version": 1, "signal": "counts"},
+        {"version": 2, "signal": "coverage_deltas", "scale": 0.1},
+    ],
+    ids=["absent", "counts", "coverage_deltas"],
+)
+def test_require_complete_should_accept_each_signal_at_its_own_version(tmp_path, fields):
+    """Test the pairings of signal and version a record may declare.
+
+    Given:
+        A complete track whose record declares no signal at version 1,
+        counts at version 1, or coverage deltas at version 2 with a
+        scale.
+    When:
+        Completeness is required.
+    Then:
+        It should return the path, an absent signal reading as counts.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, **fields)
+
+    # Act & assert
+    assert tables.require_complete(table) == table
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"version": 1, "signal": "coverage_deltas"},
+        {"version": 2, "signal": "counts"},
+        {"version": 2},
+    ],
+    ids=["deltas_at_1", "counts_at_2", "absent_at_2"],
+)
+def test_require_complete_should_raise_when_the_version_is_not_the_signals_own(
+    tmp_path, fields
+):
+    """Test that a signal and a version must agree.
+
+    Given:
+        A complete track declaring coverage deltas at version 1, which
+        a reader that knows only version 1 would read as counts, or
+        counts at version 2, declared or by absence.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` naming the version that signal is
+        written at.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, **fields)
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"track is written at version"):
+        tables.require_complete(table)
+
+
+@pytest.mark.parametrize(
+    "version", [True, 1.0, 2.0], ids=["true", "one_float", "two_float"]
+)
+def test_require_complete_should_raise_when_the_version_is_not_an_integer(
+    tmp_path, version
+):
+    """Test that a version equal to a known one but not an integer is refused.
+
+    Given:
+        A complete track of counts whose record declares its version as
+        ``true`` or ``1.0``, both equal to 1 in Python, or as ``2.0``.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` naming the version, rather than
+        read the record as one the format fixes.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, version=version)
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"declares manifest schema version"):
+        tables.require_complete(table)
+
+
+@pytest.mark.parametrize("signal", ["methylation", 5, ["counts"], None])
+def test_require_complete_should_raise_when_the_signal_is_unknown(tmp_path, signal):
+    """Test that a signal this does not know is refused, not defaulted.
+
+    Given:
+        A complete track whose record names a signal that is not one of
+        the documented strings, including a ``null``.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` rather than read it as counts.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, signal=signal)
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"whose signal is"):
+        tables.require_complete(table)
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [None, "1.0", True, float("inf"), [1.0], 10**400],
+    ids=["null", "string", "bool", "infinite", "list", "beyond-a-float"],
+)
+def test_require_complete_should_raise_when_a_coverage_record_has_no_usable_scale(
+    tmp_path, scale
+):
+    """Test that a coverage-deltas record must state a finite scale.
+
+    Given:
+        A complete track declaring coverage deltas whose ``scale`` is
+        ``null``, a string, a boolean, infinite, a list, or an integer
+        too large to hold as a float.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` naming the scale, because the
+        deltas are unscaled and the record is what gives them a
+        magnitude.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, version=2, signal="coverage_deltas", scale=scale)
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"declares coverage deltas with scale"):
+        tables.require_complete(table)
+
+
+def test_require_complete_should_raise_when_a_coverage_record_omits_its_scale(
+    tmp_path,
+):
+    """Test that a coverage-deltas record without a scale is refused.
+
+    Given:
+        A complete track declaring coverage deltas at version 2 and no
+        ``scale`` at all.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError`, the field being required on that
+        record rather than defaulted.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, version=2, signal="coverage_deltas")
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"declares coverage deltas with scale None"):
+        tables.require_complete(table)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"scale": 1.0}, {"signal": "counts", "scale": 2.0}],
+    ids=["absent", "counts"],
+)
+def test_require_complete_should_raise_when_a_counts_record_carries_a_scale(
+    tmp_path, fields
+):
+    """Test that a scale is refused on a record of counts.
+
+    Given:
+        A complete track of counts, by absence or declared, whose record
+        carries a ``scale``.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError`, because counts are written scaled
+        and the record cannot say whether to scale them again.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, **fields)
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"declares a scale of .* on a 'counts' track"):
+        tables.require_complete(table)
+
+
+@pytest.mark.parametrize("version", [0, 3, "1", None])
+def test_require_complete_should_raise_when_the_version_is_unknown(tmp_path, version):
+    """Test the schema versions this reads.
+
+    Given:
+        A complete track whose record declares a version that is
+        neither 1 nor 2.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` naming the versions it reads.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, version=version)
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"reads versions `1`, `2`"):
+        tables.require_complete(table)
+
+
+@pytest.mark.parametrize(
+    "fields, expected",
+    [
+        ({}, ("counts", None)),
+        (
+            {"version": 2, "signal": "coverage_deltas", "scale": 0.25},
+            ("coverage_deltas", 0.25),
+        ),
+    ],
+    ids=["absent", "coverage_deltas"],
+)
+def test_track_signal_should_answer_the_signal_and_scale_a_record_declares(
+    tmp_path, fields, expected
+):
+    """Test what a reader is told a track holds.
+
+    Given:
+        A track whose record declares no signal, or coverage deltas
+        with a scale.
+    When:
+        Its signal is asked for.
+    Then:
+        It should answer counts with no scale for the absent one, and
+        the declared signal and scale otherwise.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, **fields)
+
+    # Act & assert
+    assert tables.track_signal(table) == expected
+
+
+def test_track_signal_should_answer_counts_for_a_track_with_no_record(tmp_path):
+    """Test the shapes that cannot declare a signal.
+
+    Given:
+        A single Parquet file and an in-memory frame.
+    When:
+        Each one's signal is asked for.
+    Then:
+        It should answer counts with no scale for each.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+    single = tmp_path / "single.parquet"
+    frame = polars.DataFrame({"chrom": ["chr1"], "pos": [1], "value": [1.0]})
+    frame.write_parquet(single)
+
+    # Act
+    answers = [tables.track_signal(source) for source in (str(single), frame)]
+
+    # Assert
+    assert answers == [("counts", None)] * 2
+
+
+def test_track_signal_should_raise_when_the_track_does_not_verify(tmp_path):
+    """Test that the signal is not answered for an unverifiable track.
+
+    Given:
+        A track directory with no record beside it.
+    When:
+        Its signal is asked for.
+    Then:
+        It should raise `ValueError` as `require_complete` does, rather
+        than answer counts for a directory that cannot say.
+    """
+
+    # Arrange
+    bare = tmp_path / ("bare" + tables.TRACK_SUFFIX)
+    bare.mkdir()
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"cannot be verified complete"):
+        tables.track_signal(str(bare))
+
+
+def test_track_signal_should_raise_when_the_signal_is_unknown(tmp_path):
+    """Test that a reader is not told an unknown signal is counts.
+
+    Given:
+        A track whose record names a signal that is not documented.
+    When:
+        Its signal is asked for.
+    Then:
+        It should raise `ValueError` rather than answer counts.
+    """
+
+    # Arrange
+    table = declared_table(tmp_path, signal="methylation")
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"whose signal is 'methylation'"):
+        tables.track_signal(table)
+
+
+class TestTrackWriter:
+    """The writer's record of what its values mean."""
+
+    @pytest.mark.parametrize("signal", ["coverage", None, ["counts"]])
+    def test___init___should_refuse_a_signal_it_cannot_record(self, tmp_path, signal):
+        """Test that a writer does not record a meaning no reader knows.
+
+        Given:
+            A signal that is not one of the documented strings,
+            including an unhashable one, which the manifest's reader
+            refuses with `ValueError` as well.
+        When:
+            A writer is constructed with it.
+        Then:
+            It should raise `ValueError` and stage nothing.
+        """
+
+        # Arrange
+        path = str(tmp_path / ("w" + tables.TRACK_SUFFIX))
+
+        # Act & assert
+        with pytest.raises(ValueError, match="signal must be one of"):
+            tables.TrackWriter(path, signal=signal)
+        assert os.listdir(str(tmp_path)) == []
+
+    @pytest.mark.parametrize(
+        "scale",
+        [None, float("nan"), True, "1", 10**400],
+        ids=["none", "nan", "bool", "string", "beyond-a-float"],
+    )
+    def test___init___should_refuse_coverage_deltas_without_a_finite_scale(
+        self, tmp_path, scale
+    ):
+        """Test that a writer of coverage deltas must record a scale.
+
+        Given:
+            Coverage deltas, with no scale, a scale that is not finite,
+            one that is not a number, or an integer too large to hold
+            as a float.
+        When:
+            A writer is constructed with them.
+        Then:
+            It should raise `ValueError` and stage nothing, because the
+            deltas are written unscaled and the scale is the only record
+            of their magnitude.
+        """
+
+        # Arrange
+        path = str(tmp_path / ("w" + tables.TRACK_SUFFIX))
+
+        # Act & assert
+        with pytest.raises(ValueError, match="scale must be a finite number"):
+            tables.TrackWriter(path, signal="coverage_deltas", scale=scale)
+        assert os.listdir(str(tmp_path)) == []
+
+    @settings(FILE_BACKED, max_examples=100)
+    @given(
+        scale=st.one_of(
+            st.floats(), st.integers(min_value=-(10**400), max_value=10**400)
+        )
+    )
+    def test___init___should_take_a_scale_exactly_when_a_float_holds_it_finitely(
+        self, tmp_path, scale
+    ):
+        """Test the domain a writer of coverage deltas holds its scale to.
+
+        Given:
+            Any float, finite or not, and any integer up to 400 digits,
+            including those too large to hold as a float.
+        When:
+            A writer of coverage deltas is constructed with it.
+        Then:
+            It should hold the equal `float` when that float is finite,
+            and raise `ValueError` otherwise, never another exception.
+        """
+
+        # Arrange
+        path = str(tmp_path / ("w" + tables.TRACK_SUFFIX))
+        try:
+            held = float(scale)
+        except OverflowError:
+            held = math.inf
+
+        # Act & assert
+        if math.isfinite(held):
+            writer = tables.TrackWriter(path, signal="coverage_deltas", scale=scale)
+            writer.abort()
+            assert writer.scale == held
+        else:
+            with pytest.raises(ValueError, match="scale must be a finite number"):
+                tables.TrackWriter(path, signal="coverage_deltas", scale=scale)
+
+    def test___init___should_refuse_a_scale_for_counts(self, tmp_path):
+        """Test that a writer of counts takes no scale.
+
+        Given:
+            Counts, and a scale.
+        When:
+            A writer is constructed with them.
+        Then:
+            It should raise `ValueError` and stage nothing, because
+            counts are written already scaled.
+        """
+
+        # Arrange
+        path = str(tmp_path / ("w" + tables.TRACK_SUFFIX))
+
+        # Act & assert
+        with pytest.raises(ValueError, match="scale must be None"):
+            tables.TrackWriter(path, signal="counts", scale=2.0)
+        assert os.listdir(str(tmp_path)) == []
+
+    @pytest.mark.parametrize(
+        "signal, scale, version", [("counts", None, 1), ("coverage_deltas", 0.1, 2)]
+    )
+    def test_commit_should_record_the_signal_at_its_version(
+        self, tmp_path, signal, scale, version
+    ):
+        """Test that every record carries a signal, and the version it implies.
+
+        Given:
+            A writer told each signal, and a scale for coverage deltas.
+        When:
+            One frame is written and committed.
+        Then:
+            It should record that signal, at version 1 for counts and 2
+            for coverage deltas, the scale beside coverage deltas alone,
+            and the track should verify.
+        """
+
+        # Arrange
+        polars = pytest.importorskip("polars")
+        path = str(tmp_path / ("w" + tables.TRACK_SUFFIX))
+        frame = polars.DataFrame(
+            {"chrom": ["chr1"], "pos": [3], "value": [1.0]},
+            schema={"chrom": polars.Utf8, "pos": polars.Int64, "value": polars.Float64},
+        )
+
+        # Act
+        with tables.TrackWriter(path, signal=signal, scale=scale) as writer:
+            writer.write(frame)
+
+        # Assert
+        record = tables.read_manifest(path)
+        assert (record["signal"], record["version"]) == (signal, version)
+        assert record.get("scale") == scale and ("scale" in record) == (
+            scale is not None
+        )
+        assert tables.require_complete(path) == path
+
+    @settings(FILE_BACKED, max_examples=100)
+    @given(scale=st.floats(allow_nan=False, allow_infinity=False))
+    def test_commit_should_record_any_finite_scale_as_the_reader_answers_it(
+        self, tmp_path, scale
+    ):
+        """Test the scale's round-trip through a track's record.
+
+        Given:
+            Any finite float as the scale of a writer of coverage
+            deltas.
+        When:
+            It commits and the track's signal is read back.
+        Then:
+            It should answer coverage deltas at exactly that scale.
+        """
+
+        # Arrange
+        path = str(tmp_path / ("w" + tables.TRACK_SUFFIX))
+
+        # Act
+        with tables.TrackWriter(path, signal="coverage_deltas", scale=scale):
+            pass
+
+        # Assert
+        assert tables.track_signal(path) == ("coverage_deltas", scale)
+
+    def test_commit_should_record_counts_when_no_signal_is_given(self, tmp_path):
+        """Test that the signal is written unconditionally.
+
+        Given:
+            A writer given no signal.
+        When:
+            It commits.
+        Then:
+            Its record should still declare counts, at version 1.
+        """
+
+        # Arrange
+        path = str(tmp_path / ("w" + tables.TRACK_SUFFIX))
+
+        # Act
+        with tables.TrackWriter(path):
+            pass
+
+        # Assert
+        record = tables.read_manifest(path)
+        assert (record["signal"], record["version"]) == ("counts", 1)
 
 
 def test_track_directory_should_hold_parquet_and_nothing_else(tmp_path):

@@ -15,12 +15,13 @@ bam2bw oracle. What that cannot distinguish is a plan that joins
 only in whether the query survives at 291,063,148 records, which no
 fixture small enough for CI can reach. So the choice is between a
 white-box test and no regression guard on a plan that fails outright
-at scale, and the guard is kept.
+at scale, and the guard is kept. Which side of a join is collected is
+the same kind of fact, and is pinned here for the same reason.
 """
 
 import pytest
 
-from quadrat import _engine, alignments, reference
+from quadrat import Aggregate, _engine, alignments, reference
 from quadrat.pileup import sql
 from tests import TWO_CONTIGS
 
@@ -47,19 +48,38 @@ def plan_ancestor(plan, parent, child):
     return all(any(pi < ci and pd < cd for pi, pd in parents) for ci, cd in children)
 
 
-def test_pileup_sql_should_bound_positions_above_the_aggregate(corpus_factory):
-    """Test where the chromosome-sizes join sits in the plan.
+def collected_sides(plan):
+    """Return the subtree each join in a physical plan collects, as text.
 
-    Given:
-        The track pileup query over a registered alignment.
-    When:
-        polars-bio explains it.
-    Then:
-        It should take the grouped result as the join's input rather
-        than one row per read.
+    A DataFusion join collects its first child, the one printed first
+    beneath it, and streams its second through it. A node's children
+    are the lines indented two spaces deeper than it, up to the next
+    line indented no deeper than it.
     """
 
-    # Arrange
+    lines = plan.splitlines()
+    depth = [len(line) - len(line.lstrip(" ")) for line in lines]
+    sides = []
+    for i, line in enumerate(lines):
+        if "JoinExec" not in line:
+            continue
+        end = next((j for j in range(i + 1, len(lines)) if depth[j] <= depth[i]), None)
+        children = [
+            j for j in range(i + 1, end or len(lines)) if depth[j] == depth[i] + 2
+        ]
+        last = children[1] if len(children) > 1 else end or len(lines)
+        sides.append("\n".join(lines[children[0] : last]))
+    return sides
+
+
+def explain(corpus_factory, aggregate):
+    """Return the physical plan polars-bio makes of a pileup query.
+
+    The query is the one `pileup_sql` builds over a registered
+    two-alignment corpus, with the sizes frame registered under the
+    name the query joins.
+    """
+
     pb = pytest.importorskip("polars_bio")
     polars = pytest.importorskip("polars")
     corpus = corpus_factory("sql", TWO_CONTIGS, n_bams=2, index_fasta=True)
@@ -72,14 +92,28 @@ def test_pileup_sql_should_bound_positions_above_the_aggregate(corpus_factory):
             schema={"chrom": polars.Utf8, "length": polars.Int64},
         ),
     )
-
-    # Act
-    explained = pb.sql("EXPLAIN " + sql.pileup_sql(registered)).collect()
-    physical = next(
+    explained = pb.sql("EXPLAIN " + sql.pileup_sql(registered, aggregate)).collect()
+    return next(
         row["plan"]
         for row in explained.iter_rows(named=True)
         if row["plan_type"] == "physical_plan"
     )
+
+
+def test_pileup_sql_should_bound_positions_above_the_aggregate(corpus_factory):
+    """Test where the chromosome-sizes join sits in the plan.
+
+    Given:
+        The track pileup query over a registered alignment.
+    When:
+        polars-bio explains it.
+    Then:
+        It should take the grouped result as the join's input rather
+        than one row per read.
+    """
+
+    # Act
+    physical = explain(corpus_factory, Aggregate())
 
     # Assert
     assert "JoinExec" in physical and "AggregateExec" in physical
@@ -90,3 +124,38 @@ def test_pileup_sql_should_bound_positions_above_the_aggregate(corpus_factory):
     # that side was the reads.
     assert plan_ancestor(physical, "JoinExec", "AggregateExec")
     assert not plan_ancestor(physical, "AggregateExec", "JoinExec")
+
+
+@pytest.mark.parametrize(
+    "aggregate",
+    [Aggregate(), Aggregate(position="span")],
+    ids=["five_prime", "span"],
+)
+def test_pileup_sql_should_never_collect_the_reads_side_of_a_join(
+    corpus_factory, aggregate
+):
+    """Test which side of every join in the plan is collected.
+
+    Given:
+        The track pileup query under a 5' rule, which joins the sizes
+        above the grouping, and under ``"span"``, which also joins
+        them and the two boundary events below it, to each record.
+    When:
+        polars-bio explains it.
+    Then:
+        No join should collect the side the alignment is scanned on,
+        and under ``"span"`` the join that meets each record should
+        collect the two-row ``VALUES`` crossed with the sizes, whose
+        rows are per contig rather than per record.
+    """
+
+    # Act
+    physical = explain(corpus_factory, aggregate)
+
+    # Assert
+    sides = collected_sides(physical)
+    assert sides and not any("BamExec" in side for side in sides)
+    if aggregate.position == "span":
+        assert any(
+            "DataSourceExec" in side and "StreamingTableExec" in side for side in sides
+        )

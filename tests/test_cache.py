@@ -54,8 +54,13 @@ import quadrat
 from quadrat import cache, stores
 from tests import (
     FILE_BACKED,
+    SPANS,
     TWO_CONTIGS,
+    UNREADABLE_IDS,
+    UNREADABLE_RECORDS,
     builders,
+    coverage,
+    pile_up_spans,
     quadrat_tables,
     run_child,
     window_frame,
@@ -113,6 +118,60 @@ def edges(corpus_factory):
 @pytest.fixture(scope="module")
 def duplicates(corpus_factory):
     return corpus_factory("cache-duplicates", TWO_CONTIGS, tracks=[DUPLICATE_ROWS])
+
+
+# The span pileup's scale: not a power of two, so a scale applied
+# before the prefix sum would leave residue where coverage has ended.
+SPAN_SCALE = 1 / 3
+
+
+@pytest.fixture(scope="module")
+def deltas(delta_track):
+    """`tests.DELTA_ROWS` as a one-channel coverage track at a scale of a half."""
+
+    return delta_track(0.5)
+
+
+@pytest.fixture(scope="module")
+def span_pileup(span_corpus, pysam):
+    """`tests.pile_up_spans` over the shared span corpus at `SPAN_SCALE`."""
+
+    return pile_up_spans(span_corpus, "cache-span", pysam, SPAN_SCALE)
+
+
+def span_windows(chrom_sizes, width, step):
+    """Return overlapping windows tiling every contig, some reaching past its end."""
+
+    return window_frame(
+        [
+            (chrom, start, start + width)
+            for chrom, size in chrom_sizes.items()
+            for start in range(-width // 2, size, step)
+        ]
+    )
+
+
+# Spans over the shared corpus's first contig, as a ``"span"`` pileup
+# would record them: overlapping, nested, abutting or repeated, and at
+# least one, since a track with no rows has no file to read.
+span_sets = st.lists(
+    st.tuples(st.integers(0, 500), st.integers(1, 60)), min_size=1, max_size=12
+)
+
+
+def span_track(tmp_path_factory, spans):
+    """Write ``(start, width)`` spans as one coverage track, and return it with the spans."""
+
+    spans = [(lo, lo + width) for lo, width in spans]
+    rows = [("chr1", lo, 1.0) for lo, _ in spans] + [
+        ("chr1", hi, -1.0) for _, hi in spans
+    ]
+    path = builders.write_track(
+        str(tmp_path_factory.mktemp("coverage-any") / "d.track.parquet"),
+        rows,
+        signal="coverage_deltas",
+    )
+    return path, spans
 
 
 @pytest.fixture
@@ -753,6 +812,43 @@ def test_group_track_should_answer_the_same_arrays_however_the_rows_are_ordered(
     assert forward[4] == backward[4]
 
 
+def test_group_track_should_order_each_window_by_offset_then_channel(tmp_path):
+    """Test the order of a window's rows across counts and coverage.
+
+    Given:
+        Two channels of counts and a channel of coverage deltas between
+        them, all recording inside one window at shared positions, with
+        no position recorded twice in any channel.
+    When:
+        The window is grouped.
+    Then:
+        Its rows should be ordered by offset and then by channel, as
+        the layout states, whichever kind of channel a row came from.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    coverage_channel = builders.write_track(
+        str(tmp_path / "c.track.parquet"),
+        [("chr1", 9, 1.0), ("chr1", 13, -1.0)],
+        signal="coverage_deltas",
+    )
+    tracks = [
+        builders.track_rows_frame([("chr1", 10, 1.0), ("chr1", 12, 3.0)]),
+        coverage_channel,
+        builders.track_rows_frame([("chr1", 10, 5.0), ("chr1", 12, 6.0)]),
+    ]
+    windows = window_frame([("chr1", 8, 16)])
+
+    # Act
+    _, pos, _, chan, _ = cache.group_track(windows, tracks)
+
+    # Assert
+    rows = list(zip(pos.tolist(), chan.tolist()))
+    assert rows == sorted(rows)
+    assert len(rows) == 8
+
+
 # One channel's rows on the first contig: any positions, a position
 # repeated allowed, every value distinct so no two rows are identical.
 channel_rows = st.lists(
@@ -917,7 +1013,7 @@ def test_group_track_should_read_a_track_it_is_handed_in_memory(tracks):
 
     # Arrange
     windows = window_frame([("chr1", 8, 16)])
-    held = stores.track_frame(tracks[0]).collect()
+    held = stores.track_frame(tracks[0])[0].collect()
 
     # Act
     from_disk = cache.group_track(windows, [tracks[0]])
@@ -1265,6 +1361,33 @@ def test_group_track_should_refuse_a_track_it_cannot_verify_complete(tmp_path):
 
     # Act & assert
     with pytest.raises(ValueError, match="cannot be verified complete"):
+        cache.group_track(window_frame([("chr1", 8, 16)]), [root])
+
+
+@pytest.mark.parametrize("fields, message", UNREADABLE_RECORDS, ids=UNREADABLE_IDS)
+def test_group_track_should_refuse_a_track_whose_signal_it_cannot_read(
+    tmp_path, fields, message
+):
+    """Test the grouping's answer for a complete track no reader here can read.
+
+    Given:
+        A complete track whose record names a signal no reader knows,
+        or a known signal at the other's version.
+    When:
+        A window set is grouped over it.
+    Then:
+        It should raise `ValueError` naming what is wrong with the
+        record, rather than group its rows as some signal they may not
+        be.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    root = builders.write_track(str(tmp_path / "t.track.parquet"), [("chr1", 10, 1.0)])
+    builders.relabel_track(root, **fields)
+
+    # Act & assert
+    with pytest.raises(ValueError, match=message):
         cache.group_track(window_frame([("chr1", 8, 16)]), [root])
 
 
@@ -1658,6 +1781,265 @@ def test_window_group_sums_should_raise_type_error_when_given_a_single_track(tra
         cache.window_group_sums(window_frame([("chr1", 8, 16)]), tracks[0], [1])
 
 
+def test_group_track_should_group_a_coverage_channel_as_its_per_base_depth(
+    span_pileup,
+):
+    """Test the grouping of a ``"span"`` track against pysam's depth.
+
+    Given:
+        A coverage track piled up at a scale of a third, and windows
+        tiling both contigs, overlapping and reaching past either end.
+    When:
+        They are grouped and each window densified.
+    Then:
+        Every window should equal pysam's per-base depth times the
+        scale over its span, to ``float32`` precision, and every row
+        should carry a coverage that is not zero, since a base the
+        spans do not cover is not a site.
+    """
+
+    # Arrange
+    track, depth = span_pileup
+    windows = span_windows(TWO_CONTIGS, 150, 97)
+
+    # Act
+    grouped = cache.group_track(windows, [track])
+
+    # Assert
+    assert (grouped[2] != 0).all() and len(grouped[2])
+    for index, window in enumerate(densify(grouped, windows)):
+        chrom = windows["chrom"][index]
+        start, end = windows["sig_start"][index], windows["sig_end"][index]
+        expected = numpy.zeros(end - start)
+        lo, hi = max(start, 0), min(end, TWO_CONTIGS[chrom])
+        if hi > lo:
+            expected[lo - start : hi - start] = depth[chrom][lo:hi]
+        numpy.testing.assert_allclose(window[0], expected, rtol=1e-6)
+
+
+def test_window_group_sums_should_total_a_coverage_channel_as_its_per_base_depth(
+    span_pileup,
+):
+    """Test the totals of a ``"span"`` track against pysam's depth.
+
+    Given:
+        A coverage track piled up at a scale of a third, and windows
+        tiling both contigs, overlapping and reaching past either end.
+    When:
+        Its windows are totalled.
+    Then:
+        Each total should be pysam's per-base depth summed over the
+        window, times the scale, and a window past every span should
+        total exactly zero.
+    """
+
+    # Arrange
+    track, depth = span_pileup
+    windows = span_windows(TWO_CONTIGS, 150, 97)
+    expected = numpy.array(
+        [
+            depth[chrom][max(start, 0) : max(min(end, TWO_CONTIGS[chrom]), 0)].sum()
+            for chrom, start, end in windows.iter_rows()
+        ]
+    )
+
+    # Act
+    totals = cache.window_group_sums(windows, [track], [1]).numpy()[:, 0]
+
+    # Assert
+    numpy.testing.assert_allclose(totals, expected, rtol=1e-5)
+    assert (totals[expected == 0] == 0.0).all()
+
+
+def last_base_windows():
+    """Return one window per contig, from 40 bases before its end to 30 past it."""
+
+    return window_frame(
+        [(chrom, length - 40, length + 30) for chrom, length in TWO_CONTIGS.items()]
+    )
+
+
+def test_group_track_should_end_coverage_at_a_span_closing_on_its_contigs_last_base(
+    last_base_spans,
+):
+    """Test the grouping of spans that end on their contigs' last bases.
+
+    Given:
+        A ``"span"`` track of records ending on each contig's last
+        base, and a window per contig reaching 30 bases past its end.
+    When:
+        The windows are grouped and densified.
+    Then:
+        Each should equal pysam's depth inside the contig and read zero
+        past it, so no site lies past a contig's end.
+    """
+
+    # Arrange
+    track, depth = last_base_spans
+    windows = last_base_windows()
+
+    # Act
+    dense = densify(cache.group_track(windows, [track]), windows)
+
+    # Assert
+    for index, (chrom, length) in enumerate(TWO_CONTIGS.items()):
+        expected = numpy.concatenate((depth[chrom][length - 40 :], numpy.zeros(30)))
+        numpy.testing.assert_array_equal(dense[index][0], expected)
+
+
+def test_window_group_sums_should_end_coverage_at_a_span_closing_on_its_contigs_last_base(
+    last_base_spans,
+):
+    """Test the totals of spans that end on their contigs' last bases.
+
+    Given:
+        A ``"span"`` track of records ending on each contig's last
+        base, and a window per contig reaching 30 bases past its end.
+    When:
+        The windows are totalled.
+    Then:
+        Each total should be pysam's depth summed over the part of the
+        window inside its contig, with nothing past the end counted.
+    """
+
+    # Arrange
+    track, depth = last_base_spans
+    windows = last_base_windows()
+
+    # Act
+    totals = cache.window_group_sums(windows, [track], [1]).numpy()[:, 0]
+
+    # Assert
+    expected = [
+        depth[chrom][length - 40 :].sum() for chrom, length in TWO_CONTIGS.items()
+    ]
+    assert totals.tolist() == expected
+
+
+def test_group_track_should_group_counts_and_coverage_channels_side_by_side(
+    corpus, deltas
+):
+    """Test a channel set mixing the two signals.
+
+    Given:
+        A channel of counts and a channel of coverage deltas at a scale
+        of a half.
+    When:
+        Windows across both are grouped and densified.
+    Then:
+        The counts should read as their values and the coverage as the
+        spans' per-base coverage times the half, each in its own
+        channel.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    windows = window_frame([("chr1", 5, 40), ("chr1", 18, 22), ("chr2", 0, 10)])
+
+    # Act
+    dense = densify(cache.group_track(windows, [corpus.tracks[0], deltas]), windows)
+
+    # Assert
+    store = stores.TrackStore([corpus.tracks[0], deltas])
+    for index, (chrom, start, end) in enumerate(windows.iter_rows()):
+        numpy.testing.assert_array_equal(
+            dense[index], store.window(chrom, start, end).numpy()
+        )
+    numpy.testing.assert_array_equal(dense[0][1], coverage(SPANS, 5, 40) * 0.5)
+
+
+def test_window_group_sums_should_total_counts_and_coverage_channels_side_by_side(
+    corpus, deltas
+):
+    """Test the totals of a channel set mixing the two signals.
+
+    Given:
+        A channel of counts and a channel of coverage deltas at a scale
+        of a half, each its own group.
+    When:
+        Windows across both are totalled.
+    Then:
+        The counts group should total the values recorded inside each
+        window and the coverage group the spans' coverage over it times
+        the half.
+    """
+
+    # Arrange
+    windows = window_frame([("chr1", 5, 40), ("chr1", 18, 22), ("chr2", 0, 10)])
+
+    # Act
+    totals = cache.window_group_sums(windows, [corpus.tracks[0], deltas], [1, 1])
+
+    # Assert
+    assert totals[:, 0].tolist() == [4.0, 0.0, 2.0]
+    assert totals[:, 1].tolist() == [
+        coverage(SPANS, 5, 40).sum() * 0.5,
+        coverage(SPANS, 18, 22).sum() * 0.5,
+        0.0,
+    ]
+
+
+@settings(FILE_BACKED, max_examples=25)
+@given(spans=span_sets, bounds=window_sets)
+def test_group_track_should_densify_coverage_to_the_spans_for_any_window_set(
+    tmp_path_factory, spans, bounds
+):
+    """Test the coverage grouping against independently built coverage.
+
+    Given:
+        Any spans over one contig, written as the boundary events a
+        pileup writes, and any window set over that contig, empty
+        windows included.
+    When:
+        They are grouped and each window densified.
+    Then:
+        Every window should equal the coverage the spans imply, built
+        here one base at a time.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    path, spans = span_track(tmp_path_factory, spans)
+    windows = window_frame([("chr1", min(a, b), max(a, b)) for a, b in bounds])
+
+    # Act
+    dense = densify(cache.group_track(windows, [path]), windows)
+
+    # Assert
+    for index, (_, start, end) in enumerate(windows.iter_rows()):
+        numpy.testing.assert_array_equal(dense[index][0], coverage(spans, start, end))
+
+
+@settings(FILE_BACKED, max_examples=25)
+@given(spans=span_sets, bounds=window_sets)
+def test_window_group_sums_should_total_coverage_to_the_spans_for_any_window_set(
+    tmp_path_factory, spans, bounds
+):
+    """Test the coverage totals against independently built coverage.
+
+    Given:
+        Any spans over one contig, written as the boundary events a
+        pileup writes, and any window set over that contig, empty
+        windows included.
+    When:
+        Its windows are totalled.
+    Then:
+        Every total should be the sum of the coverage the spans imply
+        over the window, built here one base at a time.
+    """
+
+    # Arrange
+    path, spans = span_track(tmp_path_factory, spans)
+    windows = window_frame([("chr1", min(a, b), max(a, b)) for a, b in bounds])
+
+    # Act
+    totals = cache.window_group_sums(windows, [path], [1]).numpy()[:, 0]
+
+    # Assert
+    for index, (_, start, end) in enumerate(windows.iter_rows()):
+        assert totals[index] == coverage(spans, start, end).sum()
+
+
 def test_window_group_sums_should_refuse_a_track_it_cannot_verify_complete(tmp_path):
     """Test the group totals' answer for a track that does not verify.
 
@@ -1683,6 +2065,32 @@ def test_window_group_sums_should_refuse_a_track_it_cannot_verify_complete(tmp_p
 
     # Act & assert
     with pytest.raises(ValueError, match="cannot be verified complete"):
+        cache.window_group_sums(window_frame([("chr1", 8, 16)]), [root], [1])
+
+
+@pytest.mark.parametrize("fields, message", UNREADABLE_RECORDS, ids=UNREADABLE_IDS)
+def test_window_group_sums_should_refuse_a_track_whose_signal_it_cannot_read(
+    tmp_path, fields, message
+):
+    """Test the group totals' answer for a complete track no reader here can read.
+
+    Given:
+        A complete track whose record names a signal no reader knows,
+        or a known signal at the other's version.
+    When:
+        Its windows are totalled.
+    Then:
+        It should raise `ValueError` naming what is wrong with the
+        record, rather than total its rows as some signal they may not
+        be.
+    """
+
+    # Arrange
+    root = builders.write_track(str(tmp_path / "t.track.parquet"), [("chr1", 10, 1.0)])
+    builders.relabel_track(root, **fields)
+
+    # Act & assert
+    with pytest.raises(ValueError, match=message):
         cache.window_group_sums(window_frame([("chr1", 8, 16)]), [root], [1])
 
 
@@ -1983,6 +2391,34 @@ class TestWindowSignalCache:
         # Assert
         assert wide.meta["n_sites"] > narrow.meta["n_sites"]
         assert narrow.meta["n_sites"] == 0
+
+    def test_build_should_hold_a_coverage_channel_a_draw_reads_as_coverage(self, deltas):
+        """Test a cache built over a track of coverage deltas.
+
+        Given:
+            A window across the spans of a coverage track at a scale of
+            a half.
+        When:
+            A cache is built over it and the window is drawn plainly
+            and mirrored.
+        Then:
+            The plain draw should be the spans' coverage times the half
+            at every base, and the mirrored draw the same reversed.
+        """
+
+        # Arrange
+        pytest.importorskip("polars_bio")
+        windows = window_frame([("chr1", 5, 40)])
+        expected = coverage(SPANS, 5, 40) * 0.5
+
+        # Act
+        built = cache.WindowSignalCache.build(windows, [deltas], residency="memory")
+
+        # Assert
+        numpy.testing.assert_array_equal(built.window(0, 0, 35)[0].numpy(), expected)
+        numpy.testing.assert_array_equal(
+            built.window(0, 0, 35, reverse_complement=True)[0].numpy(), expected[::-1]
+        )
 
     def test_build_should_put_its_scratch_where_it_was_told(self, tracks, tmp_path):
         """Test the directory a scratch cache writes its arrays into.
@@ -4658,6 +5094,38 @@ def test_window_cache_should_build_once_and_read_the_entry_afterwards(tmp_path, 
         [1.0, 0.0, 3.0],
         [0.0, 5.0, 0.0],
     ]
+
+
+def test_window_cache_should_read_back_the_coverage_it_built(tmp_path, deltas):
+    """Test a persisted entry over a track of coverage deltas.
+
+    Given:
+        An empty cache directory, a key, and one peak window across the
+        spans of a coverage track at a scale of a half.
+    When:
+        The cache is asked for twice.
+    Then:
+        The build and the entry read back should both answer the spans'
+        coverage times the half at every base of the window.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    peaks = bounded_windows([("chr1", 5, 40)])
+    negatives = bounded_windows([])
+    expected = coverage(SPANS, 5, 40) * 0.5
+
+    def windows():
+        return peaks, negatives, "built"
+
+    # Act
+    built = cache.window_cache("dkey", windows, [deltas], cache_dir=str(tmp_path))
+    read = cache.window_cache("dkey", windows, [deltas], cache_dir=str(tmp_path))
+
+    # Assert
+    assert (built[4], read[4]) == ("built", None)
+    for entry in (built, read):
+        numpy.testing.assert_array_equal(entry[2].window(0, 0, 35)[0].numpy(), expected)
 
 
 def test_window_cache_should_address_a_negative_by_its_joint_row(tracks):
