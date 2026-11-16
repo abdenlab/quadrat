@@ -62,6 +62,9 @@ NEGATIVES = builders.intervals("chr1", 2700, 3500, 90, 20) + builders.intervals(
     "chr2", 1800, 2600, 95, 20
 )
 
+# What a pair's slot outside its epoch's plan is refused with.
+SLOT_REFUSAL = r"pair's index must be in range\(0, \d+\), the slots of epoch 0's plan"
+
 
 # Four signal channels and four control channels, so any group layout
 # of up to four channels is a prefix of each.
@@ -631,6 +634,224 @@ class TestLocusDataset:
         # Act & assert
         with pytest.raises(TypeError, match="no sampler to resolve it"):
             plain[(0, 0)]
+
+    @pytest.mark.parametrize(
+        ("is_peak", "index", "names"),
+        [
+            (True, -1, "peaks"),
+            (True, len(PEAKS), "peaks"),
+            (False, -1, "negatives"),
+            (False, len(NEGATIVES), "negatives"),
+        ],
+    )
+    def test___getitem___should_raise_when_a_draw_indexes_outside_its_set(
+        self, plain, is_peak, index, names
+    ):
+        """Test the refusal of a draw past either end of its locus set.
+
+        Given:
+            A dataset and a draw whose index is negative, or one past
+            the last locus of the set it names.
+        When:
+            The dataset is indexed by it.
+        Then:
+            It should raise `IndexError` naming the set, because the
+            negatives are read after the peaks: a negative at ``-1``
+            would have read the last peak, and a peak one past the last
+            the first negative, each under the wrong label.
+        """
+
+        # Act & assert
+        with pytest.raises(IndexError, match="the {} this dataset holds".format(names)):
+            plain[sampling.LocusDraw(is_peak, index, 0, False)]
+
+    def test___getitem___should_raise_when_a_draw_index_is_not_an_integer(self, plain):
+        """Test the refusal of a draw at a fractional index.
+
+        Given:
+            A dataset and a hand-built draw whose index is ``1.0``.
+        When:
+            The dataset is indexed by it.
+        Then:
+            It should raise `TypeError` naming the draw's index, rather
+            than an error from numpy naming nothing.
+        """
+
+        # Act & assert
+        with pytest.raises(TypeError, match="LocusDraw index must be an integer"):
+            plain[sampling.LocusDraw(True, 1.0, 0, False)]
+
+    def test___getitem___should_read_a_draw_at_a_numpy_integer_index(self, plain):
+        """Test a draw whose index is a numpy integer.
+
+        Given:
+            A dataset, and two draws of one negative, one at a Python
+            index and one at the same index as `numpy.int64`.
+        When:
+            The dataset is indexed by each.
+        Then:
+            They should read the same tensors.
+        """
+
+        # Arrange
+        draw = sampling.LocusDraw(False, 2, 0, False)
+
+        # Act
+        plain_read = plain[draw]
+        numpy_read = plain[draw._replace(index=numpy.int64(2))]
+
+        # Assert
+        assert all(torch.equal(a, b) for a, b in zip(plain_read[:2], numpy_read[:2]))
+        assert plain_read[2] == numpy_read[2] == 0
+
+    @pytest.mark.parametrize(
+        "draw", [(True, 1, 0, False), [True, 1, 0, False], "draw"], ids=repr
+    )
+    def test___getitem___should_raise_naming_the_type_of_what_is_not_a_draw(
+        self, plain, draw
+    ):
+        """Test the refusal of something shaped like a draw that is not one.
+
+        Given:
+            A dataset, and a plain tuple of a draw's four fields, a
+            list of them, and a string.
+        When:
+            The dataset is indexed by each.
+        Then:
+            It should raise `TypeError` naming the type given, rather
+            than an `AttributeError` naming ``is_peak``.
+        """
+
+        # Act & assert
+        with pytest.raises(TypeError, match="got a {}".format(type(draw).__name__)):
+            plain[draw]
+
+    @pytest.mark.parametrize(
+        "past_the_end", [False, True], ids=["negative", "past-the-end"]
+    )
+    def test___getitem___should_raise_when_a_pair_slot_is_outside_the_plan(
+        self, corpus, past_the_end
+    ):
+        """Test the refusal of a pair whose slot is not in its epoch's plan.
+
+        Given:
+            A dataset with a sampler attached.
+        When:
+            It is indexed by a pair at slot ``-1``, and at one past the
+            last slot.
+        Then:
+            It should raise `IndexError` naming the pair and the plan,
+            rather than read the last slot or raise from numpy.
+        """
+
+        # Arrange
+        reader = build_dataset(corpus, signal_groups=[1])
+        reader.sampler = sampling.PeakNegativeMixSampler(
+            reader.n_peaks, reader.n_negatives, negative_ratio=0.5
+        )
+        slot = len(reader.sampler) if past_the_end else -1
+
+        # Act & assert
+        with pytest.raises(IndexError, match=SLOT_REFUSAL):
+            reader[(0, slot)]
+
+    @pytest.mark.parametrize(
+        ("pair", "field"),
+        [((0, 1.5), "index"), ((0.5, 0), "epoch")],
+        ids=["fractional-slot", "fractional-epoch"],
+    )
+    def test___getitem___should_raise_type_error_when_a_pair_field_is_not_an_integer(
+        self, corpus, pair, field
+    ):
+        """Test the refusal of a pair whose slot or epoch is fractional.
+
+        Given:
+            A dataset with a sampler attached.
+        When:
+            It is indexed by a pair at a fractional slot, and at a
+            fractional epoch.
+        Then:
+            It should raise `TypeError` naming the field, rather than
+            truncate it to slot ``1`` or epoch ``0``.
+        """
+
+        # Arrange
+        reader = build_dataset(corpus, signal_groups=[1])
+        reader.sampler = sampling.PeakNegativeMixSampler(
+            reader.n_peaks, reader.n_negatives, negative_ratio=0.5
+        )
+
+        # Act & assert
+        with pytest.raises(
+            TypeError, match="pair's {} must be an integer".format(field)
+        ):
+            reader[pair]
+
+    def test___getitem___should_read_the_plan_of_a_negative_epoch_as_given(self, corpus):
+        """Test a pair whose epoch is negative.
+
+        Given:
+            A dataset with a sampler attached.
+        When:
+            It is indexed by the pair ``(-1, 0)``.
+        Then:
+            It should read what the first draw of the sampler's plan
+            for epoch ``-1`` reads, since an epoch is not an index into
+            anything and is not read from the end.
+        """
+
+        # Arrange
+        reader = build_dataset(corpus, signal_groups=[1])
+        reader.sampler = sampling.PeakNegativeMixSampler(
+            reader.n_peaks, reader.n_negatives, negative_ratio=0.5
+        )
+        expected = reader[reader.sampler.plan(-1)[0]]
+
+        # Act
+        read = reader[(-1, 0)]
+
+        # Assert
+        assert all(torch.equal(a, b) for a, b in zip(read[:-1], expected[:-1]))
+        assert read[-1] == expected[-1]
+
+    @settings(deadline=None, max_examples=50)
+    @given(
+        draw=st.one_of(
+            st.builds(
+                sampling.LocusDraw,
+                st.just(True),
+                st.one_of(st.integers(max_value=-1), st.integers(min_value=len(PEAKS))),
+                st.just(0),
+                st.just(False),
+            ),
+            st.builds(
+                sampling.LocusDraw,
+                st.just(False),
+                st.one_of(
+                    st.integers(max_value=-1), st.integers(min_value=len(NEGATIVES))
+                ),
+                st.just(0),
+                st.just(False),
+            ),
+        )
+    )
+    def test___getitem___should_refuse_any_draw_outside_its_set(self, plain, draw):
+        """Test the draw refusal across the integers.
+
+        Given:
+            A dataset, and a peak or negative draw at any index outside
+            the set it names, negative or not less than its size.
+        When:
+            The dataset is indexed by it.
+        Then:
+            It should raise `IndexError` naming that set, so no index
+            reads a window of the other set.
+        """
+
+        # Act & assert
+        names = "peaks" if draw.is_peak else "negatives"
+        with pytest.raises(IndexError, match="the {} this dataset holds".format(names)):
+            plain[draw]
 
     def test___getitem___should_answer_int8_sequence_and_float32_signal(self, plain):
         """Test the shapes and dtypes of one read.
