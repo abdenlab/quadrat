@@ -6,9 +6,9 @@ rows, the functions that key, write and read a persisted entry,
 `window_cache` that reads an entry or builds it, `joint_windows` that
 lays peaks and negatives out as one window set,
 `resolve_residency` that decides where a cache keeps its arrays, and
-`require_windows`, `track_list` and `window_columns`, the argument
-checks and the window decomposition this package's readers of window
-sets share.
+`require_windows`, `require_index`, `track_list` and `window_columns`,
+the argument checks and the window decomposition this package's readers
+of window sets share.
 
 Everything here is package-internal: no name carries a ``# public``
 marker and none is re-exported from `quadrat`.
@@ -20,6 +20,7 @@ import functools
 import hashlib
 import json
 import multiprocessing
+import numbers
 import os
 import shutil
 import sys
@@ -410,8 +411,8 @@ class WindowSignalCache(ProcessLocalHandles):
         """Return the dense signal for window ``index`` at ``jitter``, every channel.
 
         :param index: The window, as its row in the set this cache was
-            built for, counting from ``0``. A negative index is neither
-            supported nor refused.
+            built for, counting from ``0``, as `require_index` takes
+            one.
         :param jitter: How far the draw is shifted. A position shifted
             outside ``[0, length)`` is dropped, which is what makes a
             window near a contig edge read as zeros there rather than
@@ -427,12 +428,20 @@ class WindowSignalCache(ProcessLocalHandles):
             which a mirrored draw can also produce from a malformed
             track -- are added, as every other reader of a track adds
             them.
+        :raises TypeError: if ``index`` is not an integer as
+            `require_index` takes one.
         :raises ValueError: if ``perm`` is given and is not a
             permutation of ``range(n_channels)``, whether or not the
             draw is mirrored.
-        :raises IndexError: if ``index`` is past the last window.
+        :raises IndexError: if ``index`` is negative or past the last
+            window.
 
         .. rubric:: Implementation notes
+
+        A negative index is refused because the index is an absolute
+        row with no reading from the end: the two offset lookups wrap
+        independently, so an unchecked ``-1`` would pair the last offset
+        with the first and answer an empty run.
 
         ``perm`` is checked rather than trusted because a mirrored draw
         would otherwise answer for almost every wrong permutation: a
@@ -467,6 +476,10 @@ class WindowSignalCache(ProcessLocalHandles):
                 )
 
         offsets, pos, val, chan = self._arrays()
+        # Refused rather than read from the end; the notes say why.
+        index = require_index(
+            "index", index, len(offsets) - 1, "the windows this cache was built for"
+        )
         out = numpy.zeros((self.n_channels, length), dtype=numpy.float32)
 
         first = int(offsets[index])
@@ -1097,6 +1110,45 @@ def require_windows(caller, windows):
                 caller, type(windows).__name__
             )
         )
+
+
+def require_index(label, index, size=None, of=None):
+    """Return ``index`` as an `int`, refusing a non-integer or one outside ``range(size)``.
+
+    An index is any `numbers.Integral`, numpy's integers included,
+    except a ``bool``; a float, an array and a tensor are not integers,
+    whatever their value or size.
+
+    :param label: The name of the index, for the message.
+    :param index: The value given as an index.
+    :param size: The number of rows it indexes, or ``None`` to check
+        only that it is an integer.
+    :param of: What the rows are, for the message, e.g., ``"the
+        windows this cache was built for"``, or ``None`` to leave them
+        unnamed.
+    :returns: ``index`` as an `int`.
+    :raises TypeError: if ``index`` is not an integer, or is a
+        ``bool``.
+    :raises IndexError: if ``size`` is given and ``index`` is negative
+        or not less than it.
+
+    .. rubric:: Implementation notes
+
+    A ``bool`` is refused although Python counts it an integer, because
+    ``True`` in an index is almost always a field passed in the wrong
+    place, and reading it as ``1`` would answer row 1 silently.
+    """
+
+    if isinstance(index, bool) or not isinstance(index, numbers.Integral):
+        raise TypeError("{} must be an integer, got {!r}.".format(label, index))
+    index = int(index)
+    if size is not None and not 0 <= index < size:
+        raise IndexError(
+            "{} must be in range(0, {}){}; got {}.".format(
+                label, size, "" if of is None else ", " + of, index
+            )
+        )
+    return index
 
 
 def track_list(caller, label, tracks):
