@@ -209,23 +209,26 @@ def pileup_many(
     # or NFS mounts these corpora live on a cold `stat` is milliseconds.
     sizes = [_job_bytes(job) for job in jobs]
     bytes_per_job = _bytes_per_job(sizes)
-    # Rows per record, which divides the scan cap; see
-    # `quadrat.pileup.plan.group_floor`. The fan-out-wide plan takes the
-    # most any job contributes rather than a mean: the value is 1 or 2,
-    # so the largest is never far from typical, and the per-job pass
-    # below re-sizes each job from its own anyway.
-    points = [
-        job.get("aggregate", _DEFAULT_AGGREGATE)._points_per_record for job in jobs
-    ]
+    # Each job's sizing multiplier per record; see
+    # `quadrat.pileup.plan.group_floor`. The fan-out-wide plan solves
+    # the worker count from their mean weighted by each job's bytes,
+    # so one heavy job among many light ones weighs on it by its share
+    # of the bytes; the per-job ceiling below lowers the count where a
+    # job needs more, and the per-job pass sizes each job's batches
+    # from its own. Unsized, the plan multiplies no bytes and the weight
+    # is moot.
+    weights = [job.get("aggregate", _DEFAULT_AGGREGATE)._record_weight for job in jobs]
+    weight = 1
+    if bytes_per_job:
+        weighted = sum(size * job_weight for size, job_weight in zip(sizes, weights))
+        weight = weighted / sum(sizes)
     # Read once for the same reason. `memory_budget` opens two cgroup
     # paths, reads the SLURM environment, calls `sysconf` twice and
     # queries the affinity mask, none of which can change during the
     # planning below.
     budget = memory_budget()
     if workers is None:
-        plan = plan_pileup(
-            len(jobs), bytes_per_job, budget, points_per_record=max(points)
-        )
+        plan = plan_pileup(len(jobs), bytes_per_job, budget, record_weight=weight)
         workers, groups = plan.workers, plan.contig_groups
         # Then lowered, if the mean hid a job the chosen concurrency
         # cannot afford. The plan solves from `bytes_per_job`, and a
@@ -249,8 +252,8 @@ def pileup_many(
         # make. That branch still warns.
         if budget is not None:
             ceiling = max(
-                projected_peak(job_bytes, MAX_CONTIG_GROUPS, job_points)
-                for job_bytes, job_points in zip(sizes, points)
+                projected_peak(job_bytes, MAX_CONTIG_GROUPS, job_weight)
+                for job_bytes, job_weight in zip(sizes, weights)
             )
             workers = max(1, min(workers, budget // ceiling))
     else:
@@ -272,7 +275,7 @@ def pileup_many(
         # projecting 80, 160 and 320 GB against a 49.7 GB budget.
         workers = max(1, min(int(workers), len(jobs)))
         groups = memory_floor(
-            bytes_per_job, workers, budget, points_per_record=max(points)
+            bytes_per_job, workers, budget, record_weight=weight
         ).groups
     if target_partitions is None:
         target_partitions = default_partitions(workers)
@@ -306,8 +309,8 @@ def pileup_many(
     # the better-informed guess of the two whenever the rest of the set
     # could be measured.
     over = []
-    for index, (job, job_bytes, job_points) in enumerate(zip(jobs, sizes, points)):
-        floor = memory_floor(job_bytes, workers, budget, points_per_record=job_points)
+    for index, (job, job_bytes, job_weight) in enumerate(zip(jobs, sizes, weights)):
+        floor = memory_floor(job_bytes, workers, budget, record_weight=job_weight)
         own = floor.groups if job_bytes is not None else max(groups, floor.groups)
         resolved = int(job.setdefault("contig_groups", own))
         job.setdefault("target_partitions", target_partitions)

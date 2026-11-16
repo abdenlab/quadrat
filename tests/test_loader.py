@@ -44,6 +44,7 @@ from quadrat import cache, dataset, groups, loader, loci, sampling, stores
 from tests import (
     CONFIG_IDS,
     GOLDEN_CONFIGS,
+    SPLICED_READS,
     WORKER_TIMEOUT,
     builders,
     dense,
@@ -170,13 +171,15 @@ def corpus(corpus_factory):
     )
 
 
-@pytest.fixture(scope="module")
-def peak_spans(corpus_factory, pysam):
-    """Build seeded alignments and their peaks, and pile them up under ``"span"``.
+@pytest.fixture(scope="module", params=[False, True], ids=["unspliced", "spliced"])
+def peak_spans(request, corpus_factory, pysam):
+    """Build alignments and their peaks, and pile them up under ``"span"``.
 
-    Returns ``(corpus, track, depth)``: the corpus, and
-    `tests.pile_up_spans` over it at a scale of a third. The corpus
-    carries one track of counts beside the coverage.
+    Unspliced, the alignments are seeded records; spliced, they are
+    `SPLICED_READS`, piled up under a spliced ``"span"``. Returns
+    ``(corpus, track, depth)``: the corpus, and `tests.pile_up_spans`
+    over it at a scale of a third. The corpus carries one track of
+    counts beside the coverage.
     """
 
     corpus = corpus_factory(
@@ -185,12 +188,13 @@ def peak_spans(corpus_factory, pysam):
         n_bams=2,
         n_reads=400,
         index_fasta=True,
+        reads=SPLICED_READS if request.param else (),
         peaks=PEAKS,
         tracks=SIGNAL_ROWS[:1],
         in_window=IN_WINDOW,
         out_window=OUT_WINDOW,
     )
-    return (corpus, *pile_up_spans(corpus, "span", pysam, 1 / 3))
+    return (corpus, *pile_up_spans(corpus, "span", pysam, 1 / 3, request.param))
 
 
 @pytest.fixture(scope="module")
@@ -1184,9 +1188,11 @@ def test_build_training_loader_should_read_coverage_deltas_as_per_base_depth(
     """Test a ``"span"`` track as a signal channel and as a control.
 
     Given:
-        A coverage track piled up at a scale of a third, as the first
-        of two signal channels beside a track of counts, and as the
-        control; a loader that neither shuffles, jitters nor mirrors.
+        A coverage track piled up at a scale of a third, from unspliced
+        records or from spliced ones under a spliced ``"span"``, as the
+        first of two signal channels beside a track of counts, and as
+        the control; a loader that neither shuffles, jitters nor
+        mirrors.
     When:
         Every batch of one epoch is drawn.
     Then:

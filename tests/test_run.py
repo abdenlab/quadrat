@@ -27,11 +27,21 @@ import shutil
 import types
 
 import joblib
+import numpy
 import pytest
 
 from quadrat import Aggregate, tables
 from quadrat.pileup import plan, run
-from tests import TWO_CONTIGS, budget, builders, digest_track
+from tests import (
+    SPLICED_CONTIGS,
+    TWO_CONTIGS,
+    budget,
+    builders,
+    coverage_from_track,
+    digest_track,
+    oracle_depth,
+    strand_channels,
+)
 
 
 @pytest.fixture(scope="module")
@@ -1279,6 +1289,89 @@ def test_pileup_many_should_carry_an_aggregate_across_the_process_boundary(
             )
 
 
+@pytest.mark.workers
+def test_pileup_many_should_write_spliced_coverage_across_the_process_boundary(
+    spliced_corpus, tmp_path, pysam
+):
+    """Test spliced coverage written by a process pool against a CIGAR walk.
+
+    Given:
+        Two jobs over the two spliced alignments, one pooled and one
+        split by strand, each under a spliced ``"span"``.
+    When:
+        They are run across a process pool and read back through the
+        store.
+    Then:
+        Each channel should equal, at every base, the depth a walk of
+        each kept record's CIGAR gives over its records.
+    """
+
+    # Arrange
+    jobs = [
+        {
+            "alignments": spliced_corpus.bams,
+            "sequences": spliced_corpus.fasta,
+            "name": str(tmp_path / name),
+            "aggregate": Aggregate(position="span", unstranded=pooled, spliced=True),
+        }
+        for name, pooled in (("pooled", True), ("split", False))
+    ]
+    expected = [
+        strand_channels(
+            oracle_depth, spliced_corpus.bams, SPLICED_CONTIGS, pysam, job["aggregate"]
+        )
+        for job in jobs
+    ]
+
+    # Act
+    written = run.pileup_many(jobs, backend="process", workers=2)
+
+    # Assert
+    for paths, channels in zip(written, expected):
+        assert len(paths) == len(channels)
+        actual = coverage_from_track(paths, SPLICED_CONTIGS)
+        for chrom in SPLICED_CONTIGS:
+            numpy.testing.assert_array_equal(
+                actual[chrom], [depth[chrom] for depth in channels]
+            )
+
+
+@pytest.mark.workers
+def test_pileup_many_should_raise_a_refused_skip_across_the_process_boundary(
+    spliced_corpus, tmp_path
+):
+    """Test that an unspliced span's refusal crosses the process boundary.
+
+    Given:
+        Two jobs over the two spliced alignments, each writing into a
+        directory of its own: one under ``"span"`` without ``spliced``
+        and one under a spliced ``"span"``.
+    When:
+        They are run across a pool of two worker processes.
+    Then:
+        It should raise `ValueError` naming ``spliced=True`` to the
+        caller, and leave nothing in the refused job's directory.
+    """
+
+    # Arrange
+    jobs = []
+    for kind, spliced in (("refused", False), ("spliced", True)):
+        (tmp_path / kind).mkdir()
+        jobs.append(
+            {
+                "alignments": spliced_corpus.bams,
+                "sequences": spliced_corpus.fasta,
+                "name": str(tmp_path / kind / "span"),
+                "aggregate": Aggregate(position="span", spliced=spliced),
+            }
+        )
+
+    # Act & assert
+    with pytest.raises(ValueError, match="spliced=True"):
+        run.pileup_many(jobs, backend="process", workers=2)
+    assert os.listdir(tmp_path / "refused") == []
+
+
 @pytest.mark.parametrize("aggregate", [None, {"position": "span"}])
 def test_pileup_many_should_refuse_a_job_whose_aggregate_is_not_one(
     corpus, tmp_path, dispatched, aggregate
@@ -1305,33 +1398,115 @@ def test_pileup_many_should_refuse_a_job_whose_aggregate_is_not_one(
     assert dispatched["jobs"] == []
 
 
-def test_pileup_many_should_size_each_jobs_batches_by_its_rows_per_record(
+def test_pileup_many_should_size_each_jobs_batches_by_its_record_weight(
     corpus, tmp_path, dispatched, machine, sized
 ):
     """Test that the scan cap reaches the fan-out per job.
 
     Given:
-        Two jobs reading 6 GB each on a machine with memory to spare,
-        one counting 5' ends and one writing span coverage.
+        Three jobs reading 5 GiB each on a machine with memory to spare,
+        one counting 5' ends, one writing span coverage and one writing
+        spliced span coverage.
     When:
         The fan-out is planned.
     Then:
         The 5' job should run in one batch, its bytes under the scan
-        cap, and the span job in two, its two rows per record taking
-        it over.
+        cap, the span job in two, its record weight of two taking it to
+        10 GiB, and the spliced job in seven, its record weight of ten
+        taking it to 50 GiB against the 8 GiB cap.
     """
 
     # Arrange
     machine(64, 1024 * 1024**3)
-    sized(6 * 1024**3)
-    jobs = plain_jobs(corpus, tmp_path, ["points", "span"])
+    sized(5 * 1024**3)
+    jobs = plain_jobs(corpus, tmp_path, ["points", "span", "spliced"])
     jobs[1]["aggregate"] = Aggregate(position="span")
+    jobs[2]["aggregate"] = Aggregate(position="span", spliced=True)
 
     # Act
-    run.pileup_many(jobs, backend="process", workers=2)
+    run.pileup_many(jobs, backend="process", workers=3)
 
     # Assert
-    assert [job["contig_groups"] for job in dispatched["jobs"]] == [1, 2]
+    assert [job["contig_groups"] for job in dispatched["jobs"]] == [1, 2, 7]
+
+
+def test_pileup_many_should_run_as_many_workers_as_without_a_lone_spliced_job(
+    corpus, tmp_path, dispatched, machine, sized
+):
+    """Test that one heavy job weighs on the fan-out by its share of the bytes.
+
+    Given:
+        A 16-core, 128 GB machine and three fan-outs of 31 jobs of
+        1.5 GB each: one all counting 5' ends, one the same with the
+        last writing spliced span coverage, and one all writing spliced
+        span coverage.
+    When:
+        Each fan-out is planned with no worker count.
+    Then:
+        The fan-out with one spliced job should run as many workers as
+        the one with none, though the all-spliced one runs fewer, so
+        memory would allow fewer if the lone job set every worker's
+        size.
+    """
+
+    # Arrange
+    machine(16, 128 * 1024**3)
+    sized(1536 * 1024**2)
+    spliced = Aggregate(position="span", spliced=True)
+    names = ["j{}".format(index) for index in range(31)]
+    fan_outs = {}
+    for kind, heavy in (("points", 0), ("mixed", 1), ("spliced", 31)):
+        (tmp_path / kind).mkdir()
+        jobs = plain_jobs(corpus, tmp_path / kind, names)
+        for job in jobs[len(jobs) - heavy :]:
+            job["aggregate"] = spliced
+        fan_outs[kind] = jobs
+
+    # Act
+    workers = {}
+    for kind, jobs in fan_outs.items():
+        run.pileup_many(jobs, backend="process")
+        workers[kind] = dispatched["n_jobs"]
+
+    # Assert
+    assert workers["mixed"] == workers["points"]
+    assert workers["spliced"] < workers["points"]
+
+
+def test_pileup_many_should_weigh_each_jobs_record_weight_by_its_bytes(
+    corpus, tmp_path, dispatched, machine, sized
+):
+    """Test that the fan-out plans from the jobs' mean record weight weighted by bytes.
+
+    Given:
+        A 32-core, 128 GiB machine and eight jobs: seven counting 5'
+        ends over 2 GiB each and one writing spliced span coverage over
+        4 GiB, so the mean weight is three by bytes and 2.125 by job.
+    When:
+        The fan-out is planned with no worker count.
+    Then:
+        It should run the workers the planner gives the mean job at a
+        record weight of three, which is seven where the plain mean
+        would give eight.
+    """
+
+    # Arrange
+    machine(32, 128 * 1024**3)
+    names = ["s{}".format(index) for index in range(7)] + ["spliced"]
+    jobs = plain_jobs(corpus, tmp_path, names)
+    jobs[-1]["aggregate"] = Aggregate(position="span", spliced=True)
+    sizes = {job["alignments"][0]: 2 * 1024**3 for job in jobs[:-1]}
+    sizes[jobs[-1]["alignments"][0]] = 4 * 1024**3
+    sized(sizes)
+    free = budget(plan, 128 * 1024**3, 32)
+    mean = sum(sizes.values()) // len(sizes)
+
+    # Act
+    run.pileup_many(jobs, backend="process")
+
+    # Assert
+    expected = plan.plan_pileup(8, mean, free, record_weight=3).workers
+    assert dispatched["n_jobs"] == expected == 7
 
 
 def test_pileup_many_should_leave_every_table_verifiable_after_a_parallel_run(

@@ -39,6 +39,7 @@ def aggregates(draw):
         if position == "midpoint"
         else st.one_of(st.none(), st.booleans())
     )
+    spliced = draw(st.booleans()) if position == "span" else False
     return Aggregate(
         exclude_flags=exclude,
         require_flags=require,
@@ -50,6 +51,7 @@ def aggregates(draw):
         end_shift=shifts[1],
         unstranded=unstranded,
         scale_factor=draw(st.floats(-1e6, 1e6, allow_nan=False)),
+        spliced=spliced,
     )
 
 
@@ -68,7 +70,8 @@ class TestAggregate:
         Then:
             It should exclude unmapped, secondary, QC-failed, duplicate
             and supplementary records and nothing else, require no
-            flag, and count stranded 5' ends unshifted and unscaled.
+            flag, and count stranded 5' ends unshifted, unscaled and
+            unspliced.
         """
 
         # Act
@@ -84,6 +87,7 @@ class TestAggregate:
         assert (aggregate.start_shift, aggregate.end_shift) == (0, 0)
         assert aggregate.unstranded is False
         assert aggregate.scale_factor == 1.0
+        assert aggregate.spliced is False
 
     @pytest.mark.parametrize(
         "field, value",
@@ -100,6 +104,9 @@ class TestAggregate:
             ("unstranded", "yes"),
             ("scale_factor", "2"),
             ("scale_factor", True),
+            ("spliced", 1),
+            ("spliced", "yes"),
+            ("spliced", None),
         ],
     )
     def test___init___should_refuse_a_field_of_the_wrong_type(self, field, value):
@@ -176,6 +183,45 @@ class TestAggregate:
         # Act & assert
         with pytest.raises(ValueError, match="takes no shift"):
             Aggregate(position=position, unstranded=True, **{shift: 4})
+
+    @pytest.mark.parametrize("position", ["five_prime", "three_prime", "midpoint"])
+    def test___init___should_refuse_spliced_under_a_rule_other_than_span(self, position):
+        """Test that only a span takes ``spliced``.
+
+        Given:
+            Each rule that names one position per record, and
+            ``spliced=True``.
+        When:
+            An `Aggregate` is constructed.
+        Then:
+            It should raise `ValueError` naming ``"span"``, since there
+            is no span whose skipped reference could be left out.
+        """
+
+        # Act & assert
+        with pytest.raises(ValueError, match="spliced applies to 'span' alone"):
+            Aggregate(position=position, unstranded=True, spliced=True)
+
+    @pytest.mark.parametrize(
+        "position", ["five_prime", "three_prime", "midpoint", "span"]
+    )
+    def test___init___should_accept_unspliced_under_every_rule(self, position):
+        """Test that ``spliced=False`` is every rule's own default.
+
+        Given:
+            Each of the four rules, ``"span"`` among them, and
+            ``spliced=False`` given explicitly.
+        When:
+            An `Aggregate` is constructed.
+        Then:
+            It should equal the record built without it.
+        """
+
+        # Act
+        aggregate = Aggregate(position=position, unstranded=True, spliced=False)
+
+        # Assert
+        assert aggregate == Aggregate(position=position, unstranded=True)
 
     def test___init___should_refuse_a_stranded_midpoint(self):
         """Test that the midpoint rule is not split by strand.
@@ -295,8 +341,8 @@ class TestAggregate:
         """Test that a numpy string and a numpy bool are normalized.
 
         Given:
-            A position rule given as a `numpy.str_` and ``unstranded``
-            as a `numpy.bool_`.
+            A position rule given as a `numpy.str_`, and ``unstranded``
+            and ``spliced`` as `numpy.bool_`.
         When:
             An `Aggregate` is constructed and pickled.
         Then:
@@ -306,14 +352,19 @@ class TestAggregate:
         """
 
         # Arrange
-        plain = Aggregate(position="span", unstranded=True)
+        plain = Aggregate(position="span", unstranded=True, spliced=True)
 
         # Act
-        aggregate = Aggregate(position=numpy.str_("span"), unstranded=numpy.bool_(True))
+        aggregate = Aggregate(
+            position=numpy.str_("span"),
+            unstranded=numpy.bool_(True),
+            spliced=numpy.bool_(True),
+        )
 
         # Assert
         assert type(aggregate.position) is str
         assert type(aggregate.unstranded) is bool
+        assert type(aggregate.spliced) is bool
         assert aggregate == plain
         assert pickle.dumps(aggregate) == pickle.dumps(plain)
 
@@ -447,3 +498,18 @@ class TestAggregate:
 
         # Act & assert
         assert Aggregate(position=position, unstranded=True).signal == signal
+
+    def test_signal_should_name_coverage_deltas_for_a_spliced_span(self):
+        """Test what a spliced span's values mean.
+
+        Given:
+            ``"span"`` with ``spliced``.
+        When:
+            The record's signal is read.
+        Then:
+            It should be coverage deltas, read as an unspliced span's
+            are.
+        """
+
+        # Act & assert
+        assert Aggregate(position="span", spliced=True).signal == "coverage_deltas"

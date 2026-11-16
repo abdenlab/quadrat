@@ -12,6 +12,7 @@ over are here for the same reason: the plan digests and the batch
 digests are pinned in different modules over one set.
 """
 
+import dataclasses
 import hashlib
 import importlib.util
 import os
@@ -110,6 +111,34 @@ LAST_BASE_READS = (
     ("inside", "chr1", 50, "20M", 0),
     ("last1", "chr1", 980, "20M", 0),
     ("last2", "chr2", 470, "30M", 16),
+)
+
+# A geometry and records for spliced coverage: ``(name, chrom, pos,
+# cigar, flag)``, as ``corpus_factory`` places them, under a header that
+# declares both contigs longer than the reference. They hold the case
+# the CIGAR decomposition is easiest to get wrong in each way: two
+# skipped runs of one length in one record, three identical records, a
+# deletion on either side of a skip, clips and insertions beside one,
+# ``=`` and ``X``, runs closing past a contig and a record starting past
+# one, beside unspliced records and a deletion with no skip.
+SPLICED_CONTIGS = MappingProxyType({"chr1": 2100, "chr2": 500})
+SPLICED_HEADER = MappingProxyType({"chr1": 2200, "chr2": 600})
+SPLICED_READS = (
+    ("issue", "chr1", 2000, "5M10N5M", 0),
+    ("repeat", "chr1", 100, "23M112N20M102N32M102N25M", 16),
+    ("same1", "chr1", 600, "10M50N10M", 0),
+    ("same2", "chr1", 600, "10M50N10M", 0),
+    ("same3", "chr1", 600, "10M50N10M", 0),
+    ("del_skip", "chr1", 900, "10M3D2N5M", 0),
+    ("skip_del", "chr1", 950, "5M2N3D10M", 16),
+    ("clipped", "chr1", 1200, "3S10M2I5M40N8M4S", 0),
+    ("matched", "chr1", 1300, "5=1X4=30N10M", 16),
+    ("plain", "chr1", 1250, "30M", 0),
+    ("plain_r", "chr1", 1260, "30M", 16),
+    ("deleted", "chr2", 100, "10M5D10M", 0),
+    ("past", "chr1", 2080, "10M30N20M", 0),
+    ("past_r", "chr2", 470, "20M20N20M", 16),
+    ("beyond", "chr2", 520, "5M5N5M", 0),
 )
 
 # How long a loader with workers may wait on one, so a worker that
@@ -430,14 +459,60 @@ def oracle_depth(bam_paths, chrom_sizes, pysam, aggregate):
     return {c: v * aggregate.scale_factor for c, v in dense.items()}
 
 
-def pile_up_spans(corpus, name, pysam, scale_factor=1.0):
+def strand_channels(oracle, bam_paths, chrom_sizes, pysam, aggregate):
+    """Return what each channel of a pileup under ``aggregate`` should hold.
+
+    One mapping per channel, in channel order, as ``oracle`` (`oracle_pileup`
+    or `oracle_depth`) answers for that channel's records: every kept
+    record under an unstranded aggregate, and otherwise the forward
+    records and then the reverse ones. A channel's records are the pooled
+    filter with its strand's flag excluded or required, so a mask that
+    already excludes ``0x10`` leaves the reverse channel empty. ``pysam``
+    is passed in, as it is to `record_placements`.
+    """
+
+    pooled = dataclasses.replace(aggregate, unstranded=True)
+    if aggregate.unstranded:
+        return [oracle(bam_paths, chrom_sizes, pysam, pooled)]
+    forward = dataclasses.replace(pooled, exclude_flags=pooled.exclude_flags | 0x10)
+    channels = [oracle(bam_paths, chrom_sizes, pysam, forward)]
+    if pooled.exclude_flags & 0x10:
+        channels.append({c: numpy.zeros(n) for c, n in chrom_sizes.items()})
+    else:
+        reverse = dataclasses.replace(pooled, require_flags=pooled.require_flags | 0x10)
+        channels.append(oracle(bam_paths, chrom_sizes, pysam, reverse))
+    return channels
+
+
+def coverage_from_track(paths, chrom_sizes):
+    """Return each channel's dense values per contig, read through the store.
+
+    One array per contig of ``chrom_sizes``, a row per channel in the
+    order of ``paths``. A channel of coverage deltas comes back as the
+    coverage its prefix sum gives, and a channel of counts as the
+    counts.
+    """
+
+    # On call, as `pile_up_spans` imports the package: importing it here
+    # at module scope would precede the cache variable `tests.conftest`
+    # sets.
+    stores = pytest.importorskip("quadrat.stores")
+    store = stores.TrackStore(paths)
+    return {
+        chrom: store.window(chrom, 0, size).numpy().astype(numpy.float64)
+        for chrom, size in chrom_sizes.items()
+    }
+
+
+def pile_up_spans(corpus, name, pysam, scale_factor=1.0, spliced=False):
     """Pile a corpus's alignments up unstranded under ``"span"``, beside pysam's depth.
 
-    The track is written at ``scale_factor`` as ``name`` inside the
-    corpus's own directory, and the depth is `oracle_depth`'s over the
-    same records at the same scale, per contig of the corpus. Skips the
-    requesting test without the ``pileup`` extra. ``pysam`` is passed
-    in, as it is to `record_placements`.
+    The track is written at ``scale_factor`` and ``spliced`` as
+    ``name`` inside the corpus's own directory, and the depth is
+    `oracle_depth`'s over the same records at the same scale, per
+    contig of the corpus. Skips the requesting test without the
+    ``pileup`` extra. ``pysam`` is passed in, as it is to
+    `record_placements`.
 
     :returns: ``(track, depth)``.
     """
@@ -445,7 +520,7 @@ def pile_up_spans(corpus, name, pysam, scale_factor=1.0):
     pytest.importorskip("polars_bio")
     pileup = pytest.importorskip("quadrat.pileup")
     aggregate = pileup.Aggregate(
-        position="span", unstranded=True, scale_factor=scale_factor
+        position="span", unstranded=True, scale_factor=scale_factor, spliced=spliced
     )
     (track,) = pileup.pileup_alignments(
         corpus.bams, corpus.fasta, corpus.path(name), aggregate=aggregate

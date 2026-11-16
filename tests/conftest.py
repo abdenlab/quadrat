@@ -34,7 +34,16 @@ import tempfile
 
 import pytest
 
-from tests import DELTA_ROWS, LAST_BASE_READS, TWO_CONTIGS, builders, pile_up_spans
+from tests import (
+    DELTA_ROWS,
+    LAST_BASE_READS,
+    SPLICED_CONTIGS,
+    SPLICED_HEADER,
+    SPLICED_READS,
+    TWO_CONTIGS,
+    builders,
+    pile_up_spans,
+)
 
 # Progress bars in a captured suite are noise that also slows it down.
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -462,6 +471,26 @@ def span_corpus(corpus_factory):
 
     pytest.importorskip("polars_bio")
     return corpus_factory("spans", TWO_CONTIGS, n_bams=2, n_reads=300, index_fasta=True)
+
+
+@pytest.fixture(scope="session")
+def spliced_corpus(corpus_factory):
+    """Two indexed alignments of `SPLICED_READS` each, over `SPLICED_CONTIGS`.
+
+    Both alignments hold every record, under `SPLICED_HEADER`, so a
+    channel pools identical records across files as well as within
+    one. Skips the requesting test without the ``pileup`` extra.
+    """
+
+    pytest.importorskip("polars_bio")
+    return corpus_factory(
+        "spliced",
+        SPLICED_CONTIGS,
+        n_bams=2,
+        index_fasta=True,
+        header_contigs=SPLICED_HEADER,
+        reads=SPLICED_READS,
+    )
 
 
 @pytest.fixture(scope="session")
