@@ -404,28 +404,29 @@ def oracle_pileup(bam_paths, chrom_sizes, pysam, aggregate):
 def oracle_depth(bam_paths, chrom_sizes, pysam, aggregate):
     """Return per-base depth per contig over the records an aggregate keeps.
 
-    What ``samtools depth`` reports, read through pysam's
-    ``count_coverage`` with no base-quality floor: a base counts where
-    a record aligns a query base to it, so a deletion or a skipped
-    region is not covered. On records with neither, that is the
-    coverage of their span. ``pysam`` is passed in, as it is to
-    `record_placements`.
+    What ``samtools depth -a -J`` reports, found by walking each kept
+    record's CIGAR as pysam's ``cigartuples`` gives it: a base counts
+    where an ``M``, ``D``, ``=`` or ``X`` operation covers it, an ``N``
+    passes over the bases it skips without covering them, and ``I``,
+    ``S``, ``H`` and ``P`` consume no reference. A base past its contig
+    is dropped, as is a record on a contig ``chrom_sizes`` does not
+    name. ``pysam`` is passed in, as it is to `record_placements`.
     """
 
+    covering = (pysam.CMATCH, pysam.CDEL, pysam.CEQUAL, pysam.CDIFF)
     dense = {c: numpy.zeros(n, dtype=numpy.float64) for c, n in chrom_sizes.items()}
     for path in bam_paths:
         with pysam.AlignmentFile(path, "rb") as bam:
-            for chrom in dense:
-                if chrom not in bam.references:
+            for read in bam.fetch(until_eof=True):
+                if not oracle_kept(read, aggregate) or read.reference_name not in dense:
                     continue
-                counts = bam.count_coverage(
-                    chrom,
-                    0,
-                    chrom_sizes[chrom],
-                    quality_threshold=0,
-                    read_callback=lambda read: oracle_kept(read, aggregate),
-                )
-                dense[chrom] += numpy.sum(counts, axis=0)
+                row = dense[read.reference_name]
+                pos = read.reference_start
+                for op, length in read.cigartuples:
+                    if op in covering:
+                        row[pos : pos + length] += 1
+                    if op in covering or op == pysam.CREF_SKIP:
+                        pos += length
     return {c: v * aggregate.scale_factor for c, v in dense.items()}
 
 
