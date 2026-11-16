@@ -10,9 +10,9 @@ imports ``torch``, which `import quadrat` does not.
 import numpy
 import torch
 
-from quadrat.cache import joint_windows, require_windows
+from quadrat.cache import joint_windows, require_index, require_windows
 from quadrat.groups import channel_permutation_from_groups
-from quadrat.sampling import PeakNegativeMixSampler
+from quadrat.sampling import LocusDraw, PeakNegativeMixSampler
 
 
 class LocusDataset(torch.utils.data.Dataset):
@@ -21,8 +21,15 @@ class LocusDataset(torch.utils.data.Dataset):
     Indexed by a draw rather than by a position. The draw is either a
     `quadrat.sampling.LocusDraw`, or an ``(epoch, index)`` pair, which
     names slot ``index`` of ``sampler``'s plan for ``epoch`` and reads
-    as that slot's draw. A bare integer is refused, since it names
-    neither a locus set nor an epoch.
+    as that slot's draw. Anything else raises `TypeError`; a bare
+    integer is named as such, since it says neither which locus set
+    to read from nor which epoch's plan.
+
+    A pair's epoch and slot and a draw's ``index`` are integers as
+    `quadrat.cache.require_index` takes them, and anything else raises
+    `TypeError`. The epoch is planned as given. A slot outside the
+    plan, or a draw's ``index`` outside the set its ``is_peak`` picks,
+    raises `IndexError` rather than reading from the end.
 
     A read answers ``(sequence, signal, label)``, or ``(sequence,
     control, signal, label)`` with a control cache:
@@ -111,6 +118,11 @@ class LocusDataset(torch.utils.data.Dataset):
 
     .. rubric:: Implementation notes
 
+    A draw's ``index`` is checked against its own set because the
+    negatives are read after the peaks, so a negative's index read from
+    the end, or a peak's past the last, would answer a window of the
+    other set under this one's label, and no reader downstream can tell.
+
     Resolving an ``(epoch, index)`` pair here rather than ahead of the
     worker boundary sends two integers to a worker instead of a draw,
     and costs the worker one plan per epoch, which the sampler keeps.
@@ -191,17 +203,36 @@ class LocusDataset(torch.utils.data.Dataset):
                     "no sampler to resolve it against; give it one, or "
                     "index it with a LocusDraw."
                 )
-            epoch, index = draw
-            draw = self.sampler.plan(int(epoch))[int(index)]
+            epoch, slot = draw
+            plan = self.sampler.plan(require_index("(epoch, index) pair's epoch", epoch))
+            slot = require_index(
+                "(epoch, index) pair's index",
+                slot,
+                len(plan),
+                "the slots of epoch {}'s plan".format(plan.epoch),
+            )
+            draw = plan[slot]
         elif isinstance(draw, (int, numpy.integer)):
             raise TypeError(
                 "LocusDataset is indexed by a LocusDraw or an (epoch, "
                 "index) pair, not a bare integer: an integer does not say "
                 "which locus set to read from, nor which epoch's plan."
             )
+        elif not isinstance(draw, LocusDraw):
+            raise TypeError(
+                "LocusDataset is indexed by a LocusDraw or an (epoch, "
+                "index) pair, got a {}.".format(type(draw).__name__)
+            )
 
+        # Before the offset below; the notes say why.
+        index = require_index(
+            "LocusDraw index",
+            draw.index,
+            self._n_peaks if draw.is_peak else self._n_negatives,
+            "the {} this dataset holds".format("peaks" if draw.is_peak else "negatives"),
+        )
         # Negatives follow the peaks, as `joint_windows` lays them out.
-        row = draw.index if draw.is_peak else self._n_peaks + draw.index
+        row = index if draw.is_peak else self._n_peaks + index
         start = int(self._in_starts[row]) + draw.jitter
         mirrored = draw.reverse_complement
 

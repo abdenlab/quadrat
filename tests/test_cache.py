@@ -304,6 +304,111 @@ def inputs(root, *, peaks=(("chr1", 8, 16),), track_rows=None):
     }
 
 
+@settings(deadline=None, max_examples=100)
+@given(data=st.data(), size=st.integers(1, 2**40))
+@pytest.mark.parametrize("kind", [int, numpy.int64], ids=["int", "int64"])
+def test_require_index_should_answer_an_index_in_range_as_an_int(kind, data, size):
+    """Test the range rule on the indexes it admits.
+
+    Given:
+        Any row count, and any index in ``range(size)``, as a Python
+        `int` and as a numpy one.
+    When:
+        The index is required to index that many rows.
+    Then:
+        It should be answered as the same value, a Python `int`.
+    """
+
+    # Arrange
+    index = data.draw(st.integers(0, size - 1))
+
+    # Act
+    answered = cache.require_index("row", kind(index), size, "the rows")
+
+    # Assert
+    assert answered == index
+    assert type(answered) is int
+
+
+@settings(deadline=None, max_examples=100)
+@given(data=st.data(), size=st.integers(0, 2**40))
+@pytest.mark.parametrize("kind", [int, numpy.int64], ids=["int", "int64"])
+def test_require_index_should_refuse_an_index_out_of_range(kind, data, size):
+    """Test the range rule on the indexes it refuses.
+
+    Given:
+        Any row count, and any index outside ``range(size)``, negative
+        or not less than it, as a Python `int` and as a numpy one.
+    When:
+        The index is required to index that many rows.
+    Then:
+        It should raise `IndexError` naming the label, never reading a
+        negative index from the end.
+    """
+
+    # Arrange
+    index = data.draw(
+        st.one_of(st.integers(-(2**62), -1), st.integers(size, size + 2**40))
+    )
+
+    # Act & assert
+    with pytest.raises(IndexError, match="row must be in range"):
+        cache.require_index("row", kind(index), size, "the rows")
+
+
+@pytest.mark.parametrize("index", [True, numpy.bool_(False), 1.0, "1"], ids=repr)
+def test_require_index_should_raise_type_error_when_not_an_integer(index):
+    """Test the integer rule on values that are not integers.
+
+    Given:
+        A ``bool``, a numpy ``bool``, a float and a string.
+    When:
+        Each is required to be an index, with no row count.
+    Then:
+        It should raise `TypeError` naming the label.
+    """
+
+    # Act & assert
+    with pytest.raises(TypeError, match="row must be an integer"):
+        cache.require_index("row", index)
+
+
+@pytest.mark.parametrize("index", [-5, 0, 2**70], ids=repr)
+def test_require_index_should_answer_any_integer_when_given_no_size(index):
+    """Test the integer rule alone.
+
+    Given:
+        A negative integer, zero, and one past any row count.
+    When:
+        Each is required to be an index with no row count.
+    Then:
+        It should be answered unchanged.
+    """
+
+    # Act
+    answered = cache.require_index("row", index)
+
+    # Assert
+    assert answered == index
+
+
+def test_require_index_should_leave_the_rows_unnamed_when_of_is_none():
+    """Test the refusal's message when the rows have no name.
+
+    Given:
+        A row count and no name for the rows.
+    When:
+        An index past the last row is required.
+    Then:
+        It should raise `IndexError` naming the range and the index,
+        with nothing between them.
+    """
+
+    # Act & assert
+    with pytest.raises(IndexError, match=r"^row must be in range\(0, 2\); got 5\.$"):
+        cache.require_index("row", 5, 2)
+
+
 def test_require_windows_should_accept_a_polars_frame():
     """Test the windows check on the one type it admits.
 
@@ -3264,31 +3369,97 @@ class TestWindowSignalCache:
         assert tuple(empty.shape) == (2, 20)
         assert empty.sum() == 0
 
-    def test_window_should_refuse_an_index_past_the_last_window(self, tracks):
+    @pytest.mark.parametrize("residency", cache.RESIDENCIES)
+    @pytest.mark.parametrize("index", [-1, -2, -3, 2])
+    def test_window_should_refuse_an_index_outside_its_windows(
+        self, tracks, residency, index
+    ):
         """Test a draw from a window the cache was not built for.
 
         Given:
-            A cache built for one window.
+            A cache built for two windows, held in memory or mapped.
         When:
-            A second window is read.
+            A window is read at a negative index, or one past the last.
         Then:
-            It should raise, because the index is the sampler's row
-            number and one past the set is a caller error rather than
-            an empty draw.
-
-        The positive side only. A negative index is outside the
-        contract, neither refused nor supported, so nothing here pins
-        what one answers.
+            It should raise `IndexError` naming the range.
         """
 
         # Arrange
         built = cache.WindowSignalCache.build(
-            window_frame([("chr1", 8, 16)]), tracks, residency="memory"
+            window_frame([("chr1", 8, 16), ("chr1", 20, 28)]),
+            tracks,
+            residency=residency,
         )
 
         # Act & assert
-        with pytest.raises(IndexError):
-            built.window(1, 0, 8)
+        with pytest.raises(IndexError, match=r"range\(0, 2\).*got {}\.".format(index)):
+            built.window(index, 0, 8)
+
+    @pytest.mark.parametrize(
+        "index",
+        [
+            1.0,
+            0.5,
+            -0.5,
+            True,
+            numpy.array([1]),
+            torch.tensor(1),
+            torch.tensor([1]),
+        ],
+        ids=repr,
+    )
+    def test_window_should_refuse_an_index_that_is_not_an_integer(self, tracks, index):
+        """Test a draw at an index that is not an integer.
+
+        Given:
+            A cache built for two windows.
+        When:
+            A window is read at a float, a `bool`, a one-element array,
+            or a tensor of either shape.
+        Then:
+            It should raise `TypeError` naming the index, rather than a
+            range complaint, an error from numpy naming nothing, or a
+            read of window ``1``.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            window_frame([("chr1", 8, 16), ("chr1", 20, 28)]),
+            tracks,
+            residency="memory",
+        )
+
+        # Act & assert
+        with pytest.raises(TypeError, match="index must be an integer"):
+            built.window(index, 0, 8)
+
+    @pytest.mark.parametrize("index", [numpy.int64(1), numpy.uint8(1)], ids=repr)
+    def test_window_should_read_a_numpy_integer_index(self, tracks, index):
+        """Test a draw at an index that is an integer but not a Python `int`.
+
+        Given:
+            A cache built for two windows, the second holding signal.
+        When:
+            The second window is read at a numpy integer.
+        Then:
+            It should answer what ``window(1)`` answers, which is not
+            the empty run a misread index would give.
+        """
+
+        # Arrange
+        built = cache.WindowSignalCache.build(
+            window_frame([("chr1", 20, 28), ("chr1", 8, 16)]),
+            tracks,
+            residency="memory",
+        )
+        expected = built.window(1, 0, 8)
+        assert expected.abs().sum() > 0
+
+        # Act
+        read = built.window(index, 0, 8)
+
+        # Assert
+        assert torch.equal(read, expected)
 
     def test_window_should_answer_a_draw_the_caller_may_write_to(self, tracks):
         """Test whether a draw aliases the arrays behind it.
