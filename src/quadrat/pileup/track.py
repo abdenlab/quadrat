@@ -45,7 +45,7 @@ from quadrat.alignments import (
 )
 from quadrat.pileup.aggregate import Aggregate
 from quadrat.pileup.plan import n_cpus, plan_pileup
-from quadrat.pileup.sql import pileup_sql
+from quadrat.pileup.sql import SKIPPED_REFERENCE_POS, pileup_sql
 from quadrat.reference import chrom_lengths
 from quadrat.tables import TrackWriter, strand_slices, track_paths
 
@@ -153,13 +153,14 @@ def pileup_alignments(
         ever live, and the output is byte-identical at any count.
         ``None`` solves for this machine *and* for the bytes this job
         reads: one batch on a small input, more when a single batch
-        would scan past 8 GB -- 4 GB under ``"span"``, which contributes
-        two rows per record -- however much memory the machine has, and
-        more again when one batch would project past what memory is
-        free, and never more than eight. Eight is the solver's ceiling
-        and not the parameter's: a count you pass is honoured as
-        given, because how much of the genome to hold at once is a
-        decision this surface exposes rather than makes.
+        would scan past 8 GiB of alignment -- 4 GiB under an unspliced
+        ``"span"`` and 0.8 GiB under a spliced one -- however much
+        memory the machine has, and more again when one batch would
+        project past what memory is free, and never more than eight.
+        Eight is the solver's ceiling and not the parameter's: a count
+        you pass is honoured as given, because how much of the genome
+        to hold at once is a decision this surface exposes rather than
+        makes.
     :param verbose: Wire this package's progress records to stdout for
         the duration of the call. The records are emitted whatever this
         says; see `reporting`.
@@ -185,8 +186,13 @@ def pileup_alignments(
     :raises ValueError: If ``alignments`` is ``None`` or an empty
         collection, if an alignment's path ends in neither ``.bam`` nor
         ``.sam``, if an alignment whose header can be read names no
-        contig the reference does, or if ``target_partitions`` or
-        ``contig_groups`` is a string `int` cannot parse.
+        contig the reference does, if ``target_partitions`` or
+        ``contig_groups`` is a string `int` cannot parse, or if
+        ``aggregate`` refuses a record it keeps, as `Aggregate`'s
+        ``"span"`` entry states. That last is raised when the
+        first contig batch holding such a record has been grouped,
+        before any table is committed; pass ``spliced=True`` to cover
+        such records with their skipped runs left out.
 
     .. rubric:: Implementation notes
 
@@ -205,7 +211,7 @@ def pileup_alignments(
     ENCSR483RKN, which is why dividing the machine between concurrent
     pileups costs little and is what `pileup_many` does.
 
-    The two thresholds above are stated as numbers rather than as the
+    The thresholds above are stated as numbers rather than as the
     constants `quadrat.pileup.plan` holds them in. Publishing a
     constant so that a docstring may name it gives a caller nothing the
     number does not.
@@ -306,14 +312,20 @@ def pileup_alignments(
         tables = register_alignments(alignments)
         stack.callback(deregister_alignments, tables)
 
-        sizes = polars.DataFrame(
-            {
-                "chrom": list(lengths.keys()),
-                "length": list(lengths.values()),
-            },
-            schema={"chrom": polars.Utf8, "length": polars.Int64},
+        # Bound to no local, so a refusal's traceback holds no frame.
+        stack.enter_context(
+            registered_frames(
+                {
+                    SIZES_TABLE: polars.DataFrame(
+                        {
+                            "chrom": list(lengths.keys()),
+                            "length": list(lengths.values()),
+                        },
+                        schema={"chrom": polars.Utf8, "length": polars.Int64},
+                    )
+                }
+            )
         )
-        stack.enter_context(registered_frames({SIZES_TABLE: sizes}))
 
         if target_partitions is None:
             # The cores this process may use, not the machine's, so a
@@ -399,7 +411,7 @@ def pileup_alignments(
             except OSError:
                 total = None
             contig_groups = plan_pileup(
-                1, total, points_per_record=aggregate._points_per_record
+                1, total, record_weight=aggregate._record_weight
             ).contig_groups
         batches = contig_batches(lengths, available, contig_groups)
         warn_unindexed_split(alignments, available, batches)
@@ -423,7 +435,20 @@ def pileup_alignments(
             ]
 
             for batch in batches:
-                _pileup_group(pb, writers, tables, batch, aggregate)
+                skipped = _pileup_group(pb, writers, tables, batch, aggregate)
+                # Raised here, after the group's frame is released and
+                # inside the writers' stack, so nothing is committed.
+                if skipped is not None:
+                    records, chroms = skipped
+                    raise ValueError(
+                        "At least {:.0f} record(s) this span aggregate keeps "
+                        "skip reference (a CIGAR N, e.g., an RNA-seq read "
+                        "across an intron) on {}. A span from start to end "
+                        "would cover each skipped run, so no table was "
+                        "written. Pass Aggregate(position='span', "
+                        "spliced=True, ...) to cover those records with "
+                        "their skipped runs left out.".format(records, ", ".join(chroms))
+                    )
 
             for path, writer in zip(paths, writers):
                 log.info("GIQL engine: wrote %s positions to %s", writer.rows, path)
@@ -432,14 +457,25 @@ def pileup_alignments(
 
 
 def _pileup_group(pb, writers, tables, batch, aggregate):
-    """Group one contig batch and stage it.
+    """Group one contig batch and stage it, or report why it cannot be.
+
+    Returns ``None`` once the batch is staged, or when no alignment in
+    the job has anything in it. A batch holding
+    `SKIPPED_REFERENCE_POS` rows, which `pileup_sql` writes for each
+    record `Aggregate`'s ``"span"`` entry refuses without ``spliced``,
+    is not staged: this returns ``(records, chroms)``, how many such
+    records there are and the sorted contigs they are on, for the
+    caller to refuse with.
 
     A function rather than the body of a loop, and deliberately so. The
     slices `strand_slices` hands back are views over ``frame``, so any
     one of them still bound -- including a loop variable left over after
     the loop ends -- pins the entire group and gives back the memory
     that grouping exists to save. Returning drops all of them at once,
-    where a scattering of ``del`` statements would not.
+    where a scattering of ``del`` statements would not. The refusal is
+    returned rather than raised for the same reason: an exception raised
+    here would hold ``frame`` in its traceback for as long as anyone
+    held the exception.
     """
 
     polars = import_on_first_use("polars")
@@ -450,6 +486,15 @@ def _pileup_group(pb, writers, tables, batch, aggregate):
         return
 
     frame = pb.sql(sql).collect()
+
+    # Under every aggregate: no other row sits at that position; see
+    # `SKIPPED_REFERENCE_POS`.
+    skipped = frame.filter(polars.col("pos") == SKIPPED_REFERENCE_POS)
+    if skipped.height:
+        return (
+            skipped["value"].sum() / 2,
+            sorted(set(skipped["chrom"].to_list())),
+        )
 
     # The SQL casts pos to BIGINT and the count to DOUBLE, so this is a
     # no-op on every path that goes through pileup_sql. It stays as a

@@ -18,12 +18,15 @@ is checkable in CI, where a memory figure is not.
 """
 
 import dataclasses
+import gc
 import logging
 import os
 import pathlib
 import random
+import tempfile
 import threading
 import warnings
+import weakref
 
 import numpy
 import pytest
@@ -36,12 +39,16 @@ from quadrat.pileup import track
 from quadrat.pileup.aggregate import DEFAULT_EXCLUDE_FLAGS
 from tests import (
     FILE_BACKED,
+    SPLICED_CONTIGS,
+    SPLICED_HEADER,
     TWO_CONTIGS,
     bound,
     builders,
+    coverage_from_track,
     digest_track,
     oracle_depth,
     oracle_pileup,
+    strand_channels,
 )
 
 START_SHIFT, END_SHIFT = 4, -4
@@ -256,18 +263,20 @@ def long_reference(corpus_factory):
     return corpus_factory("track-long", {"chr1": 2000}, index_fasta=True).fasta
 
 
-def coverage_from_track(paths, chrom_sizes):
-    """Return each channel's dense values per contig, read through the store.
+def samtools_depth(bam_paths, chrom_sizes, pysam):
+    """Return ``samtools depth -a -J`` per contig, summed over the alignments.
 
-    A channel of coverage deltas comes back as the coverage its prefix
-    sum gives, and a channel of counts as the counts.
+    Run by pysam over every file at once, with each base past its
+    contig's length in ``chrom_sizes`` dropped. ``pysam`` is passed in,
+    as it is to `tests.record_placements`.
     """
 
-    store = stores.TrackStore(paths)
-    return {
-        chrom: store.window(chrom, 0, size).numpy().astype(numpy.float64)
-        for chrom, size in chrom_sizes.items()
-    }
+    depth = {c: numpy.zeros(n) for c, n in chrom_sizes.items()}
+    for line in pysam.depth("-a", "-J", *bam_paths).splitlines():
+        chrom, pos, *counts = line.split("\t")
+        if int(pos) <= chrom_sizes[chrom]:
+            depth[chrom][int(pos) - 1] = sum(int(count) for count in counts)
+    return depth
 
 
 def dense_from_parquet(path, chrom_sizes):
@@ -811,6 +820,7 @@ def test_pileup_alignments_should_count_three_prime_ends_with_each_shift_on_its_
     template=st.sampled_from([(0, None), (1, None), (0, 120), (50, 150)]),
     shifts=st.tuples(st.integers(-5, 5), st.integers(-5, 5)),
     unstranded=st.booleans(),
+    spliced=st.booleans(),
 )
 def test_pileup_alignments_should_agree_with_pysam_under_any_aggregate(
     tmp_path,
@@ -824,6 +834,7 @@ def test_pileup_alignments_should_agree_with_pysam_under_any_aggregate(
     template,
     shifts,
     unstranded,
+    spliced,
 ):
     """Test every rule and every filter clause against pysam.
 
@@ -831,8 +842,9 @@ def test_pileup_alignments_should_agree_with_pysam_under_any_aggregate(
         Pairs and unpaired records of seeded flags, qualities and
         fragment lengths, and any combination of an exclusion mask, a
         required flag, a quality floor, template-length bounds, a
-        position rule, for the 5' and 3' rules shifts, and the strands
-        pooled or, except under the midpoint rule, kept apart.
+        position rule, for the 5' and 3' rules shifts, for ``"span"``
+        ``spliced`` or not, and the strands pooled or, except under the
+        midpoint rule, kept apart.
     When:
         They are piled up.
     Then:
@@ -855,25 +867,10 @@ def test_pileup_alignments_should_agree_with_pysam_under_any_aggregate(
         start_shift=shifts[0] if point else 0,
         end_shift=shifts[1] if point else 0,
         unstranded=unstranded or position == "midpoint",
+        spliced=spliced and position == "span",
     )
     oracle = oracle_depth if position == "span" else oracle_pileup
-    pooled = dataclasses.replace(aggregate, unstranded=True)
-    if aggregate.unstranded:
-        channels = [oracle([mixed_pairs], TWO_CONTIGS, pysam, pooled)]
-    else:
-        # The oracle keeps what an aggregate keeps, so a channel's
-        # records are the pooled filter with its strand's flag
-        # required or excluded; a mask excluding 0x10 leaves no reverse
-        # record to require.
-        forward = dataclasses.replace(pooled, exclude_flags=pooled.exclude_flags | 0x10)
-        channels = [oracle([mixed_pairs], TWO_CONTIGS, pysam, forward)]
-        if pooled.exclude_flags & 0x10:
-            channels.append({c: numpy.zeros(n) for c, n in TWO_CONTIGS.items()})
-        else:
-            reverse = dataclasses.replace(
-                pooled, require_flags=pooled.require_flags | 0x10
-            )
-            channels.append(oracle([mixed_pairs], TWO_CONTIGS, pysam, reverse))
+    channels = strand_channels(oracle, [mixed_pairs], TWO_CONTIGS, pysam, aggregate)
 
     # Act
     paths = pileup_pkg.pileup_alignments(
@@ -1149,20 +1146,20 @@ def test_pileup_alignments_should_read_a_clipped_span_as_depth_inside_its_contig
         )
 
 
-def test_pileup_alignments_should_cover_a_records_whole_span_under_span(
+def test_pileup_alignments_should_cover_a_deletion_and_not_a_skip_under_spliced_span(
     tmp_path, bam_pair, reference_fasta
 ):
-    """Test what a span is, where it differs from aligned bases.
+    """Test what a spliced span covers, where it differs from its record's span.
 
     Given:
         A record with a 5-base deletion at 210-214 and one with a
         100-base reference skip at 410-509.
     When:
-        They are piled up under ``"span"``.
+        They are piled up under a spliced ``"span"``.
     Then:
-        Each base inside the deletion and the skip should be covered,
-        the span running from a record's start to its end, and the
-        written values should be two boundary events per record rather
+        Each base inside the deletion should be covered and none inside
+        the skip, and the skipping record should be written as four
+        boundary events, two for its span and two for its skip, rather
         than one row per base.
     """
 
@@ -1171,16 +1168,793 @@ def test_pileup_alignments_should_cover_a_records_whole_span_under_span(
         bam_pair,
         reference_fasta,
         str(tmp_path / "span"),
-        aggregate=Aggregate(position="span", unstranded=True),
+        aggregate=Aggregate(position="span", unstranded=True, spliced=True),
     )
 
     # Assert
     covered = coverage_from_track(paths, TWO_CONTIGS)["chr1"][0]
     assert covered[210:215].tolist() == [1.0] * 5
-    assert covered[410:510].tolist() == [1.0] * 100
+    assert covered[400:410].tolist() == covered[510:520].tolist() == [1.0] * 10
+    assert covered[410:510].tolist() == [0.0] * 100
     rows, _ = dense_from_parquet(paths[0], DELTA_SIZES)
-    assert rows["chr1"][400] == 1 and rows["chr1"][520] == -1
-    assert numpy.count_nonzero(rows["chr1"][401:520]) == 0
+    assert rows["chr1"][[400, 410, 510, 520]].tolist() == [1, -1, 1, -1]
+    assert numpy.count_nonzero(rows["chr1"][401:520]) == 2
+
+
+@pytest.fixture(scope="module")
+def skip_on_chr2(corpus_factory):
+    """One alignment of unspliced records on chr1 and one skipping record on chr2.
+
+    Split in two contig batches, the skipping record is in the second,
+    so a pileup meets it once the first is already staged.
+    """
+
+    pytest.importorskip("polars_bio")
+    return corpus_factory(
+        "skip-chr2",
+        TWO_CONTIGS,
+        n_bams=1,
+        index_fasta=True,
+        reads=[
+            ("plain", "chr1", 100, "20M", 0),
+            ("plain_r", "chr1", 300, "20M", 16),
+            ("skip", "chr2", 100, "10M50N10M", 16),
+        ],
+    )
+
+
+@pytest.mark.parametrize("groups", [1, 2])
+@pytest.mark.parametrize("unstranded", [True, False], ids=["unstranded", "stranded"])
+def test_pileup_alignments_should_refuse_a_skipping_record_under_unspliced_span(
+    tmp_path, skip_on_chr2, unstranded, groups
+):
+    """Test that an unspliced span never covers a skipped run.
+
+    Given:
+        Unspliced records on chr1 and a record skipping 50 bases of
+        chr2, run in one contig batch or in two with the skip in the
+        second.
+    When:
+        They are piled up under ``"span"`` without ``spliced``, pooled
+        and split by strand.
+    Then:
+        It should raise `ValueError` naming ``spliced=True`` and the
+        contig, and leave nothing in the output directory: no table,
+        no record and no staging.
+    """
+
+    # Arrange
+    out = tmp_path / "out"
+    out.mkdir()
+
+    # Act & assert
+    with pytest.raises(
+        ValueError, match=r"At least 1 record\(s\).* on chr2.*spliced=True"
+    ):
+        pileup_pkg.pileup_alignments(
+            skip_on_chr2.bams,
+            skip_on_chr2.fasta,
+            str(out / "span"),
+            aggregate=Aggregate(position="span", unstranded=unstranded),
+            contig_groups=groups,
+        )
+    assert os.listdir(out) == []
+
+
+def test_pileup_alignments_should_keep_no_grouped_result_alive_in_a_caught_refusal(
+    tmp_path, spliced_corpus, mocker
+):
+    """Test that a caught refusal keeps no grouped result alive.
+
+    Given:
+        Alignments of records that skip reference, every frame a lazy
+        query collects watched through a weak reference, and one frame
+        collected and held by the test.
+    When:
+        They are piled up under ``"span"`` without ``spliced``, and the
+        refusal is caught and held.
+    Then:
+        Every frame the pileup collected should be dead while the
+        refusal is still held, and the one the test holds alive.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+    collect = polars.LazyFrame.collect
+    watched = []
+
+    def watch(self, *args, **kwargs):
+        frame = collect(self, *args, **kwargs)
+        watched.append(weakref.ref(frame))
+        return frame
+
+    mocker.patch.object(polars.LazyFrame, "collect", watch)
+    held = polars.LazyFrame({"pos": [0]}).collect()
+
+    # Act
+    with pytest.raises(ValueError, match="spliced=True") as caught:
+        pileup_pkg.pileup_alignments(
+            spliced_corpus.bams,
+            spliced_corpus.fasta,
+            str(tmp_path / "span"),
+            aggregate=Aggregate(position="span"),
+        )
+    gc.collect()
+
+    # Assert
+    assert caught.value.__traceback__ is not None
+    assert len(watched) > 1, "the pileup collected nothing"
+    alive = [frame for frame in (ref() for ref in watched) if frame is not None]
+    assert [frame is held for frame in alive] == [True]
+
+
+def assert_spliced_writes_the_same_table(corpus, tmp_path):
+    """Assert a corpus piles up alike under ``"span"`` with and without ``spliced``.
+
+    Both are stranded and written under ``tmp_path``, and every Parquet
+    file must be byte-identical between the two, at least one written.
+    """
+
+    plain, spliced = (
+        pileup_pkg.pileup_alignments(
+            corpus.bams,
+            corpus.fasta,
+            str(tmp_path / name),
+            aggregate=Aggregate(position="span", spliced=flag),
+        )
+        for name, flag in (("plain", False), ("spliced", True))
+    )
+    for left, right in zip(plain, spliced, strict=True):
+        assert digest_track(left), "table wrote no Parquet files"
+        assert digest_track(left) == digest_track(right)
+
+
+def test_pileup_alignments_should_write_a_skipping_record_past_its_contig_under_unspliced_span(
+    tmp_path, corpus_factory
+):
+    """Test that a skipping record the clip leaves nothing of is not refused.
+
+    Given:
+        Unspliced records inside both contigs, one of them deleting
+        five bases, and records skipping reference that start at and
+        past chr2's length, under a header declaring chr2 longer than
+        the reference.
+    When:
+        They are piled up stranded under ``"span"`` without
+        ``spliced``, and with it.
+    Then:
+        It should write the table rather than refuse, every Parquet
+        file byte-identical to the spliced one.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    corpus = corpus_factory(
+        "skip-past",
+        SPLICED_CONTIGS,
+        n_bams=1,
+        index_fasta=True,
+        header_contigs=SPLICED_HEADER,
+        reads=[
+            ("plain", "chr1", 100, "20M", 0),
+            ("deleted", "chr1", 300, "10M5D10M", 0),
+            ("plain_r", "chr2", 300, "20M", 16),
+            ("at_end", "chr2", 500, "5M5N5M", 16),
+            ("beyond", "chr2", 520, "5M5N5M", 0),
+        ],
+    )
+
+    # Act & assert
+    assert_spliced_writes_the_same_table(corpus, tmp_path)
+
+
+def test_pileup_alignments_should_drop_a_count_shifted_below_zero_rather_than_refuse(
+    tmp_path, corpus_factory
+):
+    """Test that a counts pileup reads no shifted position as a refusal.
+
+    Given:
+        Forward records at 0-based positions 0, 4 and 100 of chr1.
+    When:
+        Their 5' ends are counted with a ``start_shift`` of ``-5``, which
+        moves the first two to ``-5`` and ``-1``.
+    Then:
+        It should write the one position inside the contig, ``95``,
+        rather than refuse or write a negative one.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    polars = pytest.importorskip("polars")
+    corpus = corpus_factory(
+        "shifted-below",
+        TWO_CONTIGS,
+        n_bams=1,
+        index_fasta=True,
+        reads=[
+            ("at_zero", "chr1", 0, "20M", 0),
+            ("at_four", "chr1", 4, "20M", 0),
+            ("inside", "chr1", 100, "20M", 0),
+        ],
+    )
+
+    # Act
+    (path,) = pileup_pkg.pileup_alignments(
+        corpus.bams,
+        corpus.fasta,
+        str(tmp_path / "shifted"),
+        aggregate=Aggregate(start_shift=-5, unstranded=True),
+    )
+
+    # Assert
+    assert polars.read_parquet(path).select("pos", "value").rows() == [(95, 1.0)]
+
+
+def test_pileup_alignments_should_ignore_a_skipping_record_its_filter_drops(
+    tmp_path, corpus_factory, pysam
+):
+    """Test that only a record the aggregate keeps is refused for skipping.
+
+    Given:
+        Unspliced records, and skipping records the aggregate drops: a
+        duplicate, a secondary and one below its quality floor.
+    When:
+        They are piled up under ``"span"`` without ``spliced``.
+    Then:
+        It should write the coverage pysam's depth gives over the kept
+        records, rather than refuse.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    corpus = corpus_factory(
+        "skip-dropped",
+        TWO_CONTIGS,
+        n_bams=1,
+        index_fasta=True,
+        reads=[
+            ("plain", "chr1", 100, "20M", 0),
+            ("duplicate", "chr1", 200, "10M50N10M", 0x400),
+            ("secondary", "chr1", 300, "10M50N10M", 0x100),
+            ("plain_r", "chr2", 100, "20M", 16),
+        ],
+    )
+    low = builders.aligned_read(
+        builders.alignment_header(TWO_CONTIGS), "low", "chr2", 200, "5M5N5M", mapq=2
+    )
+    extra = builders.write_bam(
+        str(tmp_path / "low.bam"), [low], builders.alignment_header(TWO_CONTIGS)
+    )
+    aggregate = Aggregate(position="span", unstranded=True, min_mapq=10)
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        corpus.bams + [extra], corpus.fasta, str(tmp_path / "span"), aggregate=aggregate
+    )
+
+    # Assert
+    actual = coverage_from_track(paths, TWO_CONTIGS)
+    expected = oracle_depth(corpus.bams + [extra], TWO_CONTIGS, pysam, aggregate)
+    for chrom in TWO_CONTIGS:
+        numpy.testing.assert_array_equal(actual[chrom][0], expected[chrom])
+
+
+@pytest.fixture(scope="module")
+def spliced_tracks(tmp_path_factory, spliced_corpus):
+    """`spliced_corpus` piled up under a spliced ``"span"``, pooled and by strand.
+
+    Returns ``{unstranded: paths}``.
+    """
+
+    root = tmp_path_factory.mktemp("track-spliced")
+    return {
+        unstranded: pileup_pkg.pileup_alignments(
+            spliced_corpus.bams,
+            spliced_corpus.fasta,
+            str(root / ("pooled" if unstranded else "split")),
+            aggregate=Aggregate(position="span", unstranded=unstranded, spliced=True),
+        )
+        for unstranded in (True, False)
+    }
+
+
+@pytest.mark.parametrize("unstranded", [True, False], ids=["unstranded", "stranded"])
+def test_pileup_alignments_should_write_spliced_coverage_that_sums_to_per_base_depth(
+    spliced_tracks, spliced_corpus, pysam, unstranded
+):
+    """Test spliced coverage against a CIGAR walk, strand by strand.
+
+    Given:
+        Two alignments of the same spliced and unspliced records:
+        repeated skip lengths in one record, identical records, a
+        deletion beside a skip on either side, clips, insertions,
+        ``=`` and ``X``, and runs past each contig's end under a header
+        longer than the reference.
+    When:
+        They are piled up under a spliced ``"span"``, pooled and split
+        by strand, and each channel is read back through the store.
+    Then:
+        Each channel should equal, at every base, the depth a walk of
+        each kept record's CIGAR gives over its records, skipped runs
+        uncovered and deletions covered.
+    """
+
+    # Arrange
+    paths = spliced_tracks[unstranded]
+    expected = strand_channels(
+        oracle_depth,
+        spliced_corpus.bams,
+        SPLICED_CONTIGS,
+        pysam,
+        Aggregate(position="span", unstranded=unstranded, spliced=True),
+    )
+
+    # Act
+    actual = coverage_from_track(paths, SPLICED_CONTIGS)
+
+    # Assert
+    for chrom in SPLICED_CONTIGS:
+        assert len(actual[chrom]) == len(expected)
+        for row, depth in zip(actual[chrom], expected):
+            assert depth["chr1"].any()
+            numpy.testing.assert_array_equal(row, depth[chrom])
+
+
+def test_pileup_alignments_should_write_spliced_coverage_samtools_depth_agrees_with(
+    spliced_tracks, spliced_corpus, pysam
+):
+    """Test pooled spliced coverage against ``samtools depth -a -J``.
+
+    Given:
+        The same two alignments piled up pooled under a spliced
+        ``"span"``.
+    When:
+        The track is read back through the store, and ``samtools depth
+        -a -J`` is run over both alignments by pysam.
+    Then:
+        Every base of every contig should read what samtools reports
+        summed over the two files.
+    """
+
+    # Arrange
+    depth = samtools_depth(spliced_corpus.bams, SPLICED_CONTIGS, pysam)
+
+    # Act
+    actual = coverage_from_track(spliced_tracks[True], SPLICED_CONTIGS)
+
+    # Assert
+    assert depth["chr1"].any()
+    for chrom in SPLICED_CONTIGS:
+        numpy.testing.assert_array_equal(actual[chrom][0], depth[chrom])
+
+
+def long_cigar(n_ops, offset):
+    """A CIGAR of ``n_ops`` operations, aligned blocks joined by skips and indels.
+
+    Blocks cycle through ``M``, ``=`` and ``X`` and joins through skips
+    of three lengths, deletions and insertions, so a record holds many
+    skips of each length. ``offset`` shifts both cycles, so two calls
+    with different offsets give different records. ``n_ops`` is odd, so
+    the record ends on a block.
+    """
+
+    joins = ["4N", "2D", "9N", "1I", "30N", "3D", "2I", "9N", "4N"]
+    parts = []
+    for index in range(n_ops // 2):
+        step = index + offset
+        parts.append("{}{}".format(1 + step * 7 % 9, "M=X"[step % 3]))
+        parts.append(joins[step % len(joins)])
+    parts.append("5M")
+    return "".join(parts)
+
+
+def test_pileup_alignments_should_cover_records_of_a_thousand_operations_under_spliced_span(
+    tmp_path, corpus_factory, pysam
+):
+    """Test spliced coverage over records whose CIGARs hold about a thousand operations.
+
+    Given:
+        Long-read-shaped records of 999 to 1,001 operations each, on
+        both strands, one of them twice, one starting behind a soft
+        clip, and one running past chr2's end under a header longer
+        than the reference.
+    When:
+        They are piled up pooled under a spliced ``"span"`` and read
+        back through the store.
+    Then:
+        Every base of every contig should read both the depth a walk of
+        each record's CIGAR gives and what ``samtools depth -a -J``
+        reports.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    contigs = {"chr1": 12000, "chr2": 3000}
+    corpus = corpus_factory(
+        "spliced-long",
+        contigs,
+        n_bams=1,
+        index_fasta=True,
+        header_contigs={"chr1": 12000, "chr2": 9000},
+        reads=[
+            ("long1", "chr1", 100, long_cigar(1001, 0), 0),
+            ("long1_copy", "chr1", 100, long_cigar(1001, 0), 0),
+            ("long2", "chr1", 300, "3S" + long_cigar(999, 4), 16),
+            ("long3", "chr2", 200, long_cigar(1001, 2), 0),
+        ],
+    )
+    aggregate = Aggregate(position="span", unstranded=True, spliced=True)
+    walked = oracle_depth(corpus.bams, contigs, pysam, aggregate)
+    reported = samtools_depth(corpus.bams, contigs, pysam)
+
+    # Act
+    (path,) = pileup_pkg.pileup_alignments(
+        corpus.bams, corpus.fasta, str(tmp_path / "long"), aggregate=aggregate
+    )
+
+    # Assert
+    actual = coverage_from_track([path], contigs)
+    assert walked["chr1"].max() == 3.0 and walked["chr2"][-100:].any()
+    for chrom in contigs:
+        numpy.testing.assert_array_equal(actual[chrom][0], walked[chrom])
+        numpy.testing.assert_array_equal(actual[chrom][0], reported[chrom])
+
+
+@pytest.mark.parametrize("unstranded", [True, False], ids=["unstranded", "stranded"])
+def test_pileup_alignments_should_clip_spliced_coverage_to_its_contig(
+    spliced_tracks, unstranded
+):
+    """Test the deltas of spliced records that leave their contig.
+
+    Given:
+        Spliced records whose skipped runs and spans close past each
+        contig's end, and one starting past chr2's length.
+    When:
+        They are piled up under a spliced ``"span"``, pooled and split
+        by strand.
+    Then:
+        Each contig's deltas should sum to zero in every track, with no
+        row past the contig's length.
+    """
+
+    # Arrange
+    polars = pytest.importorskip("polars")
+
+    # Act
+    frames = [polars.read_parquet(path) for path in spliced_tracks[unstranded]]
+
+    # Assert
+    for frame in frames:
+        for chrom, length in SPLICED_CONTIGS.items():
+            rows = frame.filter(polars.col("chrom") == chrom)
+            assert rows["value"].sum() == 0.0
+            assert (rows["pos"] <= length).all()
+
+
+@pytest.mark.parametrize(
+    "reads, rows",
+    [
+        (
+            [("issue", "chr1", 2000, "5M10N5M", 0)],
+            [(2000, 1.0), (2005, -1.0), (2015, 1.0), (2020, -1.0)],
+        ),
+        (
+            [("repeat", "chr1", 100, "23M112N20M102N32M102N25M", 0)],
+            [
+                (100, 1.0),
+                (123, -1.0),
+                (235, 1.0),
+                (255, -1.0),
+                (357, 1.0),
+                (389, -1.0),
+                (491, 1.0),
+                (516, -1.0),
+            ],
+        ),
+        (
+            [("same{}".format(n), "chr1", 600, "10M50N10M", 0) for n in range(3)],
+            [(600, 3.0), (610, -3.0), (660, 3.0), (670, -3.0)],
+        ),
+    ],
+    ids=["one-skip", "repeated-length", "identical-records"],
+)
+def test_pileup_alignments_should_write_each_skipped_run_as_two_events(
+    tmp_path, corpus_factory, reads, rows
+):
+    """Test the rows a spliced record writes.
+
+    Given:
+        A record skipping ten bases from 0-based 2005, the case
+        ``samtools depth -a`` reports as zero across 2006-2015; a record
+        skipping three runs, two of them of one length; and three
+        identical skipping records.
+    When:
+        Each is piled up under a spliced ``"span"``.
+    Then:
+        It should write ``+1`` at each record's start and ``-1`` at its
+        end, and ``-1`` at the first base of each skipped run and
+        ``+1`` one past its last, each times the number of identical
+        records, and nothing else.
+    """
+
+    # Arrange
+    pytest.importorskip("polars_bio")
+    polars = pytest.importorskip("polars")
+    corpus = corpus_factory(
+        "spliced-rows", SPLICED_CONTIGS, n_bams=1, index_fasta=True, reads=reads
+    )
+
+    # Act
+    (path,) = pileup_pkg.pileup_alignments(
+        corpus.bams,
+        corpus.fasta,
+        str(tmp_path / "rows"),
+        aggregate=Aggregate(position="span", unstranded=True, spliced=True),
+    )
+
+    # Assert
+    written = polars.read_parquet(path).select("pos", "value").rows()
+    assert written == rows
+
+
+def test_pileup_alignments_should_write_the_same_table_spliced_over_unspliced_records(
+    tmp_path, span_corpus
+):
+    """Test that ``spliced`` changes nothing where no record skips.
+
+    Given:
+        Two alignments of unspliced records on both strands.
+    When:
+        They are piled up stranded under ``"span"`` with and without
+        ``spliced``.
+    Then:
+        Every Parquet file should be byte-identical between the two.
+    """
+
+    # Act & assert
+    assert_spliced_writes_the_same_table(span_corpus, tmp_path)
+
+
+@st.composite
+def cigars(draw, joins="NDI"):
+    """A CIGAR of aligned blocks joined by skips, deletions and insertions.
+
+    Each block is ``M``, ``=`` or ``X``, each join one or two of the
+    operations ``joins`` names, ``N``, ``D`` and ``I`` by default, in
+    any order, so a skip may sit beside a deletion, and either end may
+    carry a soft clip. Skip lengths come from a set of three, so two
+    skips of one length in one record are common.
+    """
+
+    def block():
+        return "{}{}".format(draw(st.integers(1, 15)), draw(st.sampled_from("M=X")))
+
+    def join():
+        kind = draw(st.sampled_from(joins))
+        if kind == "N":
+            return "{}N".format(draw(st.sampled_from([4, 9, 30])))
+        return "{}{}".format(draw(st.integers(1, 4)), kind)
+
+    clip = "{}S".format(draw(st.integers(1, 3))) if draw(st.booleans()) else ""
+    parts = [clip, block()]
+    for _ in range(draw(st.integers(0, 4))):
+        parts += [join() for _ in range(draw(st.integers(1, 2)))]
+        parts.append(block())
+    if draw(st.booleans()):
+        parts.append("{}S".format(draw(st.integers(1, 3))))
+    return "".join(parts)
+
+
+def write_drawn_records(tmp_path, records):
+    """Write drawn records to one indexed BAM in a fresh directory under ``tmp_path``.
+
+    Each record is ``(chrom, pos, cigar, flag, copies)``, written
+    ``copies`` times under `SPLICED_HEADER`. The directory is fresh per
+    call because Hypothesis draws every example of a test into one
+    ``tmp_path``.
+
+    :returns: ``(root, bam)``, the directory as a `pathlib.Path`, which
+        a pileup's output may share, and the BAM's path.
+    """
+
+    root = pathlib.Path(tempfile.mkdtemp(dir=tmp_path))
+    header = builders.alignment_header(SPLICED_HEADER)
+    reads = [
+        builders.aligned_read(
+            header, "r{}_{}".format(index, copy), chrom, pos, cigar, flag
+        )
+        for index, (chrom, pos, cigar, flag, copies) in enumerate(records)
+        for copy in range(copies)
+    ]
+    return root, builders.write_bam(str(root / "any.bam"), reads, header)
+
+
+@settings(FILE_BACKED, max_examples=50)
+@given(
+    records=st.lists(
+        st.tuples(
+            st.sampled_from(["chr1", "chr2"]),
+            st.integers(0, 590),
+            cigars(),
+            st.sampled_from([0, 0x10]),
+            st.integers(1, 3),
+        ),
+        min_size=1,
+        max_size=10,
+    ),
+    unstranded=st.booleans(),
+)
+def test_pileup_alignments_should_agree_with_a_cigar_walk_under_spliced_span(
+    tmp_path, spliced_corpus, pysam, records, unstranded
+):
+    """Test spliced coverage against a CIGAR walk over any spliced records.
+
+    Given:
+        Any handful of records over two contigs, each placed up to 90
+        bases past chr2's end, with any CIGAR of aligned blocks joined
+        by skips, deletions and insertions, on either strand, each
+        repeated up to three times, under a header longer than the
+        reference.
+    When:
+        They are piled up under a spliced ``"span"``, pooled or split
+        by strand, and read back through the store.
+    Then:
+        Each channel should equal, at every base, the depth a walk of
+        each record's CIGAR gives over the records on its strand, or on
+        both when pooled.
+    """
+
+    # Arrange
+    root, bam = write_drawn_records(tmp_path, records)
+    aggregate = Aggregate(position="span", unstranded=unstranded, spliced=True)
+    expected = strand_channels(oracle_depth, [bam], SPLICED_CONTIGS, pysam, aggregate)
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        [bam], spliced_corpus.fasta, str(root / "any"), aggregate=aggregate
+    )
+
+    # Assert
+    actual = coverage_from_track(paths, SPLICED_CONTIGS)
+    for chrom in SPLICED_CONTIGS:
+        for row, depth in zip(actual[chrom], expected, strict=True):
+            numpy.testing.assert_array_equal(row, depth[chrom])
+
+
+@settings(FILE_BACKED, max_examples=50)
+@given(
+    records=st.lists(
+        st.tuples(
+            st.sampled_from(["chr1", "chr2"]),
+            st.integers(0, 590) | st.integers(500, 590),
+            cigars(joins="DI") | cigars(),
+            st.sampled_from([0, 0x10, 0x400]),
+            st.integers(1, 2),
+        ),
+        min_size=1,
+        max_size=4,
+    ),
+    unstranded=st.booleans(),
+)
+def test_pileup_alignments_should_refuse_under_unspliced_span_exactly_when_a_kept_record_skips_inside_its_contig(
+    tmp_path, spliced_corpus, records, unstranded
+):
+    """Test which records an unspliced span refuses.
+
+    Given:
+        Any handful of records over two contigs, each placed up to 90
+        bases past chr2's end and often past it, with any CIGAR of
+        aligned blocks joined by deletions and insertions, or by those
+        and skips, on either strand or flagged duplicate, each repeated
+        up to twice, under a header longer than the reference.
+    When:
+        They are piled up under ``"span"`` without ``spliced``, pooled
+        or split by strand.
+    Then:
+        It should raise `ValueError` naming ``spliced=True`` if and only
+        if a record the aggregate keeps holds an ``N`` and starts inside
+        its contig.
+    """
+
+    # Arrange
+    root, bam = write_drawn_records(tmp_path, records)
+    aggregate = Aggregate(position="span", unstranded=unstranded)
+    refused = any(
+        "N" in cigar
+        and not flag & aggregate.exclude_flags
+        and pos < SPLICED_CONTIGS[chrom]
+        for chrom, pos, cigar, flag, _ in records
+    )
+
+    # Act
+    try:
+        pileup_pkg.pileup_alignments(
+            [bam], spliced_corpus.fasta, str(root / "any"), aggregate=aggregate
+        )
+    except ValueError as error:
+        raised = "spliced=True" in str(error)
+    else:
+        raised = False
+
+    # Assert
+    assert raised == refused
+
+
+@settings(FILE_BACKED, max_examples=50)
+@given(
+    records=st.lists(
+        st.tuples(
+            st.sampled_from(["chr1", "chr2"]),
+            st.integers(0, 590),
+            cigars(joins="DI"),
+            st.sampled_from([0, 0x10, 0x400]),
+            st.integers(1, 2),
+        )
+        | st.tuples(
+            st.just("chr2"),
+            st.integers(500, 590),
+            cigars(),
+            st.sampled_from([0, 0x10, 0x400]),
+            st.integers(1, 2),
+        )
+        | st.tuples(
+            st.sampled_from(["chr1", "chr2"]),
+            st.integers(0, 590),
+            cigars(),
+            st.just(0x400),
+            st.integers(1, 2),
+        ),
+        min_size=1,
+        max_size=4,
+    ),
+    unstranded=st.booleans(),
+)
+def test_pileup_alignments_should_agree_with_a_cigar_walk_and_with_spliced_under_unspliced_span(
+    tmp_path, spliced_corpus, pysam, records, unstranded
+):
+    """Test what an unspliced span covers wherever it refuses nothing.
+
+    Given:
+        Any handful of records over two contigs that an unspliced span
+        does not refuse, under a header longer than the reference: on
+        either strand or flagged duplicate, with any CIGAR of aligned
+        blocks joined by deletions and insertions placed anywhere up to
+        90 bases past chr2's end, one joined by skips as well placed
+        past chr2's end, or one of those anywhere flagged duplicate,
+        each repeated up to twice.
+    When:
+        They are piled up under ``"span"`` without ``spliced``, pooled
+        or split by strand, and again with ``spliced``.
+    Then:
+        Each channel should equal, at every base, the depth a walk of
+        each record's CIGAR gives over the records on its strand, or on
+        both when pooled, and every Parquet file should be
+        byte-identical to the spliced one.
+    """
+
+    # Arrange
+    root, bam = write_drawn_records(tmp_path, records)
+    aggregate = Aggregate(position="span", unstranded=unstranded)
+    expected = strand_channels(oracle_depth, [bam], SPLICED_CONTIGS, pysam, aggregate)
+
+    # Act
+    paths = pileup_pkg.pileup_alignments(
+        [bam], spliced_corpus.fasta, str(root / "plain"), aggregate=aggregate
+    )
+    spliced = pileup_pkg.pileup_alignments(
+        [bam],
+        spliced_corpus.fasta,
+        str(root / "spliced"),
+        aggregate=dataclasses.replace(aggregate, spliced=True),
+    )
+
+    # Assert
+    actual = coverage_from_track(paths, SPLICED_CONTIGS)
+    for chrom in SPLICED_CONTIGS:
+        for row, depth in zip(actual[chrom], expected, strict=True):
+            numpy.testing.assert_array_equal(row, depth[chrom])
+    for left, right in zip(paths, spliced, strict=True):
+        assert digest_track(left) == digest_track(right)
 
 
 @pytest.fixture(
@@ -1189,11 +1963,16 @@ def test_pileup_alignments_should_cover_a_records_whole_span_under_span(
         (Aggregate(unstranded=True), "counts", 1),
         (Aggregate(position="midpoint", unstranded=True), "counts", 1),
         (Aggregate(position="span", unstranded=True, min_mapq=3), "coverage_deltas", 2),
+        (
+            Aggregate(position="span", unstranded=True, spliced=True),
+            "coverage_deltas",
+            2,
+        ),
     ],
-    ids=["five_prime", "midpoint", "span"],
+    ids=["five_prime", "midpoint", "span", "spliced"],
 )
 def recorded(request, corpus_factory):
-    """One alignment piled up under a point rule, the midpoint rule or ``"span"``.
+    """One alignment piled up under a point rule, the midpoint rule or a ``"span"``.
 
     Returns ``(aggregate, signal, version, record)``: the aggregate, the
     signal and manifest version a track of it should declare, and the
@@ -1219,12 +1998,13 @@ def test_pileup_alignments_should_record_what_the_values_mean(recorded):
     """Test the manifest's signal and the version it implies.
 
     Given:
-        A point rule, the midpoint rule, and ``"span"``.
+        A point rule, the midpoint rule, ``"span"`` and a spliced
+        ``"span"``.
     When:
         Alignments are piled up under each and the manifest is read.
     Then:
         It should declare counts at version 1 for the first two and
-        coverage deltas at version 2 for the third.
+        coverage deltas at version 2 for both spans.
     """
 
     # Arrange
@@ -1241,12 +2021,14 @@ def test_pileup_alignments_should_record_the_aggregate_it_counted_by(recorded):
     """Test the aggregate's provenance in the manifest.
 
     Given:
-        A point rule, the midpoint rule, and ``"span"``.
+        A point rule, the midpoint rule, ``"span"`` and a spliced
+        ``"span"``.
     When:
         Alignments are piled up under each and the manifest is read.
     Then:
         It should record every field of the aggregate under
-        ``parameters``, as `dataclasses.asdict` gives them.
+        ``parameters``, ``spliced`` among them, as
+        `dataclasses.asdict` gives them.
     """
 
     # Arrange
@@ -1257,24 +2039,50 @@ def test_pileup_alignments_should_record_the_aggregate_it_counted_by(recorded):
 
     # Assert
     assert provenance == dataclasses.asdict(aggregate)
+    assert provenance["spliced"] is aggregate.spliced
 
 
-@pytest.mark.parametrize("position, queries", [("five_prime", 1), ("span", 2)])
-def test_pileup_alignments_should_split_by_the_scan_its_rule_implies(
-    tmp_path, shifted_pair, machine, sized, mocker, position, queries
+@pytest.fixture(scope="module")
+def eight_contigs(corpus_factory):
+    """One alignment over eight contigs of equal length, a record on each.
+
+    Eight is the planner's batch ceiling, so every batch count it can
+    answer splits these into that many queries.
+    """
+
+    pytest.importorskip("polars_bio")
+    sizes = {"chr{}".format(index): 200 for index in range(1, 9)}
+    return corpus_factory(
+        "eight",
+        sizes,
+        n_bams=1,
+        index_fasta=True,
+        reads=[("r_" + chrom, chrom, 50, "20M", 0) for chrom in sizes],
+    )
+
+
+@pytest.mark.parametrize(
+    "position, spliced, queries",
+    [("five_prime", False, 1), ("span", False, 2), ("span", True, 8)],
+    ids=["five_prime", "span", "spliced"],
+)
+def test_pileup_alignments_should_split_by_the_scan_its_aggregate_implies(
+    tmp_path, eight_contigs, machine, sized, mocker, position, spliced, queries
 ):
-    """Test that a direct call sizes its batches by the rows per record.
+    """Test that a direct call sizes its batches by its record weight.
 
     Given:
-        An alignment reported as 6 GB on a machine with memory to
-        spare, piled up under the 5' rule and under ``"span"``.
+        An alignment over eight contigs, reported as 6 GiB on a machine
+        with memory to spare, piled up under the 5' rule, under
+        ``"span"`` and under a spliced ``"span"``.
     When:
         The batch count is left to the planner.
     Then:
-        The 5' pileup should run as one aggregate, its bytes under the
-        scan cap, and the span pileup as two, one per contig, its two
-        rows per record taking it over: each should ask the engine as
-        many queries as the same pileup run at that batch count.
+        The 5' pileup should run as one batch, its bytes under the scan
+        cap, the span pileup as two, its record weight of two taking it
+        to 12 GiB, and the spliced one as eight, its weight of ten taking
+        it to 60 GiB: each should ask the engine as many queries as the
+        same pileup run at that batch count.
     """
 
     # Arrange
@@ -1282,12 +2090,12 @@ def test_pileup_alignments_should_split_by_the_scan_its_rule_implies(
     machine(64, 1024 * 1024**3)
     sized(6 * 1024**3)
     spy = mocker.spy(pb, "sql")
-    aggregate = Aggregate(position=position, unstranded=True)
+    aggregate = Aggregate(position=position, unstranded=True, spliced=spliced)
 
     # Act
     pileup_pkg.pileup_alignments(
-        shifted_pair.bams,
-        shifted_pair.fasta,
+        eight_contigs.bams,
+        eight_contigs.fasta,
         str(tmp_path / "planned"),
         aggregate=aggregate,
         target_partitions=1,
@@ -1295,8 +2103,8 @@ def test_pileup_alignments_should_split_by_the_scan_its_rule_implies(
     planned = spy.call_count
     spy.reset_mock()
     pileup_pkg.pileup_alignments(
-        shifted_pair.bams,
-        shifted_pair.fasta,
+        eight_contigs.bams,
+        eight_contigs.fasta,
         str(tmp_path / "named"),
         aggregate=aggregate,
         target_partitions=1,
@@ -1848,13 +2656,16 @@ def test_pileup_alignments_should_write_fixed_size_row_groups(corpus_factory, tm
 
 
 @pytest.mark.parametrize("groups", [2, 4])
+@pytest.mark.parametrize("spliced", [False, True], ids=["atac", "spliced"])
 def test_pileup_alignments_should_write_the_same_table_at_any_batch_count(
-    tmp_path, bam_pair, reference_fasta, groups
+    tmp_path, bam_pair, reference_fasta, spliced_corpus, spliced, groups
 ):
     """Test that contig batching changes nothing it writes.
 
     Given:
-        A pileup run as one aggregate and as several contig batches.
+        An ATAC pileup, and a spliced ``"span"`` over records skipping
+        reference on both contigs, each run as one aggregate and as
+        several contig batches.
     When:
         The written tables are hashed.
     Then:
@@ -1866,19 +2677,22 @@ def test_pileup_alignments_should_write_the_same_table_at_any_batch_count(
     boundary.
     """
 
+    # Arrange
+    if spliced:
+        bams, fasta = spliced_corpus.bams, spliced_corpus.fasta
+        aggregate = Aggregate(position="span", spliced=True)
+    else:
+        bams, fasta, aggregate = [bam_pair[0]], reference_fasta, ATAC
+
     # Act
     one = pileup_pkg.pileup_alignments(
-        [bam_pair[0]],
-        reference_fasta,
-        str(tmp_path / "whole"),
-        aggregate=ATAC,
-        contig_groups=1,
+        bams, fasta, str(tmp_path / "whole"), aggregate=aggregate, contig_groups=1
     )
     many = pileup_pkg.pileup_alignments(
-        [bam_pair[0]],
-        reference_fasta,
+        bams,
+        fasta,
         str(tmp_path / "split"),
-        aggregate=ATAC,
+        aggregate=aggregate,
         contig_groups=groups,
     )
 

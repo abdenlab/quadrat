@@ -1533,7 +1533,7 @@ def window_group_sums(
 
     On a channel of coverage deltas that total is the area under the
     window's coverage, i.e., its per-base coverage summed, rather than
-    a count of records: each record adds the bases of its span that
+    a count of records: each record adds the bases it covers that
     fall inside the window. That is about the read length times the
     records only where every record lies inside the window, and less
     where one overhangs an end. A band chosen for counts therefore shifts at both

@@ -33,8 +33,8 @@ class Aggregate:
     template length. The *position rule* decides which positions a
     qualifying record contributes. What accumulates follows from the
     rule: a rule naming one position per record accumulates a count
-    there, and ``"span"`` accumulates coverage over the reference span
-    the record is aligned to.
+    there, and ``"span"`` accumulates coverage over the reference the
+    record is aligned to.
 
     Being a value, it compares, hashes and pickles by its fields, so
     it crosses into a `quadrat.pileup_many` worker process
@@ -74,18 +74,31 @@ class Aggregate:
         record never does.
 
     ``"span"``
-        Every base from ``start`` to ``end``, each gaining one. The
-        track records this as two signed boundary events per record,
-        ``+1`` at ``start`` and ``-1`` at ``end``, so its values are
-        coverage deltas; see `quadrat.read_manifest` for how they read
-        back.
+        Every base from ``start`` to ``end``, each gaining one, a
+        deletion's bases included. The track records this as two
+        signed boundary events per record, ``+1`` at ``start`` and
+        ``-1`` at ``end``, so its values are coverage deltas; see
+        `quadrat.read_manifest` for how they read back.
+
+        A record that skips reference, i.e., one whose CIGAR holds an
+        ``N`` operation, as a spliced RNA-seq alignment does across an
+        intron, is covered only under ``spliced``. There each skipped
+        run is left out: the record covers the bases its ``M``, ``D``,
+        ``=`` and ``X`` operations consume, as ``samtools depth -J``
+        counts them, and adds a ``-1`` at the first base of each
+        skipped run and a ``+1`` one past its last. Without
+        ``spliced``, a pileup whose filter keeps such a record starting
+        inside its contig refuses rather than cover its skipped runs;
+        see `quadrat.pileup_alignments`. One starting past its contig
+        contributes nothing either way, as below.
 
     A position outside its contig is dropped, as is a record on a
     contig the reference does not name. ``"span"`` clips a record's
     span to its contig instead: one ending on or past the contig's last
     base closes with a ``-1`` at the contig's length, and one starting
-    at or past the length contributes nothing, so each contig's deltas
-    sum to zero. A record reaches past its contig only where the
+    at or past the length contributes nothing. A skipped run's events
+    are clipped the same way, so each contig's deltas sum to zero. A
+    record reaches past its contig only where the
     alignment's header declares the contig longer than the reference
     does. A stranded pileup puts each contribution on the
     strand of the record that made it. ``"midpoint"`` is always
@@ -95,9 +108,9 @@ class Aggregate:
     fragment's.
 
     Integer fields and ``scale_factor`` are held as `int` and `float`,
-    ``position`` as `str` and ``unstranded`` as `bool`, whatever numpy
-    scalar or `str` subclass was given, so a record pickles and is
-    recorded as plain Python values.
+    ``position`` as `str` and ``unstranded`` and ``spliced`` as `bool`,
+    whatever numpy scalar or `str` subclass was given, so a record
+    pickles and is recorded as plain Python values.
 
     :param exclude_flags: A record carrying any of these flags is
         skipped. The default skips unmapped, secondary, QC-failed,
@@ -135,11 +148,27 @@ class Aggregate:
         values have accumulated. Under ``"span"`` it is recorded as the
         track's ``scale`` rather than applied to the deltas written;
         see `quadrat.read_manifest`.
+    :param spliced: Leave the reference a record skips uncovered under
+        ``"span"``, as above, rather than refuse the record. Only
+        ``"span"`` takes it true. On input whose kept records hold no
+        ``N``, the Parquet files written are the same either way; the
+        manifest records ``spliced`` as given. Each alignment
+        is scanned twice, once for the spans and once for the skipping
+        records, so it costs time and memory on input that holds none
+        and belongs on jobs that do. A spliced pileup peaks higher than
+        an unspliced one over the same records, by an amount that
+        follows the skipping records' CIGAR operations. The contig
+        batches `quadrat.pileup_alignments` solves for cover short reads
+        with a few skips each, up to about 6.4 GiB of alignment per job.
+        A larger job needs ``contig_groups`` raised by hand, as does a
+        job of records of hundreds of operations, as long reads carry,
+        which peak several times higher per byte than short ones.
     :raises TypeError: if a field is passed by position; if a flag
         mask, a quality, a length or a shift is not an integer, if
-        ``unstranded`` is neither ``None`` nor a `bool` (a numpy
-        ``numpy.bool_`` is one), or if ``scale_factor`` is not a real
-        number; or on defining a subclass.
+        ``unstranded`` is neither ``None`` nor a `bool`, if ``spliced``
+        is not a `bool` (a numpy ``numpy.bool_`` is a `bool` to both),
+        or if ``scale_factor`` is not a real number; or on defining a
+        subclass.
     :raises ValueError: if ``position`` is not one of the four rules; if
         a flag mask is outside ``0`` to ``0xFFFF``; if ``require_flags``
         shares a flag with ``exclude_flags`` or asks for ``0x4``, so
@@ -147,9 +176,16 @@ class Aggregate:
         negative, the ceiling is below the floor, or ``"midpoint"`` is
         given a ceiling below ``1``; if a shift is given with
         ``"midpoint"`` or ``"span"``, which take no shift; if
-        ``"midpoint"`` is given ``unstranded=False``; or if
-        ``scale_factor`` is not finite, or is too large to hold as a
-        `float`.
+        ``"midpoint"`` is given ``unstranded=False``; if ``spliced`` is
+        true under a rule other than ``"span"``; or if ``scale_factor``
+        is not finite, or is too large to hold as a `float`.
+
+    .. rubric:: Implementation notes
+
+    ``spliced`` is declared rather than detected because the contig
+    batches are solved before any record is read, and a spliced pileup
+    is sized for a higher peak; `quadrat.pileup.plan.group_floor`
+    states the record weight it is sized at.
     """
 
     exclude_flags: int = DEFAULT_EXCLUDE_FLAGS
@@ -162,6 +198,7 @@ class Aggregate:
     end_shift: int = 0
     unstranded: bool | None = None
     scale_factor: float = 1.0
+    spliced: bool = False
 
     def __post_init__(self):
         integers = [
@@ -194,6 +231,13 @@ class Aggregate:
                     )
                 )
             object.__setattr__(self, "unstranded", bool(self.unstranded))
+        if not _is_bool(self.spliced):
+            raise TypeError(
+                "Aggregate.spliced must be a bool, got {}.".format(
+                    type(self.spliced).__name__
+                )
+            )
+        object.__setattr__(self, "spliced", bool(self.spliced))
         if not isinstance(self.scale_factor, numbers.Real) or isinstance(
             self.scale_factor, bool
         ):
@@ -289,6 +333,13 @@ class Aggregate:
                 "length, which is almost always the forward one, so a strand "
                 "split would put nearly every fragment on '+'."
             )
+        if self.spliced and self.position != "span":
+            raise ValueError(
+                "Aggregate.spliced applies to 'span' alone: it decides "
+                "whether a span covers the reference a record skips, and "
+                "position {!r} takes one position per record rather than "
+                "a span.".format(self.position)
+            )
         if not math.isfinite(self.scale_factor):
             raise ValueError(
                 "Aggregate.scale_factor must be finite, got {}.".format(
@@ -317,16 +368,16 @@ class Aggregate:
         return COVERAGE_DELTAS if self.position == "span" else COUNTS
 
     @property
-    def _points_per_record(self):
-        """The most rows one record contributes to the grouping.
+    def _record_weight(self):
+        """The planner's ``record_weight`` for this pileup.
 
-        Two for coverage deltas, a record's two boundary events, and one
-        for counts. It is the ``points_per_record`` the planner takes;
-        `quadrat.pileup.plan.group_floor` and
-        `quadrat.pileup.plan.projected_peak` state what it changes.
+        `quadrat.pileup.plan.group_floor` states each value and what it
+        sizes.
         """
 
-        return 2 if self.signal == COVERAGE_DELTAS else 1
+        if self.signal != COVERAGE_DELTAS:
+            return 1
+        return 10 if self.spliced else 2
 
     @property
     def _manifest_scale(self):

@@ -67,6 +67,7 @@ __all__ = [
     "projected_peak",
 ]
 
+import math
 import os
 import types
 import typing
@@ -210,26 +211,24 @@ CONTIG_GROUP_GAIN = 1.25
 #: memory a machine has, the more certainly it answers one batch -- so
 #: the biggest machines were the ones that fell over.
 #:
-#: Eight GB rather than less because batches are not free below about
+#: Eight GiB rather than less because batches are not free below about
 #: 100 GB of total input: four batches cost 25% more pileup wall clock
 #: at 56 GB of input and 2% less at 109 GB, for 37-54% lower peak at
 #: both, with byte-identical output (cherimoya's ladder). At
-#: 8 GB the cap cannot fire on inputs that size -- the largest single
+#: 8 GiB the cap cannot fire on inputs that size -- the largest single
 #: file in either set is 3.3 GB.
 #:
-#: The figure is for a pileup whose records contribute one row each to
-#: the grouping, and the rows are what the bytes stand in for: one
-#: whose records contribute ``m`` rows each scans at most this divided
-#: by ``m`` -- see `group_floor`. The divisor is the record's own count
-#: of rows per record, as `quadrat.pileup.aggregate.Aggregate` answers
-#: it, rather than a fitted multiple.
+#: The figure is for a pileup whose records weigh one, i.e., contribute
+#: one row each to the grouping, and the rows are what the bytes stand
+#: in for: one whose records weigh ``m`` scans at most this divided by
+#: ``m``. `group_floor` states what a record weighs.
 #:
 #: Two honest limits. Bytes are a proxy for records and an imperfect
 #: one: a 35.2 GB starr-seq alignment in the same set piles up fine in
 #: one batch, because read density is nothing like uniform across
 #: assays. And `MAX_CONTIG_GROUPS` is a hard ceiling, so this
-#: saturates at 64 GB of input per job, divided by ``m``, and asks for
-#: no more.
+#: saturates at 64 GiB of input per job, divided by ``m`` rounded up,
+#: and asks for no more.
 MAX_GROUP_INPUT_BYTES = 8 * 1024**3
 
 
@@ -312,25 +311,24 @@ class MemoryFloor(typing.NamedTuple):
     fits: bool
 
 
-def projected_peak(bytes_per_job, groups=1, points_per_record=1):
+def projected_peak(bytes_per_job, groups=1, record_weight=1):
     """Peak bytes one pileup is expected to reach, machine cost aside.
 
     A fixed part and a part that scales with what this job reads:
     `PEAK_BYTES_PER_WORKER` plus
     `PEAK_BYTES_PER_INPUT_BYTE` times the bytes one contig batch
-    scans, times ``points_per_record``. The machine-wide term is not
+    scans, times ``record_weight``. The machine-wide term is not
     here; `memory_budget` takes it off the top instead.
 
-    ``points_per_record`` multiplies the second part for the reason it
-    divides the scan cap in `group_floor`: what the input bytes buy is
-    the grouping's state, one entry per distinct key, and a pileup
-    contributing two rows per record keys about twice as many entries
-    as one contributing one. A job of ``b`` bytes at two rows per
-    record is therefore projected as one of ``2 * b`` bytes at one.
-    The fit behind `PEAK_BYTES_PER_INPUT_BYTE` is of one-row
-    pileups, so this is the model's extrapolation and not a
-    measurement. An unsized job's figure is not multiplied: it is a
-    guess at a whole peak rather than a multiple of known bytes.
+    ``record_weight`` multiplies the second part, as it divides the
+    scan cap in `group_floor`: a job of ``b`` bytes whose records weigh
+    ``m`` is projected as one of ``m * b`` bytes whose records weigh
+    one. The fit behind `PEAK_BYTES_PER_INPUT_BYTE` is of pileups whose
+    records weigh one, so any other weight is the model's
+    extrapolation; `group_floor` states what each weight stands for. A
+    fractional weight multiplies as given, where `group_floor` rounds
+    it up. An unsized job's figure is not multiplied: it is a guess at
+    a whole peak rather than a multiple of known bytes.
 
     ``groups`` divides the second part and leaves the first alone,
     which is what the batches actually do. The division is in
@@ -351,11 +349,11 @@ def projected_peak(bytes_per_job, groups=1, points_per_record=1):
         # of it above the fixed cost behaves like the input part.
         implied = max(0, UNKNOWN_INPUT_PEAK_BYTES - PEAK_BYTES_PER_WORKER)
         return int(PEAK_BYTES_PER_WORKER + implied / float(max(1, groups)))
-    scanned = bytes_per_job * points_per_record / float(max(1, groups))
+    scanned = bytes_per_job * record_weight / float(max(1, groups))
     return int(PEAK_BYTES_PER_WORKER + max(1, int(scanned * PEAK_BYTES_PER_INPUT_BYTE)))
 
 
-def plan_pileup(n_jobs, bytes_per_job=None, budget=None, points_per_record=1):
+def plan_pileup(n_jobs, bytes_per_job=None, budget=None, record_weight=1):
     """Choose the worker count and the batch count together for a fan-out.
 
     The two are one decision rather than two, because splitting the
@@ -379,8 +377,8 @@ def plan_pileup(n_jobs, bytes_per_job=None, budget=None, points_per_record=1):
         worker count and the per-job batch counts are solved against
         one figure. The budget comes from mutable OS state and two
         reads are not guaranteed to agree.
-    :param points_per_record: Rows one record contributes to the
-        grouping, as `group_floor` takes it.
+    :param record_weight: The sizing multiplier per record, as
+        `group_floor` takes it.
     :returns: a `PileupPlan`, whose two elements are read by name.
         Unpacking and ``== (1, 3)`` both keep working, and a caller who
         wants to name or annotate the type reaches it here rather than
@@ -415,7 +413,7 @@ def plan_pileup(n_jobs, bytes_per_job=None, budget=None, points_per_record=1):
     most room -- which is where the largest inputs get run.
     """
 
-    floor = group_floor(bytes_per_job, points_per_record)
+    floor = group_floor(bytes_per_job, record_weight)
     if n_jobs <= 0:
         # Nothing to run, so nothing to plan. The batch count is still
         # the scan floor, which is a property of the bytes rather than
@@ -440,7 +438,7 @@ def plan_pileup(n_jobs, bytes_per_job=None, budget=None, points_per_record=1):
     # `memory_floor` already gives in exactly this situation, so the
     # two solvers agree about what to hand back.
     best = (0, MAX_CONTIG_GROUPS)
-    for groups, peak in _admissible_counts(bytes_per_job, points_per_record):
+    for groups, peak in _admissible_counts(bytes_per_job, record_weight):
         fits = budget // peak
         # Not clamped here: a zero has to reach the comparison, or
         # "one fits" and "none fits" are indistinguishable and the
@@ -544,7 +542,7 @@ def memory_budget():
     return max(1, headroom - machine_cost)
 
 
-def memory_floor(input_bytes, workers, budget=None, points_per_record=1):
+def memory_floor(input_bytes, workers, budget=None, record_weight=1):
     """Fewest contig batches that keep ``workers`` of this job in budget.
 
     The memory counterpart of `group_floor`, which answers the
@@ -563,9 +561,8 @@ def memory_floor(input_bytes, workers, budget=None, points_per_record=1):
         ``/sys/fs/cgroup``, the environment and ``sysconf`` per job --
         and the budget comes from mutable OS state, so two reads are
         not guaranteed to agree.
-    :param points_per_record: Rows one record contributes to the
-        grouping, as `group_floor` takes it, and scales the projected
-        peak as `projected_peak` takes it.
+    :param record_weight: The sizing multiplier per record, as
+        `group_floor` and `projected_peak` take it.
     :returns: a `MemoryFloor`. ``fits`` is what makes the batch count
         answerable: the largest count available is the best this can do
         when nothing fits, and silently being over budget is how a
@@ -587,7 +584,7 @@ def memory_floor(input_bytes, workers, budget=None, points_per_record=1):
     fits then nothing in range fits.
     """
 
-    floor = group_floor(input_bytes, points_per_record)
+    floor = group_floor(input_bytes, record_weight)
     if budget is None:
         budget = memory_budget()
     if budget is None:
@@ -595,13 +592,13 @@ def memory_floor(input_bytes, workers, budget=None, points_per_record=1):
         # that was exceeded, which is why this reports a fit.
         return MemoryFloor(floor, True)
     workers = max(1, int(workers))
-    for groups, peak in _admissible_counts(input_bytes, points_per_record):
+    for groups, peak in _admissible_counts(input_bytes, record_weight):
         if workers * peak <= budget:
             return MemoryFloor(groups, True)
     return MemoryFloor(MAX_CONTIG_GROUPS, False)
 
 
-def group_floor(input_bytes, points_per_record=1):
+def group_floor(input_bytes, record_weight=1):
     """Fewest contig batches that keep one query's scan under the cap.
 
     Independent of memory by design: this is how large a single
@@ -609,20 +606,50 @@ def group_floor(input_bytes, points_per_record=1):
     `MAX_GROUP_INPUT_BYTES`.
 
     :param input_bytes: Alignment bytes the job reads, or ``None``.
-    :param points_per_record: Rows one record contributes to the
-        grouping, as `quadrat.pileup.aggregate.Aggregate` answers it
-        through its private ``_points_per_record``. The cap is divided
-        by it, so a job contributing two
-        rows per record is split as a job of twice its bytes would be.
+    :param record_weight: The sizing multiplier per record: how many
+        records of a counts pileup one of this job's stands for. The cap
+        is divided by it, so a job whose records weigh two is split as a
+        job of twice its bytes would be. A fractional weight is rounded
+        up first, so ``1.5`` is split as ``2``. A pileup's records weigh
+        one of three values, as its `quadrat.pileup.aggregate.Aggregate`
+        answers:
+
+        ``1``
+            A rule naming one position per record, which contributes one
+            row to the grouping.
+
+        ``2``
+            An unspliced ``"span"``, whose record contributes two
+            boundary events.
+
+        ``10``
+            A spliced ``"span"``, whose peak grows with the CIGAR
+            operations of the skipping records kept, however densely
+            they are packed, rather than with the positions they cover.
+            It sizes short reads with a few skips each; the ``spliced``
+            field of `quadrat.pileup.aggregate.Aggregate` states how
+            large a job of them the batch ceiling leaves covered.
+
+    .. rubric:: Implementation notes
+
+    The spliced weight rests on resident-memory peaks measured on
+    synthetic alignments of 2 to 6 MB, on macOS, at one partition. Over
+    short reads half of which skip one to three runs, a spliced span
+    peaked at 2.7 times an unspliced span per record, 4.3 times it per
+    input byte, and 7.9 times a counts pileup per input byte, which ten
+    exceeds by about a quarter. Over records of about 300 operations it
+    peaked up to 15 times an unspliced span per input byte, past what
+    ten covers.
     """
 
     if not input_bytes:
         return 1
-    groups = -(-int(input_bytes) * int(points_per_record) // MAX_GROUP_INPUT_BYTES)
+    weighted = int(input_bytes) * math.ceil(record_weight)
+    groups = -(-weighted // MAX_GROUP_INPUT_BYTES)
     return max(1, min(MAX_CONTIG_GROUPS, groups))
 
 
-def _admissible_counts(input_bytes, points_per_record):
+def _admissible_counts(input_bytes, record_weight):
     """Each batch count a solver may choose, with its projected peak.
 
     The two solvers above answer different questions -- one maximises
@@ -646,10 +673,8 @@ def _admissible_counts(input_bytes, points_per_record):
     fewest batches that do.
     """
 
-    for groups in range(
-        group_floor(input_bytes, points_per_record), MAX_CONTIG_GROUPS + 1
-    ):
-        yield groups, projected_peak(input_bytes, groups, points_per_record)
+    for groups in range(group_floor(input_bytes, record_weight), MAX_CONTIG_GROUPS + 1):
+        yield groups, projected_peak(input_bytes, groups, record_weight)
 
 
 def _allocation_bytes():
