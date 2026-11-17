@@ -77,6 +77,23 @@ GOLDEN_CONFIGS = MappingProxyType(
 # The golden configurations in a fixed order, as test ids.
 CONFIG_IDS = tuple(sorted(GOLDEN_CONFIGS))
 
+
+def before_92(config):
+    """Return a golden configuration with its jitter drawn as upstream drew it before #92.
+
+    A bound ``m`` becomes ``Jitter(-m, m - 1)``, the rule
+    jmschrei/cherimoya#92 replaced; a bound of ``0`` stays, being no
+    jitter under either.
+    """
+
+    # Imported here, not at the top: the conftest imports this module
+    # before it sets the cache variable the package reads on import.
+    from quadrat.rules import Jitter
+
+    bound = config["max_jitter"]
+    return dict(config, max_jitter=Jitter(-bound, bound - 1) if bound else 0)
+
+
 # Three records' spans on chr1, two overlapping and the third abutting
 # the second, and the boundary events a ``"span"`` pileup writes for
 # them: ``+1`` at each start and ``-1`` at each end, the abutting pair's

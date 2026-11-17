@@ -37,6 +37,7 @@ from quadrat._engine import (
     registered_frames,
     transpile_intervals,
 )
+from quadrat.rules import as_exclusions, as_jitter
 from quadrat.stores import (
     ProcessLocalHandles,
     SequenceStore,
@@ -146,7 +147,7 @@ class WindowSignalCache(ProcessLocalHandles):
     The layout is the one `group_track` returns and documents.
 
     Never authoritative. A cache depends on the locus set, the contig
-    split, the exclusion lists and the jitter bound, and can always be
+    split, the exclusion rules and the jitter's margin, and can always be
     rebuilt from the tracks, so a persisted entry is an optimisation
     and a miss is never an error.
 
@@ -413,7 +414,8 @@ class WindowSignalCache(ProcessLocalHandles):
         :param index: The window, as its row in the set this cache was
             built for, counting from ``0``, as `require_index` takes
             one.
-        :param jitter: How far the draw is shifted. A position shifted
+        :param jitter: The draw's offset into its window, as
+            `quadrat.sampling.LocusDraw` carries it. A position shifted
             outside ``[0, length)`` is dropped, which is what makes a
             window near a contig edge read as zeros there rather than
             raise.
@@ -624,12 +626,16 @@ def window_cache_key(
     :param chroms: The contig subset, or ``None`` for all.
     :param in_window: The input window's width, in bases.
     :param out_window: The output window's width, in bases.
-    :param max_jitter: The jitter margin, in bases, as
-        `quadrat.loci.load_windows` takes it.
+    :param max_jitter: The jitter, as `quadrat.loci.load_windows`
+        takes it. Only its `quadrat.rules.Jitter.margin` is keyed, since
+        the shifts drawn inside the margin change what a run draws and
+        not what an entry holds.
     :param summits: Whether the windows are centred on the peaks'
         summits.
-    :param exclusion_lists: The exclusion locus file or files, as
-        ``peaks``. Each is hashed by content, as a peak file is.
+    :param exclusion_lists: The exclusions, as
+        `quadrat.rules.as_exclusions` takes them, their regions files
+        as ``peaks`` are. Each exclusion is keyed by its rule and by
+        its files, each hashed by content as a peak file is.
     :param min_counts: The lower count threshold, or ``None``. A
         number, a per-group sequence, or anything `numpy.asarray`
         reads as either, so a threshold taken from
@@ -647,8 +653,11 @@ def window_cache_key(
         entries.
     :returns: The key, as a hex `str`.
     :raises TypeError: if ``sequences`` is not a path; if a locus set,
-        an exclusion list or a track is given as anything but a path; or
-        if ``signals`` or ``controls`` is anything `track_list` refuses.
+        an exclusion list or a track is given as anything but a path; if
+        ``signals`` or ``controls`` is anything `track_list` refuses; or
+        for a ``max_jitter`` `quadrat.rules.as_jitter` refuses by type.
+    :raises ValueError: for a ``max_jitter`` `quadrat.rules.as_jitter`
+        refuses by value.
     :raises OSError: if the reference exists and has no usable index,
         and none can be written beside it, or cannot be read.
 
@@ -714,7 +723,7 @@ def window_cache_key(
                 "chroms": list(chroms) if chroms is not None else None,
                 "in_window": int(in_window),
                 "out_window": int(out_window),
-                "max_jitter": int(max_jitter),
+                "max_jitter": as_jitter(max_jitter).margin,
                 "summits": bool(summits),
                 "min_counts": _threshold(min_counts),
                 "max_counts": _threshold(max_counts),
@@ -728,10 +737,11 @@ def window_cache_key(
     )
 
     digest.update(b"exclusion")
-    excluded = [] if exclusion_lists is None else item_list(exclusion_lists)
-    for path in _key_paths("exclusion_lists", excluded):
-        digest.update(os.path.abspath(path).encode())
-        _hash_file(digest, path)
+    for rule in as_exclusions(exclusion_lists):
+        digest.update(json.dumps([rule.bin_width, rule.end_padding]).encode())
+        for path in _key_paths("exclusion_lists", item_list(rule.regions)):
+            digest.update(os.path.abspath(path).encode())
+            _hash_file(digest, path)
 
     for label, tracks in (("signals", signals), ("controls", controls)):
         digest.update(label.encode())

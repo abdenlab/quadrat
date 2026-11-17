@@ -29,12 +29,9 @@ from quadrat._engine import (
 )
 from quadrat.cache import group_track, require_windows, track_list, window_columns
 from quadrat.reference import chrom_lengths
+from quadrat.rules import as_exclusions, as_jitter
 from quadrat.stores import SequenceStore, track_frame
 from quadrat.tables import track_contigs
-
-#: Width of the bins `exclusion_mask` tests on, in bases.
-EXCLUSION_BIN_WIDTH = 100
-
 
 #: The start of a BED line that holds no interval: a comment, or a
 #: track or browser line.
@@ -96,9 +93,9 @@ def load_windows(
     ``in_end``       ``Int64``    end of the input window
     ===============  ===========  =========================================
 
-    Each window is ``max_jitter`` wider on both sides than its nominal
-    width, so every draw a sampler may make lies inside it. A union
-    ending exactly at the contig's length is in bounds.
+    Each window is the jitter's margin wider on both sides than its
+    nominal width, so every draw a sampler may make lies inside it. A
+    union ending exactly at the contig's length is in bounds.
 
     Needs the ``pileup`` extra only where
     `quadrat.reference.chrom_lengths` falls back to a scan for the
@@ -123,20 +120,21 @@ def load_windows(
     :param summits: Whether to centre each locus on its summit, i.e.,
         its start plus the offset in the tenth column. The centre is
         then the summit exactly, whatever the locus's width.
-    :param max_jitter: The margin every window is widened by on both
-        sides, in bases. `quadrat.sampling.PeakNegativeMixSampler`
-        states the shifts a draw takes within it.
+    :param max_jitter: The jitter, as `quadrat.rules.as_jitter` takes
+        it.
     :returns: A `polars.DataFrame` with the columns above.
     :raises TypeError: if ``loci`` is of none of those shapes, if
         ``chroms`` is a single name rather than a collection of them,
-        or if ``sequences`` is not a path.
+        if ``sequences`` is not a path, or for a ``max_jitter``
+        `quadrat.rules.as_jitter` refuses by type.
     :raises FileNotFoundError: if nothing exists at ``sequences`` or at
         a locus file's path.
     :raises ValueError: if ``chroms`` leaves no locus where the loci
         hold some, which is a naming mismatch between the two; if any
         locus is on a contig the reference does not name; or if a
-        summit is negative or lies past its locus's end. Loci that
-        hold no locus to begin with are not refused.
+        summit is negative or lies past its locus's end; or for a
+        ``max_jitter`` `quadrat.rules.as_jitter` refuses by value. Loci
+        that hold no locus to begin with are not refused.
     :raises ImportError: if the reference has no usable index, none
         can be written beside it, and the ``pileup`` extra is not
         installed.
@@ -160,6 +158,7 @@ def load_windows(
 
     pandas = import_on_first_use("pandas")
     polars = import_on_first_use("polars")
+    margin = as_jitter(max_jitter).margin
     sources = _locus_sources("loci", loci)
     chroms = _contig_names(chroms)
     # Ahead of `chrom_lengths`, for the reason in the notes. A
@@ -217,8 +216,8 @@ def load_windows(
 
     in_left, in_right = in_window // 2, in_window // 2 + in_window % 2
     out_left, out_right = out_window // 2, out_window // 2 + out_window % 2
-    outer_start = mid - max(in_left, out_left) - max_jitter
-    outer_end = mid + max(in_right, out_right) + max_jitter
+    outer_start = mid - max(in_left, out_left) - margin
+    outer_end = mid + max(in_right, out_right) + margin
 
     return polars.DataFrame(
         {
@@ -227,10 +226,10 @@ def load_windows(
             "outer_start": outer_start,
             "outer_end": outer_end,
             "in_bounds": (outer_start >= 0) & (outer_end <= sizes),
-            "sig_start": mid - out_left - max_jitter,
-            "sig_end": mid + out_right + max_jitter,
-            "in_start": mid - in_left - max_jitter,
-            "in_end": mid + in_right + max_jitter,
+            "sig_start": mid - out_left - margin,
+            "sig_end": mid + out_right + margin,
+            "in_start": mid - in_left - margin,
+            "in_end": mid + in_right + margin,
         },
         schema={
             "chrom": polars.Utf8,
@@ -247,15 +246,11 @@ def load_windows(
 
 
 def exclusion_mask(windows, exclusion_lists):
-    """Return which windows touch an excluded region, on a grid of fixed bins.
+    """Return which windows touch an excluded region, on a grid of bins.
 
-    The test is made on bins `EXCLUSION_BIN_WIDTH` bases wide rather
-    than on bases. A region marks every bin from the one holding its
-    start through the one holding its end, and a window is flagged when
-    any bin from the one holding ``outer_start`` through the one
-    holding ``outer_end`` is marked. Both ends are the exclusive ones,
-    so a region or a window ending exactly on a bin edge also reaches
-    the bin that begins there.
+    Each `quadrat.rules.Exclusion` bins its regions and every window's
+    ``[outer_start, outer_end)`` by its own rule, and a window is
+    flagged when any of them flags it.
 
     A region on a contig no window is on flags nothing, and neither
     does a window on a contig no region names.
@@ -266,54 +261,60 @@ def exclusion_mask(windows, exclusion_lists):
 
     :param windows: A `polars.DataFrame` carrying ``chrom``,
         ``outer_start`` and ``outer_end``, as `load_windows` returns.
-    :param exclusion_lists: The excluded regions, in any shape
-        `load_windows` takes loci in.
+    :param exclusion_lists: The exclusions, in any shape
+        `quadrat.rules.as_exclusions` takes.
     :returns: A boolean `numpy.ndarray` with one entry per window, in
         row order, true where the window is excluded.
     :raises TypeError: if ``windows`` is not a `polars.DataFrame`, or
-        if ``exclusion_lists`` is of no shape a locus set can take.
+        if an exclusion's regions are of no shape a locus set can take.
     :raises FileNotFoundError: if nothing exists at an exclusion
         list's path.
     :raises ImportError: if the ``pileup`` extra is not installed.
 
     .. rubric:: Implementation notes
 
-    Both sides are half-open runs of bins, so the test is one interval
-    join between two bin tables rather than a scan of either.
+    Both sides are half-open runs of bins, so each rule's test is one
+    interval join between two bin tables rather than a scan of either.
     """
 
     polars = import_on_first_use("polars")
     require_windows("exclusion_mask", windows)
-    regions = _interleave_loci(_locus_sources("exclusion_lists", exclusion_lists))
+    # Every rule's regions are read before any join, so a bad one is
+    # refused whether or not an earlier rule flagged every window.
+    rules = [
+        (rule, _interleave_loci(_locus_sources("exclusion_lists", rule.regions)))
+        for rule in as_exclusions(exclusion_lists)
+    ]
 
     mask = numpy.zeros(len(windows), dtype=bool)
-    if not len(regions) or not len(windows):
+    if not len(windows):
         return mask
-
     bins = {"chrom": polars.Utf8, "bstart": polars.Int64, "bend": polars.Int64}
-    region_bins = polars.DataFrame(
-        {
-            "chrom": regions["chrom"].tolist(),
-            "bstart": _bins(regions["start"].to_numpy()),
-            "bend": _bins(regions["end"].to_numpy()) + 1,
-        },
-        schema=bins,
-    )
-    window_bins = polars.DataFrame(
-        {
-            "idx": numpy.arange(len(windows), dtype=numpy.int64),
-            "chrom": windows["chrom"].cast(polars.Utf8),
-            "bstart": _bins(windows["outer_start"].to_numpy()),
-            "bend": _bins(windows["outer_end"].to_numpy()) + 1,
-        },
-        schema={"idx": polars.Int64, **bins},
-    )
+    # Built once: only the bins differ between rules.
+    window_idx = numpy.arange(len(windows), dtype=numpy.int64)
+    window_chrom = windows["chrom"].cast(polars.Utf8)
+    # An interval covering no bin is left out of the join, where the
+    # interval test would still match its empty run.
+    covering = polars.col("bend") > polars.col("bstart")
+    for rule, regions in rules:
+        if not len(regions):
+            continue
+        bstart, bend = _bins(rule, regions["start"], regions["end"])
+        region_bins = polars.DataFrame(
+            {"chrom": regions["chrom"].tolist(), "bstart": bstart, "bend": bend},
+            schema=bins,
+        ).filter(covering)
+        bstart, bend = _bins(rule, windows["outer_start"], windows["outer_end"])
+        window_bins = polars.DataFrame(
+            {"idx": window_idx, "chrom": window_chrom, "bstart": bstart, "bend": bend},
+            schema={"idx": polars.Int64, **bins},
+        ).filter(covering)
 
-    with registered_frames(
-        {EXCLUSION_BINS_TABLE: region_bins, LOCUS_BINS_TABLE: window_bins}
-    ) as pb:
-        hits = pb.sql(_exclusion_sql()).collect()
-    mask[hits["idx"].to_numpy()] = True
+        with registered_frames(
+            {EXCLUSION_BINS_TABLE: region_bins, LOCUS_BINS_TABLE: window_bins}
+        ) as pb:
+            hits = pb.sql(_exclusion_sql()).collect()
+        mask[hits["idx"].to_numpy()] = True
     return mask
 
 
@@ -342,9 +343,9 @@ def readable_windows(
     :param chroms: The contigs to keep, likewise.
     :param summits: Whether loci are centred on their summits,
         likewise.
-    :param max_jitter: The jitter margin, likewise.
-    :param exclusion_lists: The excluded regions, as `exclusion_mask`
-        takes them, or ``None`` to exclude nothing.
+    :param max_jitter: The jitter, likewise.
+    :param exclusion_lists: The exclusions, as `exclusion_mask` takes
+        them, or ``None`` to exclude nothing.
     :returns: ``(windows, keep)``: the frame `load_windows` returns,
         and a boolean `numpy.ndarray` with one entry per row, true
         where the window may be read.
@@ -662,10 +663,11 @@ def extract_loci(
     keeps none: both answer tensors with no rows.
 
     Controls are read over the input window, at the width the
-    sequence is. The sequences and the controls are ``in_window + 2 *
-    max_jitter`` wide and the signals ``out_window + 2 * max_jitter``,
-    and they are those widths when no locus is read as well, so an
-    empty result differs from a full one in its first axis alone.
+    sequence is. With ``m`` the jitter's `quadrat.rules.Jitter.margin`,
+    the sequences and the controls are ``in_window + 2 * m`` wide and
+    the signals ``out_window + 2 * m``, and they are those widths when
+    no locus is read as well, so an empty result differs from a full
+    one in its first axis alone.
 
     Needs the ``pileup`` extra to read ``signals`` and ``controls``
     and to apply ``exclusion_lists``, and for nothing else. The
@@ -690,8 +692,7 @@ def extract_loci(
     :param controls: One track per control channel, in the same form,
         or ``None``.
     :param chroms: The contigs to keep, as `load_windows` takes them.
-    :param max_jitter: The margin every window is widened by on both
-        sides, in bases, as `load_windows` takes it.
+    :param max_jitter: The jitter, as `load_windows` takes it.
     :param min_counts: The lowest count a kept locus may have, or
         ``None`` for no floor.
     :param max_counts: The highest count a kept locus may have, or
@@ -702,20 +703,20 @@ def extract_loci(
         `load_windows` takes it.
     :param alphabet: The residues that get a row, in row order.
     :param ignore: Residues that encode to an all-zero column.
-    :param exclusion_lists: The excluded regions, as `exclusion_mask`
-        takes them, or ``None`` to exclude nothing.
+    :param exclusion_lists: The exclusions, as `exclusion_mask` takes
+        them, or ``None`` to exclude nothing.
     :returns: An `ExtractedLoci`.
     :raises TypeError: if ``signals`` or ``controls`` is a single
         track, an unordered collection of them, or holds something that
-        is no track, or for any argument `load_windows` refuses by
+        is no track, or for anything `readable_windows` refuses by
         type.
     :raises ValueError: if ``signals`` is given without ``out_window``;
         if a count threshold is given without ``signals``; if
         ``target_idx`` names no signal track where ``signals`` holds
         one or a count threshold is given; if a track directory does
-        not verify complete; for the two naming mismatches
-        `load_windows` refuses; for the one `require_track_contigs`
-        refuses; or for a residue `extract_sequences` refuses.
+        not verify complete; for anything `load_windows` refuses by
+        value; for the one `require_track_contigs` refuses; or for a
+        residue `extract_sequences` refuses.
     :raises FileNotFoundError: if a track path does not exist, or for a
         locus file or an exclusion list `readable_windows` finds nothing
         at.
@@ -799,7 +800,8 @@ def extract_loci(
         # At the nominal widths, as the docstring promises: the
         # readers below answer no width for no windows, having only
         # the windows to take one from.
-        in_width, out_width = in_window + 2 * max_jitter, out_window + 2 * max_jitter
+        margin = as_jitter(max_jitter).margin
+        in_width, out_width = in_window + 2 * margin, out_window + 2 * margin
         empty = {
             label: torch.zeros((0, len(tracks), width), dtype=torch.float32)
             for label, tracks, width in (
@@ -907,10 +909,28 @@ def _described(sources):
     )
 
 
-def _bins(coordinates):
-    """Return the exclusion bin each coordinate falls in, as ``int64``."""
+def _bins(rule, starts, ends):
+    """Return the half-open bin runs ``rule`` covers intervals by, as ``int64``.
 
-    return coordinates.astype(numpy.int64) // EXCLUSION_BIN_WIDTH
+    ``(bstart, bend)``, the run from ``bstart`` up to ``bend``. A run
+    with ``bend <= bstart`` covers no bin; `quadrat.rules.Exclusion`
+    states when that is.
+    """
+
+    starts = numpy.asarray(starts).astype(numpy.int64)
+    ends = numpy.asarray(ends).astype(numpy.int64)
+    if rule.end_padding:
+        ends += rule.end_padding
+    # Tested rather than left to the division, which gives an empty
+    # interval starting inside a bin that whole bin.
+    empty = ends <= starts
+    # In place, on copies this owns: the frames run to a million rows.
+    starts //= rule.bin_width
+    ends -= 1
+    ends //= rule.bin_width
+    ends += 1
+    ends[empty] = starts[empty]
+    return starts, ends
 
 
 @functools.cache

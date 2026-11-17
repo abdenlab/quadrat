@@ -26,11 +26,12 @@ import pandas
 import polars
 import pytest
 import torch
-from hypothesis import assume, given, settings
+from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
 from tangermeme.io import extract_loci as tangermeme_extract_loci
 
 from quadrat import loci
+from quadrat.rules import Exclusion, Jitter
 from tests import (
     TWO_CONTIGS,
     UNREADABLE_IDS,
@@ -56,19 +57,11 @@ PEAKS = [
     ("chr1", 20, 40, "peak", 0, "."),  # starts before the contig
     ("chr1", 960, 1000, "peak", 0, "."),  # ends past the contig
     ("chr1", 955, 975, "peak", 0, "."),  # ends exactly at the contig's length
-    ("chr1", 690, 720, "peak", 0, "."),  # excluded only through a bin edge
+    ("chr1", 690, 720, "peak", 0, "."),  # excluded only through a padded bin edge
     ("chr1", 800, 840, "peak", 0, "."),  # over the soft-masked run
     ("chr1", 930, 940, "peak", 0, "."),  # ordinary, near the end
     ("chr1", 540, 560, "peak", 0, "."),  # inside the excluded region
 ]
-
-
-# The peaks on which every release of tangermeme agrees with this
-# package. The sixth is left out: its window starts in the bin that
-# begins where the excluded region ends, which a region marks under
-# the rule `exclusion_mask` documents and does not mark under the rule
-# tangermeme 1.6 adopted. That rule has a test of its own below.
-AGREED_PEAKS = PEAKS[:5] + PEAKS[6:]
 
 
 EXCLUSION = [("chr1", 500, 600)]
@@ -304,17 +297,23 @@ def round_robin(locus_sets):
     return order
 
 
-def touches(window, regions, width=100):
-    """Return whether a window shares a bin with any region on its contig.
+def covered(start, end, width, padding):
+    """Return the bins an interval covers under one exclusion rule, as a set.
 
-    The rule `exclusion_mask` documents, restated as a set intersection
-    over the bins each side reaches.
+    The rule `quadrat.rules.Exclusion` documents, restated base by
+    base: the bins holding any base of ``[start, end + padding)``.
     """
 
+    return {base // width for base in range(start, end + padding)}
+
+
+def touches(window, regions, width=100, padding=0):
+    """Return whether a window shares a bin with any region on its contig."""
+
     chrom, start, end = window
-    reached = set(range(start // width, end // width + 1))
+    reached = covered(start, end, width, padding)
     return any(
-        on == chrom and reached & set(range(lo // width, hi // width + 1))
+        on == chrom and reached & covered(lo, hi, width, padding)
         for on, lo, hi in regions
     )
 
@@ -1252,6 +1251,52 @@ def test_load_windows_should_raise_import_error_when_only_a_scan_gives_the_lengt
     assert "`pileup` extra" in message
 
 
+def test_load_windows_should_widen_by_the_margin_of_a_jitter(corpus):
+    """Test that a `Jitter` widens every window by its margin.
+
+    Given:
+        The module's peaks, and a jitter of ``Jitter(-5, 4)``, whose
+        margin is 5, beside the bare integer 5.
+    When:
+        Windows are loaded under each.
+    Then:
+        It should answer equal frames.
+    """
+
+    # Act
+    lopsided = loci.load_windows(
+        corpus.peaks, corpus.fasta, 60, 30, max_jitter=Jitter(-5, 4)
+    )
+    bare = loci.load_windows(corpus.peaks, corpus.fasta, 60, 30, max_jitter=5)
+
+    # Assert
+    assert lopsided.equals(bare)
+
+
+@pytest.mark.parametrize(
+    ("max_jitter", "error"),
+    [(-1, ValueError), (True, TypeError)],
+    ids=["negative", "bool"],
+)
+def test_load_windows_should_raise_when_max_jitter_is_no_jitter(
+    corpus, max_jitter, error
+):
+    """Test the refusal of a jitter `quadrat.rules.as_jitter` refuses.
+
+    Given:
+        The module's peaks and a jitter of -1 or `True`.
+    When:
+        Windows are loaded.
+    Then:
+        It should raise `ValueError` for the negative integer and
+        `TypeError` for the `bool`, each naming ``max_jitter``.
+    """
+
+    # Act & assert
+    with pytest.raises(error, match="max_jitter"):
+        loci.load_windows(corpus.peaks, corpus.fasta, 60, 30, max_jitter=max_jitter)
+
+
 @settings(max_examples=60, deadline=None)
 @given(rows=locus_rows, in_window=in_windows, out_window=out_windows, max_jitter=jitters)
 def test_load_windows_should_bound_every_window_consistently_for_any_geometry(
@@ -1300,44 +1345,58 @@ def test_load_windows_should_bound_every_window_consistently_for_any_geometry(
         )
 
 
+@pytest.mark.parametrize(
+    ("end_padding", "flagged"), [(0, [8]), (1, [5, 8])], ids=["half_open", "padded"]
+)
 def test_exclusion_mask_should_flag_the_windows_sharing_a_bin_with_a_region(
-    corpus, engine
+    corpus, engine, end_padding, flagged
 ):
-    """Test the mask over the module's peaks.
+    """Test the mask over the module's peaks under both end rules.
 
     Given:
         The module's nine windows at a jitter of 5 and a region over
-        ``[500, 600)`` of ``chr1``.
+        ``[500, 600)`` of ``chr1``, its ends padded by nothing or by
+        one base.
     When:
         The mask is taken.
     Then:
-        It should flag the window inside the region and the one
-        starting in the bin that begins where the region ends, and no
-        other.
+        It should flag the window inside the region, and, padded, the
+        one starting in the bin that begins where the region ends, and
+        no other.
     """
 
     # Arrange
     windows = loci.load_windows(corpus.peaks, corpus.fasta, 60, 30, max_jitter=5)
 
     # Act
-    mask = loci.exclusion_mask(windows, [corpus.exclusion])
+    mask = loci.exclusion_mask(
+        windows, Exclusion(corpus.exclusion, end_padding=end_padding)
+    )
 
     # Assert
     assert mask.dtype == numpy.bool_
-    assert mask.tolist() == [False, False, False, False, False, True, False, False, True]
+    assert numpy.flatnonzero(mask).tolist() == flagged
 
 
-def test_exclusion_mask_should_reach_the_bin_that_begins_where_a_region_ends(engine):
-    """Test the documented reach of a region ending on a bin edge.
+@pytest.mark.parametrize(
+    ("end_padding", "flagged"),
+    [(0, [False, False]), (1, [True, False])],
+    ids=["half_open", "padded"],
+)
+def test_exclusion_mask_should_reach_the_bin_beginning_where_a_region_ends_only_when_padded(
+    engine, end_padding, flagged
+):
+    """Test the reach of a region ending on a bin edge under both end rules.
 
     Given:
-        A region over ``[500, 600)``, a window over ``[650, 699)`` in
-        the bin beginning at 600, and one over ``[700, 760)`` in the
-        bin after.
+        A region over ``[500, 600)``, its end padded by nothing or by
+        one base, a window over ``[650, 699)`` in the bin beginning at
+        600, and one over ``[700, 760)`` in the bin after.
     When:
         The mask is taken.
     Then:
-        It should flag the first window and not the second.
+        It should flag the first window only when padded, and never
+        the second.
     """
 
     # Arrange
@@ -1347,23 +1406,32 @@ def test_exclusion_mask_should_reach_the_bin_that_begins_where_a_region_ends(eng
     regions = pandas.DataFrame([("chr1", 500, 600)])
 
     # Act
-    mask = loci.exclusion_mask(windows, regions)
+    mask = loci.exclusion_mask(windows, Exclusion(regions, end_padding=end_padding))
 
     # Assert
-    assert mask.tolist() == [True, False]
+    assert mask.tolist() == flagged
 
 
-def test_exclusion_mask_should_reach_the_bin_that_begins_where_a_window_ends(engine):
-    """Test the documented reach of a window ending on a bin edge.
+@pytest.mark.parametrize(
+    ("end_padding", "flagged"),
+    [(0, [False, False]), (1, [True, False])],
+    ids=["half_open", "padded"],
+)
+def test_exclusion_mask_should_reach_the_bin_beginning_where_a_window_ends_only_when_padded(
+    engine, end_padding, flagged
+):
+    """Test the reach of a window ending on a bin edge under both end rules.
 
     Given:
-        A region over ``[500, 510)``, a window over ``[430, 500)``
-        ending on the edge of the region's bin, and one over
-        ``[430, 499)`` ending a base short of it.
+        A region over ``[500, 510)``, ends padded by nothing or by one
+        base, a window over ``[430, 500)`` ending on the edge of the
+        region's bin, and one over ``[430, 499)`` ending a base short
+        of it.
     When:
         The mask is taken.
     Then:
-        It should flag the first window and not the second.
+        It should flag the first window only when padded, and never
+        the second.
     """
 
     # Arrange
@@ -1373,10 +1441,10 @@ def test_exclusion_mask_should_reach_the_bin_that_begins_where_a_window_ends(eng
     regions = pandas.DataFrame([("chr1", 500, 510)])
 
     # Act
-    mask = loci.exclusion_mask(windows, regions)
+    mask = loci.exclusion_mask(windows, Exclusion(regions, end_padding=end_padding))
 
     # Assert
-    assert mask.tolist() == [True, False]
+    assert mask.tolist() == flagged
 
 
 def test_exclusion_mask_should_flag_nothing_across_contigs(engine):
@@ -1402,6 +1470,168 @@ def test_exclusion_mask_should_flag_nothing_across_contigs(engine):
     assert mask.tolist() == [False]
 
 
+@pytest.mark.parametrize(
+    ("window", "region"),
+    [(("chr1", 500, 560), ("chr1", 550, 550)), (("chr1", 0, 300), ("chr1", 150, 150))],
+    ids=["start_bin", "inside"],
+)
+@pytest.mark.parametrize(
+    ("end_padding", "flagged"),
+    [(0, [False]), (1, [True])],
+    ids=["half_open", "padded"],
+)
+def test_exclusion_mask_should_flag_by_an_empty_region_only_when_padded(
+    engine, end_padding, flagged, window, region
+):
+    """Test the reach of a region holding no base under both end rules.
+
+    Given:
+        An empty region of ``chr1``, its end padded by nothing or by
+        one base, either at 550 with a window over ``[500, 560)``
+        starting in the bin holding it, or at 150 strictly inside a
+        window over ``[0, 300)``.
+    When:
+        The mask is taken.
+    Then:
+        It should flag the window only when padded.
+    """
+
+    # Arrange
+    windows = window_frame([window], ("outer_start", "outer_end"))
+    regions = pandas.DataFrame([region])
+
+    # Act
+    mask = loci.exclusion_mask(windows, Exclusion(regions, end_padding=end_padding))
+
+    # Assert
+    assert mask.tolist() == flagged
+
+
+@pytest.mark.parametrize(
+    ("window", "region"),
+    [(("chr1", 550, 550), ("chr1", 500, 600)), (("chr1", 150, 150), ("chr1", 0, 300))],
+    ids=["start_bin", "inside"],
+)
+@pytest.mark.parametrize(
+    ("end_padding", "flagged"),
+    [(0, [False]), (1, [True])],
+    ids=["half_open", "padded"],
+)
+def test_exclusion_mask_should_flag_an_empty_window_only_when_padded(
+    engine, end_padding, flagged, window, region
+):
+    """Test the reach of a window holding no base under both end rules.
+
+    Given:
+        An empty window of ``chr1``, ends padded by nothing or by one
+        base, either at 550 in the bin a region over ``[500, 600)``
+        starts in, or at 150 strictly inside a region over
+        ``[0, 300)``.
+    When:
+        The mask is taken.
+    Then:
+        It should flag the window only when padded.
+    """
+
+    # Arrange
+    windows = window_frame([window], ("outer_start", "outer_end"))
+    regions = pandas.DataFrame([region])
+
+    # Act
+    mask = loci.exclusion_mask(windows, Exclusion(regions, end_padding=end_padding))
+
+    # Assert
+    assert mask.tolist() == flagged
+
+
+@pytest.mark.parametrize(
+    ("bin_width", "flagged"), [(1, [False]), (100, [True])], ids=["bases", "bins"]
+)
+def test_exclusion_mask_should_compare_bases_only_when_the_bin_width_is_one(
+    engine, bin_width, flagged
+):
+    """Test that a bin width of one compares bases rather than bins.
+
+    Given:
+        A window over ``[100, 150)`` of ``chr1`` and a region over
+        ``[160, 170)``, which share the bin beginning at 100 but no
+        base, under a bin width of one or of 100.
+    When:
+        The mask is taken.
+    Then:
+        It should flag the window at a width of 100 only.
+    """
+
+    # Arrange
+    windows = window_frame([("chr1", 100, 150)], ("outer_start", "outer_end"))
+    regions = pandas.DataFrame([("chr1", 160, 170)])
+
+    # Act
+    mask = loci.exclusion_mask(windows, Exclusion(regions, bin_width=bin_width))
+
+    # Assert
+    assert mask.tolist() == flagged
+
+
+def test_exclusion_mask_should_flag_a_window_any_of_its_rules_flags(engine):
+    """Test that the rules of a list are combined by either flagging.
+
+    Given:
+        Three windows in bins 1, 3 and 5 of ``chr1``, and a list of two
+        `Exclusion` values, one over a region in bin 1 and one, under a
+        bin width of 1, over a region in bin 3.
+    When:
+        The mask is taken.
+    Then:
+        It should flag the first two windows and not the third.
+    """
+
+    # Arrange
+    windows = window_frame(
+        [("chr1", 100, 160), ("chr1", 300, 360), ("chr1", 500, 560)],
+        ("outer_start", "outer_end"),
+    )
+    rules = [
+        Exclusion(pandas.DataFrame([("chr1", 120, 130)])),
+        Exclusion(pandas.DataFrame([("chr1", 350, 351)]), bin_width=1),
+    ]
+
+    # Act
+    mask = loci.exclusion_mask(windows, rules)
+
+    # Assert
+    assert mask.tolist() == [True, True, False]
+
+
+def test_exclusion_mask_should_read_a_list_of_region_frames_as_one_rule(engine):
+    """Test that bare region sets in a list are excluded together.
+
+    Given:
+        Three windows in bins 1, 3 and 5 of ``chr1``, and a list of two
+        region frames, one in bin 1 and one in bin 3.
+    When:
+        The mask is taken.
+    Then:
+        It should flag the first two windows and not the third.
+    """
+
+    # Arrange
+    windows = window_frame(
+        [("chr1", 100, 160), ("chr1", 300, 360), ("chr1", 500, 560)],
+        ("outer_start", "outer_end"),
+    )
+    regions = [
+        pandas.DataFrame([("chr1", 120, 130)]),
+        pandas.DataFrame([("chr1", 320, 330)]),
+    ]
+
+    # Act
+    mask = loci.exclusion_mask(windows, regions)
+
+    # Assert
+    assert mask.tolist() == [True, True, False]
+
+
 @pytest.mark.parametrize("form", ["path", "list", "frame", "polars", "plain"])
 def test_exclusion_mask_should_take_regions_in_every_shape_loci_come_in(
     corpus, engine, tmp_path, form
@@ -1414,7 +1644,7 @@ def test_exclusion_mask_should_take_regions_in_every_shape_loci_come_in(
     When:
         The mask is taken over the module's windows.
     Then:
-        It should flag the same two windows from every form.
+        It should flag the same window from every form.
     """
 
     # Arrange
@@ -1431,7 +1661,7 @@ def test_exclusion_mask_should_take_regions_in_every_shape_loci_come_in(
     mask = loci.exclusion_mask(windows, regions)
 
     # Assert
-    assert numpy.flatnonzero(mask).tolist() == [5, 8]
+    assert numpy.flatnonzero(mask).tolist() == [8]
 
 
 @pytest.mark.parametrize("regions", [[], pandas.DataFrame({"c": [], "s": [], "e": []})])
@@ -1522,6 +1752,35 @@ def test_exclusion_mask_should_raise_type_error_when_a_region_set_is_no_locus_se
         loci.exclusion_mask(windows, 42)
 
 
+def test_exclusion_mask_should_raise_type_error_when_a_later_rule_holds_no_locus_set(
+    engine,
+):
+    """Test that every rule's regions are read before any is applied.
+
+    Given:
+        A window, and a list of an `Exclusion` whose region flags it
+        followed by an `Exclusion` over an object that is no locus set.
+    When:
+        The mask is taken.
+    Then:
+        It should raise `TypeError` naming the argument, though the
+        first rule alone flags every window.
+    """
+
+    # Arrange
+    windows = window_frame([("chr1", 0, 60)], ("outer_start", "outer_end"))
+    rules = [
+        Exclusion(pandas.DataFrame([("chr1", 0, 1000)])),
+        Exclusion(object()),
+    ]
+
+    # Act & assert
+    with pytest.raises(
+        TypeError, match=r"`exclusion_lists` is a BED file path.*Got builtins\.object\."
+    ):
+        loci.exclusion_mask(windows, rules)
+
+
 def test_exclusion_mask_should_raise_file_not_found_error_when_a_list_is_missing(
     tmp_path,
 ):
@@ -1587,35 +1846,75 @@ def test_exclusion_mask_should_raise_import_error_when_the_extra_is_absent(
         loci.exclusion_mask(windows, [corpus.exclusion])
 
 
+# Base overlap under both end rules, over intervals that meet only at
+# an edge, so that the end padding alone decides whether they touch.
+# At a width of 100 the mask is the same, so this pins the padding at
+# an edge but not the width; the examples beside it, and
+# `test_exclusion_mask_should_compare_bases_only_when_the_bin_width_is_one`,
+# separate the widths.
+EDGE_ONLY = {
+    "window_rows": [("a", 100, 200), ("a", 300, 400)],
+    "region_rows": [("a", 200, 300)],
+    "width": 1,
+}
+
+
 @settings(max_examples=60, deadline=None)
-@given(window_rows=interval_rows, region_rows=interval_rows)
-def test_exclusion_mask_should_match_a_bin_by_bin_test_for_any_intervals(
-    engine, window_rows, region_rows
+@example(**EDGE_ONLY, padding=0)
+@example(**EDGE_ONLY, padding=1)
+# An empty region strictly inside a window's bin, which covers no base.
+@example(
+    window_rows=[("a", 0, 300)], region_rows=[("a", 150, 150)], width=100, padding=0
+)
+# An empty window strictly inside a region, which covers no base.
+@example(
+    window_rows=[("a", 150, 150)], region_rows=[("a", 0, 300)], width=100, padding=0
+)
+# A window and a region sharing the bin at 100 but no 7-base bin, so
+# a width of 7 is told apart from one of 100.
+@example(
+    window_rows=[("a", 100, 150)], region_rows=[("a", 160, 170)], width=7, padding=0
+)
+@given(
+    window_rows=interval_rows,
+    region_rows=interval_rows,
+    width=st.sampled_from([1, 7, 100]),
+    padding=st.integers(min_value=0, max_value=2),
+)
+def test_exclusion_mask_should_match_a_base_by_base_test_for_any_intervals(
+    engine, window_rows, region_rows, width, padding
 ):
     """Test the mask against the rule it documents, over arbitrary inputs.
 
     Given:
         At least one window and one region over two contigs, each
-        bounded on or beside a bin edge and of any width down to zero.
+        bounded on or beside a bin edge and of any width down to zero,
+        under any of three bin widths and an end padding of up to two
+        bases.
     When:
         The mask is taken.
     Then:
-        It should flag exactly the windows whose bins intersect the
-        bins of a region on the same contig.
+        It should flag exactly the windows that hold a base in a bin
+        holding a base of a region on the same contig, each interval
+        padded at its end.
     """
 
     # Arrange
     windows = [(chrom, min(lo, hi), max(lo, hi)) for chrom, lo, hi in window_rows]
     regions = [(chrom, min(lo, hi), max(lo, hi)) for chrom, lo, hi in region_rows]
-
-    # Act
-    mask = loci.exclusion_mask(
-        window_frame(windows, ("outer_start", "outer_end")),
+    rule = Exclusion(
         pandas.DataFrame(regions, columns=["chrom", "start", "end"]),
+        bin_width=width,
+        end_padding=padding,
     )
 
+    # Act
+    mask = loci.exclusion_mask(window_frame(windows, ("outer_start", "outer_end")), rule)
+
     # Assert
-    assert mask.tolist() == [touches(window, regions) for window in windows]
+    assert mask.tolist() == [
+        touches(window, regions, width, padding) for window in windows
+    ]
 
 
 def test_readable_windows_should_keep_the_windows_in_bounds_that_no_region_excludes(
@@ -1625,7 +1924,7 @@ def test_readable_windows_should_keep_the_windows_in_bounds_that_no_region_exclu
 
     Given:
         The module's nine peaks at a jitter of 5 and its exclusion
-        list.
+        list, its ends padded by one base.
     When:
         Their readable windows are taken.
     Then:
@@ -1641,7 +1940,7 @@ def test_readable_windows_should_keep_the_windows_in_bounds_that_no_region_exclu
         IN_WINDOW,
         OUT_WINDOW,
         max_jitter=5,
-        exclusion_lists=[corpus.exclusion],
+        exclusion_lists=Exclusion(corpus.exclusion, end_padding=1),
     )
 
     # Assert
@@ -3069,9 +3368,10 @@ def test_extract_loci_should_match_tangermeme_over_the_same_inputs(
 
     Given:
         Peaks with windows off either edge of a contig, one ending
-        exactly at a contig's length and one inside an excluded
-        region; an exclusion list; and one track, given to tangermeme
-        as the dense arrays its rows imply.
+        exactly at a contig's length, one inside an excluded region
+        and one only a padded end would exclude; an exclusion list;
+        and one track, given to tangermeme as the dense arrays its
+        rows imply.
     When:
         The loci are extracted by this package and by tangermeme, with
         and without jitter and a contig filter.
@@ -3081,7 +3381,7 @@ def test_extract_loci_should_match_tangermeme_over_the_same_inputs(
     """
 
     # Arrange
-    peaks = pandas.DataFrame(AGREED_PEAKS)
+    peaks = pandas.DataFrame(PEAKS)
     shared = dict(
         chroms=chroms, max_jitter=max_jitter, exclusion_lists=[corpus.exclusion]
     )
@@ -3114,7 +3414,8 @@ def test_extract_loci_should_keep_the_loci_its_three_tests_admit(corpus, engine)
     """Test the kept mask against a hand-derived expectation.
 
     Given:
-        The module's nine peaks, its exclusion list and a jitter of 5.
+        The module's nine peaks, its exclusion list with its ends
+        padded by one base, and a jitter of 5.
     When:
         The loci are extracted.
     Then:
@@ -3132,7 +3433,7 @@ def test_extract_loci_should_keep_the_loci_its_three_tests_admit(corpus, engine)
         OUT_WINDOW,
         signals=corpus.tracks[:1],
         max_jitter=5,
-        exclusion_lists=[corpus.exclusion],
+        exclusion_lists=Exclusion(corpus.exclusion, end_padding=1),
     )
 
     # Assert
@@ -4017,6 +4318,44 @@ def test_extract_loci_should_answer_no_rows_when_the_exclusion_lists_keep_nothin
     # Assert
     assert extracted.signals.shape == (0, 1, OUT_WINDOW)
     assert extracted.sequences.shape == (0, 4, IN_WINDOW)
+    assert not extracted.kept.any()
+
+
+def test_extract_loci_should_widen_an_empty_result_by_the_margin_of_a_jitter(
+    corpus, engine, tmp_path
+):
+    """Test the widths of an empty result under a lopsided jitter.
+
+    Given:
+        The module's peaks, a signal track, a jitter of
+        ``Jitter(-5, 4)``, whose margin is 5, and an `Exclusion` over
+        regions covering both contigs.
+    When:
+        The loci are extracted.
+    Then:
+        It should answer no rows, the sequences ``in_window + 10``
+        wide and the signals ``out_window + 10``.
+    """
+
+    # Arrange
+    everything = builders.write_bed(
+        str(tmp_path / "exclude_all.bed.gz"), [("chr1", 0, 1000), ("chr2", 0, 500)]
+    )
+
+    # Act
+    extracted = loci.extract_loci(
+        corpus.peaks,
+        corpus.fasta,
+        IN_WINDOW,
+        OUT_WINDOW,
+        signals=corpus.tracks[:1],
+        max_jitter=Jitter(-5, 4),
+        exclusion_lists=Exclusion(everything),
+    )
+
+    # Assert
+    assert extracted.sequences.shape == (0, 4, IN_WINDOW + 10)
+    assert extracted.signals.shape == (0, 1, OUT_WINDOW + 10)
     assert not extracted.kept.any()
 
 

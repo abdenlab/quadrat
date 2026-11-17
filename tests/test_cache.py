@@ -52,6 +52,7 @@ from hypothesis import strategies as st
 
 import quadrat
 from quadrat import cache, stores
+from quadrat.rules import Exclusion, Jitter
 from tests import (
     FILE_BACKED,
     SPANS,
@@ -4603,6 +4604,107 @@ def test_window_cache_key_should_follow_the_content_of_a_single_exclusion_path(
     assert before != after
 
 
+def test_window_cache_key_should_key_a_default_exclusion_as_its_bare_path(tmp_path):
+    """Test that the default rule over one file keys as the file alone.
+
+    Given:
+        One exclusion file, given as a bare path and as an `Exclusion`
+        over it under the default rule.
+    When:
+        Keys are taken for each.
+    Then:
+        They should be equal, because the two remove the same windows.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    path = builders.write_bed(str(tmp_path / "regions.bed"), [("chr1", 40, 60)])
+
+    # Act
+    bare = cache.window_cache_key(**given, exclusion_lists=path)
+    rule = cache.window_cache_key(**given, exclusion_lists=Exclusion(path))
+
+    # Assert
+    assert bare == rule
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"bin_width": 50}, {"end_padding": 1}],
+    ids=lambda value: next(iter(value)),
+)
+def test_window_cache_key_should_notice_a_changed_exclusion_rule(tmp_path, changed):
+    """Test that an exclusion's rule is part of the key.
+
+    Given:
+        One exclusion file under the default rule, and under a bin
+        width of 50 or an end padding of 1.
+    When:
+        Keys are taken for each.
+    Then:
+        They should differ, because the two rules remove different
+        windows from the same regions.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    path = builders.write_bed(str(tmp_path / "regions.bed"), [("chr1", 40, 60)])
+
+    # Act
+    default = cache.window_cache_key(**given, exclusion_lists=Exclusion(path))
+    other = cache.window_cache_key(**given, exclusion_lists=Exclusion(path, **changed))
+
+    # Assert
+    assert default != other
+
+
+def test_window_cache_key_should_key_a_jitter_by_its_margin_alone(tmp_path):
+    """Test that rules sharing a margin share a key.
+
+    Given:
+        A ``max_jitter`` of 500, ``Jitter(-500, 499)`` and
+        ``Jitter(-500, 500)``, each with a margin of 500.
+    When:
+        Keys are taken for each.
+    Then:
+        They should be equal, because the margin decides the windows an
+        entry holds and the shifts drawn inside it do not.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+    jitters = [500, Jitter(-500, 499), Jitter(-500, 500)]
+
+    # Act
+    keys = {cache.window_cache_key(**given, max_jitter=jitter) for jitter in jitters}
+
+    # Assert
+    assert len(keys) == 1
+
+
+def test_window_cache_key_should_notice_a_jitter_with_another_margin(tmp_path):
+    """Test that a jitter's margin is part of the key.
+
+    Given:
+        A ``max_jitter`` of 500 and ``Jitter(-400, 400)``.
+    When:
+        Keys are taken for each.
+    Then:
+        They should differ, because the margins widen the windows by
+        different amounts.
+    """
+
+    # Arrange
+    given = inputs(tmp_path)
+
+    # Act
+    wide = cache.window_cache_key(**given, max_jitter=500)
+    narrow = cache.window_cache_key(**given, max_jitter=Jitter(-400, 400))
+
+    # Assert
+    assert wide != narrow
+
+
 @pytest.mark.parametrize(
     "label", ["peaks", "negatives", "exclusion_lists", "signals", "controls"]
 )
@@ -4644,6 +4746,33 @@ def test_window_cache_key_should_raise_type_error_for_an_input_held_in_memory(
     for value, message in held:
         with pytest.raises(TypeError, match=message):
             cache.window_cache_key(**dict(given, **{label: value}))
+
+
+def test_window_cache_key_should_raise_type_error_for_an_exclusion_over_a_frame(
+    tmp_path,
+):
+    """Test the refusal of in-memory regions given through a rule.
+
+    Given:
+        A key's inputs with an `Exclusion` over a pandas frame as the
+        exclusion lists.
+    When:
+        A key is taken.
+    Then:
+        It should raise `TypeError` naming the argument and saying
+        ``cache_dir=False`` reads it, as for a bare frame.
+    """
+
+    # Arrange
+    pandas = pytest.importorskip("pandas")
+    given = inputs(tmp_path)
+    frame = pandas.DataFrame({"chrom": ["chr1"], "start": [8], "end": [16]})
+
+    # Act & assert
+    with pytest.raises(
+        TypeError, match="`exclusion_lists` must be a str.*cache_dir=False"
+    ):
+        cache.window_cache_key(**given, exclusion_lists=Exclusion(frame))
 
 
 def test_write_window_cache_should_commit_an_entry_the_package_verifies(

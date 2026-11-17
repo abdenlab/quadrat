@@ -26,6 +26,7 @@ from quadrat.cache import (
 from quadrat.dataset import LocusDataset
 from quadrat.groups import normalize_signal_groups
 from quadrat.loci import readable_windows, require_track_contigs, within_counts
+from quadrat.rules import as_jitter
 from quadrat.sampling import PeakNegativeMixSampler, ShardedEpochSampler
 from quadrat.stores import SequenceStore
 
@@ -202,8 +203,8 @@ def build_training_loader(
     tested in this order, and a negative when the first three do:
 
     1. its windows lie on its contig, as `quadrat.loci.load_windows`
-       marks ``in_bounds``, a peak's being ``max_jitter`` wider on both
-       sides and a negative's not;
+       marks ``in_bounds``, a peak's being the jitter's margin wider on
+       both sides and a negative's not;
     2. `quadrat.loci.exclusion_mask` does not flag it;
     3. its count is within ``min_counts`` and ``max_counts`` as
        `quadrat.loci.within_counts` decides, the count being the total
@@ -281,9 +282,8 @@ def build_training_loader(
         takes them.
     :param in_window: The input window's width, in bases.
     :param out_window: The output window's width, in bases.
-    :param max_jitter: The jitter bound, as
-        `quadrat.sampling.PeakNegativeMixSampler` takes it, and the
-        margin a peak's windows are widened by on both sides.
+    :param max_jitter: The peaks' jitter, as `quadrat.rules.as_jitter`
+        takes it. Negatives are not jittered.
     :param negative_ratio: Negative draws per peak, per epoch.
     :param reverse_complement: Whether to mirror about half the draws.
     :param shuffle: Whether to permute the peak order every epoch.
@@ -295,9 +295,10 @@ def build_training_loader(
         ``None`` for no ceiling.
     :param summits: Whether peaks are centred on their summits, as
         `quadrat.loci.load_windows` takes it. Negatives never are.
-    :param exclusion_lists: The excluded regions, as
+    :param exclusion_lists: The exclusions, as
         `quadrat.loci.exclusion_mask` takes them, or ``None`` to
-        exclude nothing. Files only, unless ``cache_dir=False``.
+        exclude nothing. Their regions are files only, unless
+        ``cache_dir=False``.
     :param random_state: The sampler's seed, or ``None`` to draw one.
     :param pin_memory: Whether the loader pins the batches it yields.
     :param num_workers: How many worker processes read samples; ``0``
@@ -349,8 +350,8 @@ def build_training_loader(
         positive whole multiple of the batches the loader yields; for
         anything
         `quadrat.sampling.PeakNegativeMixSampler.validate_arguments`
-        refuses of ``negative_ratio`` and ``max_jitter``, ``negatives``
-        being ``None`` counting as no negative; for anything
+        refuses by value of ``negative_ratio`` and ``max_jitter``,
+        ``negatives`` being ``None`` counting as no negative; for anything
         `quadrat.sampling.ShardedEpochSampler.validate_arguments`
         refuses of ``batch_size``, ``rank`` and ``world_size``, not
         sharding counting as rank ``0`` of a world of ``1``; for a
@@ -366,7 +367,10 @@ def build_training_loader(
     :raises TypeError: if ``signals`` or ``controls`` is anything but
         ``None``, a `list` or a `tuple`; if a locus set, an exclusion
         list or a track is held in memory while ``cache_dir`` is not
-        ``False``; or for anything `quadrat.loci.load_windows` refuses
+        ``False``; for a ``max_jitter``
+        `quadrat.sampling.PeakNegativeMixSampler.validate_arguments`
+        refuses by type, before anything is read or keyed; or for
+        anything `quadrat.loci.load_windows` refuses
         by type.
     :raises FileNotFoundError: for a reference, a locus file or an
         exclusion list `quadrat.loci.readable_windows` finds nothing
@@ -425,6 +429,7 @@ def build_training_loader(
     PeakNegativeMixSampler.validate_arguments(
         negative_ratio, max_jitter, 0 if negatives is None else None
     )
+    jitter = as_jitter(max_jitter)
     ShardedEpochSampler.validate_arguments(
         batch_size,
         0 if rank is None else rank,
@@ -467,7 +472,7 @@ def build_training_loader(
             chroms=chroms,
             in_window=in_window,
             out_window=out_window,
-            max_jitter=max_jitter,
+            max_jitter=jitter,
             summits=summits,
             exclusion_lists=exclusion_lists,
             min_counts=min_counts,
@@ -477,7 +482,7 @@ def build_training_loader(
             control_groups=control_groups,
         )
 
-    def readable(loci, jitter, centred):
+    def readable(loci, widening, centred):
         windows, keep = readable_windows(
             loci,
             sequences,
@@ -485,7 +490,7 @@ def build_training_loader(
             out_window,
             chroms=chroms,
             summits=centred,
-            max_jitter=jitter,
+            max_jitter=widening,
             exclusion_lists=exclusion_lists,
         )
         return windows.filter(keep)
@@ -497,7 +502,7 @@ def build_training_loader(
         return windows.filter(within_counts(totals.numpy(), min_counts, max_counts))
 
     def kept_windows():
-        peak_windows = readable(peaks, max_jitter, summits)
+        peak_windows = readable(peaks, jitter, summits)
         negative_windows = readable(negatives, 0, False)
 
         on = sorted(
@@ -522,7 +527,7 @@ def build_training_loader(
                 "no peak is kept by the filters; there is nothing to draw from"
             )
         PeakNegativeMixSampler.validate_arguments(
-            negative_ratio, max_jitter, len(negative_windows)
+            negative_ratio, jitter, len(negative_windows)
         )
         return peak_windows, negative_windows, int(outliers.sum())
 
@@ -556,7 +561,7 @@ def build_training_loader(
         n_peaks=len(peak_windows),
         n_negatives=len(negative_windows),
         negative_ratio=negative_ratio,
-        max_jitter=max_jitter,
+        max_jitter=jitter,
         reverse_complement=reverse_complement,
         shuffle=shuffle,
         random_state=random_state,

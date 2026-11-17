@@ -49,9 +49,9 @@ TRACK_TABLE = "quadrat_track"
 
 
 #: The windows side of the exclusion join: each window's span as a
-#: half-open run of exclusion bins, `quadrat.loci.EXCLUSION_BIN_WIDTH`
-#: bases wide. Fixed for the reason `WINDOWS_TABLE` is, the join running
-#: once per call.
+#: half-open run of exclusion bins, as `quadrat.rules.Exclusion` bins
+#: it. Fixed for the reason `WINDOWS_TABLE` is, the join running once
+#: per rule.
 LOCUS_BINS_TABLE = "quadrat_locus_bins"
 
 

@@ -8,10 +8,12 @@ persisted entry answers the batches a cold build answers; and that the
 emitted stream does not depend on how many workers draw it or on
 whether they survive between epochs.
 
-The golden batch digests are literal values carried over with the plan
-digests in ``tests/test_sampling.py``. They hash the tensors a loader
-emits over a corpus built from index arithmetic alone, and are never
-to be regenerated to make a test pass.
+The golden batch digests hash the tensors a loader emits over a corpus
+built from index arithmetic alone. `GOLDEN_BATCHES` was recorded from
+upstream cherimoya's own `PeakGenerator` at 5729b57 over the same
+corpus, and `GOLDEN_BATCHES_BEFORE_92` pins the batches earlier runs
+drew. Both are literal values and are never to be regenerated from
+this package to make a test pass.
 
 `RechunkedLoader`, `auto_fetch_size` and `sample_nbytes` are pinned on
 the two contracts that make fetching in bulk safe: only the number of
@@ -41,11 +43,13 @@ from hypothesis import strategies as st
 from hypothesis.extra import numpy as hnp
 
 from quadrat import cache, dataset, groups, loader, loci, sampling, stores
+from quadrat.rules import Exclusion, Jitter
 from tests import (
     CONFIG_IDS,
     GOLDEN_CONFIGS,
     SPLICED_READS,
     WORKER_TIMEOUT,
+    before_92,
     builders,
     dense,
     drain,
@@ -102,10 +106,26 @@ SIGNAL_ROWS = [
 CONTROL_ROWS = [builders.scattered_rows(CHROM_SIZES, seed) for seed in (40, 41)]
 
 
-# The batch digests, recorded over `GOLDEN_CONFIGS`, two epochs each.
-# Carried as literals: a value that stops matching means a batch moved,
-# and the fix is in whatever moved it.
+# The batch digests, recorded over `GOLDEN_CONFIGS`, two epochs each,
+# from upstream cherimoya's own `PeakGenerator` at 5729b57 over the same
+# corpus. Carried as literals: a value that stops matching means a batch
+# moved, and the fix is in whatever moved it.
 GOLDEN_BATCHES = MappingProxyType(
+    {
+        "baseline": "0281a27f60cc2c3c0153d104931da4e0aa832db2ecccf314fed304dcbccb8733",
+        "grouped_ctl": "ff977ee8bde23708118bba2d63d1fa8b36169a6c8f2acd11694be53362b0f7ef",
+        "no_jitter": "d4e0507f0bdeba5ffadc3116c11b3ce5db55cef5562945d2dd6b6b6b1420046a",
+        "no_negatives": "112ce4f0179377649c1de198d286ee8a62eccbfff4f2d42cbbd6c82270c78945",
+        "no_rc": "703c1b5c62104d7c09304a826478c0b996f304fb6b5983024847764983598ed3",
+        "sequential": "c2d637b6b0ad8c7b8207a652b283c9f4a4eec15a33d08bd97fe4d362983bb789",
+    }
+)
+
+
+# The same digests from upstream at abb4d7b, the commit before
+# jmschrei/cherimoya#92, which `GOLDEN_CONFIGS` reach under
+# `before_92`.
+GOLDEN_BATCHES_BEFORE_92 = MappingProxyType(
     {
         "baseline": "a257008ecdcd2ae7b95bc2fce12fe83da71dca2000e0c77a30276a5fc9fa8a70",
         "grouped_ctl": "08b7b8e3eac510a736f4eaae507c15bf1f8a84ff291a7f457830ca82af57cdb6",
@@ -280,10 +300,13 @@ def arguments(corpus, **overrides):
     )
 
 
-def golden_arguments(golden, config_id):
-    """Return the loader arguments of one golden configuration."""
+def golden_arguments(golden, config_id, rule=dict):
+    """Return the loader arguments of one golden configuration.
 
-    config = GOLDEN_CONFIGS[config_id]
+    ``rule`` maps the configuration first, e.g., `tests.before_92`.
+    """
+
+    config = rule(GOLDEN_CONFIGS[config_id])
     return dict(
         golden,
         max_jitter=config["max_jitter"],
@@ -1512,28 +1535,42 @@ def test_build_training_loader_should_raise_when_ranks_share_no_seed(corpus):
 
 
 @pytest.mark.parametrize(
-    "overrides,match",
+    "overrides,error,match",
     [
-        ({"batch_size": 0}, "batch_size and world_size must be at least 1"),
-        ({"batch_size": 8, "rank": 2, "world_size": 2}, "rank must be in range"),
-        ({"batch_size": 6, "rank": 0, "world_size": 4}, "must be divisible"),
-        ({"negative_ratio": -0.5}, "negative_ratio must be non-negative"),
-        ({"max_jitter": -1}, "max_jitter must be non-negative"),
-        ({"negatives": None, "negative_ratio": 0.5}, "no negatives to draw from"),
-        ({"fetch_size": BATCH_SIZE + 2}, "fetch_size must be a positive"),
+        ({"batch_size": 0}, ValueError, "batch_size and world_size must be at least 1"),
+        (
+            {"batch_size": 8, "rank": 2, "world_size": 2},
+            ValueError,
+            "rank must be in range",
+        ),
+        ({"batch_size": 6, "rank": 0, "world_size": 4}, ValueError, "must be divisible"),
+        ({"negative_ratio": -0.5}, ValueError, "negative_ratio must be non-negative"),
+        ({"max_jitter": -1}, ValueError, "max_jitter must be non-negative"),
+        (
+            {"negatives": None, "negative_ratio": 0.5},
+            ValueError,
+            "no negatives to draw from",
+        ),
+        ({"fetch_size": BATCH_SIZE + 2}, ValueError, "fetch_size must be a positive"),
         (
             {"batch_size": 8, "rank": 0, "world_size": 2, "fetch_size": 6},
+            ValueError,
             "fetch_size must be a positive whole multiple of the 4 samples",
         ),
-        ({"fetch_size": float(BATCH_SIZE)}, "fetch_size must be a positive"),
-        ({"signals": [[]]}, "a signal group is empty"),
-        ({"cache_residency": "bogus"}, "residency must be one of"),
-        ({"num_workers": -1}, "num_workers option should be non-negative"),
-        ({"timeout": -1}, "timeout option should be non-negative"),
+        ({"fetch_size": float(BATCH_SIZE)}, ValueError, "fetch_size must be a positive"),
+        ({"signals": [[]]}, ValueError, "a signal group is empty"),
+        ({"cache_residency": "bogus"}, ValueError, "residency must be one of"),
+        ({"num_workers": -1}, ValueError, "num_workers option should be non-negative"),
+        ({"timeout": -1}, ValueError, "timeout option should be non-negative"),
+        (
+            {"max_jitter": True},
+            TypeError,
+            "max_jitter must be a Jitter or an integer",
+        ),
     ],
 )
 def test_build_training_loader_should_refuse_an_argument_before_building(
-    tmp_path, overrides, match
+    tmp_path, overrides, error, match
 ):
     """Test that a refusal needing no data is made before anything is read.
 
@@ -1544,9 +1581,11 @@ def test_build_training_loader_should_refuse_an_argument_before_building(
     When:
         The loader is built.
     Then:
-        It should raise `ValueError` naming the argument rather than
-        the missing files, and leave the reference unindexed, which
-        taking the key would not, and the cache directory empty.
+        It should raise the argument's error, `ValueError` for a
+        refused value and `TypeError` for a refused type, naming the
+        argument rather than the missing files, and leave the reference
+        unindexed, which taking the key would not, and the cache
+        directory empty.
     """
 
     # Arrange
@@ -1569,7 +1608,7 @@ def test_build_training_loader_should_refuse_an_argument_before_building(
     )
 
     # Act
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(error, match=match):
         loader.build_training_loader(**given)
 
     # Assert
@@ -1888,6 +1927,40 @@ def test_build_training_loader_should_apply_the_exclusion_lists(corpus):
         assert built.dataset.n_peaks == unexcluded.dataset.n_peaks
 
 
+def test_build_training_loader_should_apply_an_exclusion_rule(corpus, tmp_path):
+    """Test that an `Exclusion` excludes by its own end rule.
+
+    Given:
+        A region over ``[3400, 3500)`` of ``chr1``, the empty bin
+        between the last peak's window and the first negative's, which
+        starts in the bin beginning where the region ends; and a cache
+        directory.
+    When:
+        Loaders are built with the region under the default rule and
+        with its ends padded by one base.
+    Then:
+        The default rule should keep every negative, and the padded
+        rule every negative but the first, both keeping the same peaks.
+    """
+
+    # Arrange
+    regions = builders.write_bed(str(tmp_path / "edge.bed.gz"), [("chr1", 3400, 3500)])
+    cache_dir = str(tmp_path / "entries")
+
+    # Act
+    half_open, padded = (
+        loader.build_training_loader(
+            **arguments(corpus, exclusion_lists=rule, cache_dir=cache_dir)
+        )
+        for rule in (Exclusion(regions), Exclusion(regions, end_padding=1))
+    )
+
+    # Assert
+    assert half_open.dataset.n_negatives == len(NEGATIVES)
+    assert padded.dataset.n_negatives == len(NEGATIVES) - 1
+    assert padded.dataset.n_peaks == half_open.dataset.n_peaks
+
+
 def test_build_training_loader_should_draw_peaks_only_when_negatives_are_none(corpus):
     """Test a loader with no negative set.
 
@@ -2040,6 +2113,32 @@ def test_build_training_loader_should_refuse_a_window_holding_a_character_that_i
         next(iter(built))
 
 
+def test_build_training_loader_should_yield_one_stream_under_an_integer_and_its_jitter(
+    corpus,
+):
+    """Test that an integer jitter is the symmetric rule it stands for.
+
+    Given:
+        A loader with a ``max_jitter`` of 6 and one with
+        ``Jitter(-6, 6)``, otherwise alike.
+    When:
+        Two epochs are drained from each.
+    Then:
+        It should yield the same tensors from both, batch for batch.
+    """
+
+    # Arrange
+    bare = loader.build_training_loader(**arguments(corpus, max_jitter=6))
+    rule = loader.build_training_loader(**arguments(corpus, max_jitter=Jitter(-6, 6)))
+
+    # Act
+    from_bare = drain(bare)
+    from_rule = drain(rule)
+
+    # Assert
+    assert same_batches(from_bare, from_rule)
+
+
 def test_build_training_loader_should_differ_between_epochs(corpus):
     """Test that a second pass is a second epoch.
 
@@ -2086,6 +2185,33 @@ def test_build_training_loader_should_match_the_golden_digest(golden, config_id)
 
     # Assert
     assert digest == GOLDEN_BATCHES[config_id]
+
+
+@pytest.mark.parametrize("config_id", CONFIG_IDS)
+def test_build_training_loader_should_match_the_golden_digest_before_92_when_its_jitter_is_given(
+    golden, config_id
+):
+    """Test that the batches before jmschrei/cherimoya#92 are still reachable.
+
+    Given:
+        The arithmetic corpus and one golden sampler configuration,
+        its jitter bound ``m`` given as ``Jitter(-m, m - 1)``.
+    When:
+        The loader is built in this process and two epochs are hashed.
+    Then:
+        The digest should equal the one upstream recorded before #92.
+    """
+
+    # Arrange
+    built = loader.build_training_loader(
+        **golden_arguments(golden, config_id, before_92)
+    )
+
+    # Act
+    digest = batch_digest(drain(built))
+
+    # Assert
+    assert digest == GOLDEN_BATCHES_BEFORE_92[config_id]
 
 
 @pytest.mark.workers
