@@ -15,6 +15,8 @@ import typing
 import numpy
 import torch
 
+from quadrat.rules import as_jitter
+
 #: The multiplier that spreads consecutive epochs across the seed
 #: space, and the modulus that keeps a seed one
 #: `numpy.random.RandomState` accepts. Both are part of the frozen draw
@@ -32,8 +34,9 @@ class LocusDraw(typing.NamedTuple):
     :param is_peak: Whether the locus is a peak rather than a
         negative.
     :param index: The locus, as its row in the set ``is_peak`` picks.
-    :param jitter: How far the draw is shifted into its window, in
-        bases.
+    :param jitter: How far the draw starts into its window, in bases,
+        as `PeakNegativeMixSampler` states it for a peak and for a
+        negative.
     :param reverse_complement: Whether the draw is mirrored.
 
     .. rubric:: Implementation notes
@@ -65,7 +68,8 @@ class EpochPlan(object):
     :param is_peak: Whether each slot draws a peak, as a boolean array.
     :param index: The row each slot draws, in the set its ``is_peak``
         picks.
-    :param jitter: The shift of each slot's draw, in bases.
+    :param jitter: Each slot's offset into its widened window, as
+        `LocusDraw` carries it.
     :param reverse_complement: Whether each slot's draw is mirrored, as
         a boolean array.
     """
@@ -130,10 +134,10 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
     :param n_negatives: How many negatives there are to draw from.
     :param negative_ratio: Negative slots per peak, per epoch. ``0``
         draws no negative.
-    :param max_jitter: The jitter bound. A peak's jitter is drawn
-        uniformly from ``[0, 2 * max_jitter)``, the range that keeps a
-        draw inside a window made ``max_jitter`` wider on both sides,
-        and a negative's is always ``0``.
+    :param max_jitter: The jitter, as `quadrat.rules.as_jitter` takes
+        it. A peak's draw carries its offset into its widened window,
+        as `quadrat.rules.Jitter.margin` states it, and a negative's is
+        always ``0``.
     :param reverse_complement: Whether to mirror about half the draws,
         each chosen independently. ``False`` mirrors none.
     :param shuffle: Whether to permute the peak order every epoch.
@@ -141,7 +145,10 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         take among them are random either way.
     :param random_state: The seed, as an `int`, or ``None`` to draw
         one from numpy's global generator at construction.
-    :raises ValueError: for anything `validate_arguments` refuses.
+    :raises TypeError: for anything `validate_arguments` refuses by
+        type.
+    :raises ValueError: for anything `validate_arguments` refuses by
+        value.
 
     .. rubric:: Implementation notes
 
@@ -169,7 +176,7 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         self.n_peaks = int(n_peaks)
         self.n_negatives = int(n_negatives)
         self.negative_ratio = negative_ratio
-        self.max_jitter = max_jitter
+        self.jitter = as_jitter(max_jitter)
         self.reverse_complement = reverse_complement
         self.shuffle = shuffle
 
@@ -206,9 +213,12 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         :param n_negatives: As the class takes it, or ``None`` where the
             count is not known yet, which skips the one refusal that
             needs it.
-        :raises ValueError: if ``max_jitter`` or ``negative_ratio`` is
-            negative, or if ``negative_ratio`` is positive while
-            ``n_negatives`` is ``0``.
+        :raises TypeError: for a ``max_jitter`` `quadrat.rules.as_jitter`
+            refuses by type.
+        :raises ValueError: for a ``max_jitter`` `quadrat.rules.as_jitter`
+            refuses by value, if ``negative_ratio`` is negative, or if
+            ``negative_ratio`` is positive while ``n_negatives`` is
+            ``0``.
 
         .. rubric:: Implementation notes
 
@@ -217,10 +227,7 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         set, which fails somewhere far from the cause.
         """
 
-        if max_jitter < 0:
-            raise ValueError(
-                "max_jitter must be non-negative, got {}".format(max_jitter)
-            )
+        as_jitter(max_jitter)
         if negative_ratio < 0:
             raise ValueError(
                 "negative_ratio must be non-negative, got {}".format(negative_ratio)
@@ -267,8 +274,12 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
 
         The sequence of generator calls below is frozen, including the
         branches that skip a call: no permutation without ``shuffle``,
-        no jitter draw at a ``max_jitter`` of ``0``, no orientation
-        draw without ``reverse_complement``. Each skipped call shifts
+        no jitter draw at a margin of ``0``, no orientation draw
+        without ``reverse_complement``. The jitter draw is
+        ``randint(low + margin, high + margin + 1)``, which for
+        ``Jitter(-m, m)`` is upstream cherimoya's ``randint(0, 2 * m +
+        1)`` and for ``Jitter(-m, m - 1)`` its draw before
+        jmschrei/cherimoya#92, ``randint(0, 2 * m)``. Each skipped call shifts
         every later one, and every run launched against a seed depends
         on the stream as it is. For the same reason the generator is
         `numpy.random.RandomState`, the legacy stream, and must not
@@ -295,8 +306,11 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
             0, max(1, self.n_negatives), size=int((~is_peak).sum())
         )
 
-        if self.max_jitter > 0:
-            jitter = rng.randint(0, self.max_jitter * 2, size=n)
+        margin = self.jitter.margin
+        if margin > 0:
+            jitter = rng.randint(
+                self.jitter.low + margin, self.jitter.high + margin + 1, size=n
+            )
             jitter[~is_peak] = 0
         else:
             jitter = numpy.zeros(n, dtype=numpy.int64)

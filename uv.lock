@@ -2110,7 +2110,7 @@ requires-dist = [
     { name = "polars", specifier = ">=1.30" },
     { name = "polars-bio", marker = "extra == 'pileup'", specifier = ">=0.35.1" },
     { name = "pyfaidx", specifier = ">=0.9" },
-    { name = "tangermeme", specifier = ">=1.5.0" },
+    { name = "tangermeme", specifier = ">=1.6.0" },
     { name = "torch", specifier = ">=2.9.0" },
     { name = "tqdm", specifier = ">=4.64.1" },
 ]

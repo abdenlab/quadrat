@@ -35,7 +35,7 @@ dependencies = [
     "torch>=2.9.0",
     "tqdm>=4.64.1",
     "joblib>=1.0.0",
-    "tangermeme>=1.5.0",
+    "tangermeme>=1.6.0",
     # Reading, not writing, which is why these two are here and the
     # engine below is not. A track is Parquet and a reference is a
     # faidx FASTA, so a caller who already has tracks needs both to

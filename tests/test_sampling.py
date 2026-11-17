@@ -3,9 +3,12 @@
 What the mix sampler promises is each peak drawn exactly once per
 epoch, exact slot proportions, a plan that is a pure function of the
 seed and the epoch, and an epoch that advances on iteration and can be
-set outright. That the plan is still the one every earlier run drew,
-generator call for generator call, is what the golden digests pin; they
-are literal values and are never to be regenerated to make a test pass.
+set outright. That the plan is upstream cherimoya main's draw,
+generator call for generator call, is what `GOLDEN_PLANS` pins,
+recorded from upstream's own sampler at 5729b57; that the draw earlier
+runs made under ``Jitter(-m, m - 1)`` is still reachable is what
+`GOLDEN_PLANS_BEFORE_92` pins. Both are literal values and are never to
+be regenerated from this package to make a test pass.
 
 What the sharded sampler promises is a partition: the ranks together
 read exactly what one rank would, step for step.
@@ -24,12 +27,29 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from quadrat import sampling
-from tests import CONFIG_IDS, GOLDEN_CONFIGS
+from quadrat.rules import Jitter
+from tests import CONFIG_IDS, GOLDEN_CONFIGS, before_92
 
-# The plan digests, recorded over `GOLDEN_CONFIGS` and two epochs each.
-# Carried as literals: a value that stops matching means the draw
-# sequence moved, and the fix is in the sampler.
+# The plan digests, recorded over `GOLDEN_CONFIGS` and two epochs each
+# from upstream cherimoya's own sampler at 5729b57. Carried as
+# literals: a value that stops matching means the draw sequence moved,
+# and the fix is in the sampler.
 GOLDEN_PLANS = MappingProxyType(
+    {
+        "baseline": "5436cf3eba7f87d1182c85f6ac0c9c3f61925821835cb14fc1e5eac7197d0fc0",
+        "grouped_ctl": "d720f85034afc86c8c62365223cde79b4ccdcb3d0a6f52f5ca4114ad619a8f1a",
+        "no_jitter": "b8b257f2efdbeeedc245fbd28218f911e98f94225693254932c4ffb85c983253",
+        "no_negatives": "f988f0033247bd1034a965d9779a1946f0a59788efb410564297d0dce467a245",
+        "no_rc": "a82c55db4fef873aa876a761070483c3a3cc943c3446a3b5f4d054ed92884875",
+        "sequential": "73eb9e1bc5efdc5a326d373c955e3a5895ca4a4d7d40cce7b9c0aef6f1d8f523",
+    }
+)
+
+
+# The same digests from upstream at abb4d7b, the commit before
+# jmschrei/cherimoya#92, which `GOLDEN_CONFIGS` reach under
+# `before_92`.
+GOLDEN_PLANS_BEFORE_92 = MappingProxyType(
     {
         "baseline": "0f7a75a773e2455c3f85558d9faaf15a31947a934e2d73a28202400e74003bfa",
         "grouped_ctl": "cb6ec38d60dafd83b6f1689a14e61c64731be6db4931cd04720468b62fc0bf3e",
@@ -299,6 +319,21 @@ class TestPeakNegativeMixSampler:
         with pytest.raises(ValueError, match="max_jitter"):
             sampling.PeakNegativeMixSampler(8, 4, max_jitter=-1)
 
+    def test___init___should_raise_type_error_when_max_jitter_is_a_bool(self):
+        """Test the refusal of a `bool` jitter.
+
+        Given:
+            A ``max_jitter`` of `True`.
+        When:
+            The sampler is constructed.
+        Then:
+            It should raise `TypeError` naming the argument.
+        """
+
+        # Act & assert
+        with pytest.raises(TypeError, match="max_jitter"):
+            sampling.PeakNegativeMixSampler(8, 4, max_jitter=True)
+
     def test___init___should_raise_when_negative_ratio_is_negative(self):
         """Test the refusal of a negative ratio.
 
@@ -409,6 +444,27 @@ class TestPeakNegativeMixSampler:
         assert digest == GOLDEN_PLANS[config_id]
 
     @pytest.mark.parametrize("config_id", CONFIG_IDS)
+    def test_plan_should_match_the_golden_digest_before_92_when_its_jitter_is_given(
+        self, config_id
+    ):
+        """Test that the draw sequence before jmschrei/cherimoya#92 is still reachable.
+
+        Given:
+            A golden configuration with its jitter bound ``m`` given as
+            ``Jitter(-m, m - 1)``.
+        When:
+            Its plans for the first two epochs are hashed.
+        Then:
+            It should equal the digest upstream recorded before #92.
+        """
+
+        # Act
+        digest = plan_digest(before_92(GOLDEN_CONFIGS[config_id]))
+
+        # Assert
+        assert digest == GOLDEN_PLANS_BEFORE_92[config_id]
+
+    @pytest.mark.parametrize("config_id", CONFIG_IDS)
     def test_plan_should_draw_every_peak_exactly_once(self, config_id):
         """Test the peak draws of one epoch.
 
@@ -474,7 +530,7 @@ class TestPeakNegativeMixSampler:
         # Assert
         assert not plan.jitter[~plan.is_peak].any()
 
-    def test_plan_should_keep_peak_jitter_inside_the_margin(self):
+    def test_plan_should_draw_every_peak_offset_the_margin_allows(self):
         """Test the range a peak's jitter is drawn from.
 
         Given:
@@ -482,19 +538,89 @@ class TestPeakNegativeMixSampler:
         When:
             Several epochs are planned.
         Then:
-            Every jitter should lie in ``[0, 4)``, and both ends of
-            that range should occur.
+            Every peak's jitter should lie in ``[0, 4]``, and both ends
+            of that range should occur.
         """
 
         # Arrange
         sampler = make_sampler("baseline")
 
         # Act
-        jitter = numpy.concatenate([sampler.plan(epoch).jitter for epoch in range(8)])
+        plans = [sampler.plan(epoch) for epoch in range(8)]
 
         # Assert
+        jitter = numpy.concatenate([plan.jitter[plan.is_peak] for plan in plans])
+        assert jitter.min() == 0
+        assert jitter.max() == 4
+
+    def test_plan_should_draw_every_peak_offset_of_the_rule_before_92(self):
+        """Test the range a peak's jitter is drawn from under the rule before #92.
+
+        Given:
+            A jitter of ``Jitter(-2, 1)``, whose margin is 2.
+        When:
+            Several epochs are planned.
+        Then:
+            Every peak's jitter should lie in ``[0, 3]``, and both ends
+            of that range should occur.
+        """
+
+        # Arrange
+        sampler = make_sampler("baseline", max_jitter=Jitter(-2, 1))
+
+        # Act
+        plans = [sampler.plan(epoch) for epoch in range(8)]
+
+        # Assert
+        jitter = numpy.concatenate([plan.jitter[plan.is_peak] for plan in plans])
         assert jitter.min() == 0
         assert jitter.max() == 3
+
+    def test_plan_should_offset_a_lopsided_jitter_by_its_margin(self):
+        """Test the range a peak's jitter is drawn from under a lopsided rule.
+
+        Given:
+            A jitter of ``Jitter(0, 3)``, whose margin is 3.
+        When:
+            Several epochs are planned.
+        Then:
+            Every peak's jitter should lie in ``[3, 6]``, and both ends
+            of that range should occur.
+        """
+
+        # Arrange
+        sampler = make_sampler("baseline", max_jitter=Jitter(0, 3))
+
+        # Act
+        plans = [sampler.plan(epoch) for epoch in range(8)]
+
+        # Assert
+        jitter = numpy.concatenate([plan.jitter[plan.is_peak] for plan in plans])
+        assert jitter.min() == 3
+        assert jitter.max() == 6
+
+    def test_plan_should_draw_alike_under_an_integer_and_its_symmetric_jitter(self):
+        """Test that an integer jitter is the symmetric rule it stands for.
+
+        Given:
+            One sampler with a ``max_jitter`` of 2 and one with
+            ``Jitter(-2, 2)``, otherwise alike.
+        When:
+            Several epochs are planned by each.
+        Then:
+            It should answer the same draws from both.
+        """
+
+        # Arrange
+        bare = make_sampler("baseline", max_jitter=2)
+        rule = make_sampler("baseline", max_jitter=Jitter(-2, 2))
+
+        # Act
+        planned = [(draws(bare.plan(e)), draws(rule.plan(e))) for e in range(3)]
+
+        # Assert
+        for from_bare, from_rule in planned:
+            assert from_bare == from_rule
 
     def test_plan_should_mirror_nothing_when_reverse_complement_is_off(self):
         """Test the orientation of the draws without augmentation.
@@ -690,9 +816,48 @@ class TestPeakNegativeMixSampler:
         negatives = plan.index[~plan.is_peak]
         assert ((negatives >= 0) & (negatives < sampler.n_negatives)).all()
         assert (plan.jitter >= 0).all()
-        assert (plan.jitter < max(1, 2 * sampler.max_jitter)).all()
+        assert (plan.jitter <= 2 * sampler.jitter.margin).all()
         assert not plan.jitter[~plan.is_peak].any()
         assert draws(plan) == draws(other.plan(epoch))
+
+    @settings(max_examples=50)
+    @given(
+        arguments=sampler_arguments,
+        bounds=st.tuples(
+            st.integers(min_value=-6, max_value=6),
+            st.integers(min_value=-6, max_value=6),
+        ).map(sorted),
+        epoch=st.integers(min_value=0, max_value=50),
+    )
+    def test_plan_should_draw_each_peak_jitter_from_its_rule_for_any_jitter(
+        self, arguments, bounds, epoch
+    ):
+        """Test the range of a peak's jitter over arbitrary rules.
+
+        Given:
+            Any sampler arguments with a ``Jitter(low, high)`` of any
+            ordered bounds from -6 through 6, one-sided rules included,
+            and any epoch.
+        When:
+            That epoch is planned.
+        Then:
+            Every peak's jitter should lie in ``[low + margin, high +
+            margin]``, and every negative's should be ``0``.
+        """
+
+        # Arrange
+        low, high = bounds
+        jitter = Jitter(low, high)
+        sampler = sampling.PeakNegativeMixSampler(**dict(arguments, max_jitter=jitter))
+
+        # Act
+        plan = sampler.plan(epoch)
+
+        # Assert
+        peaks = plan.jitter[plan.is_peak]
+        assert (peaks >= low + jitter.margin).all()
+        assert (peaks <= high + jitter.margin).all()
+        assert not plan.jitter[~plan.is_peak].any()
 
     def test___iter___should_emit_epoch_zero_first(self):
         """Test the first pass over a fresh sampler.
