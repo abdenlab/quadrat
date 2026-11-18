@@ -1352,9 +1352,9 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
         ``tracks`` is a single track or an unordered collection of
         them, or if a track is of no shape a track can take.
     :raises ValueError: if there are more channels than ``int16`` can
-        index, or if a track directory does not verify complete, as
-        `quadrat.stores.track_frame` refuses it.
+        index, or for a track `quadrat.stores.track_frame` refuses.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
     :raises ImportError: if the ``pileup`` extra is not installed.
 
     .. rubric:: Implementation notes
@@ -1620,12 +1620,13 @@ def window_group_sums(
     :returns: A `torch.Tensor` of shape ``(len(windows),
         len(channel_group_sizes))`` and dtype ``float32``.
     :raises ValueError: if ``channel_group_sizes`` does not sum to
-        the channel count, or if a track is a directory that cannot be
-        verified complete.
+        the channel count, or for a track `quadrat.stores.track_frame`
+        refuses.
     :raises TypeError: if ``tracks`` is a single track or an unordered
         collection of them, or if a track is of no shape a track can
         take.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
 
     .. rubric:: Implementation notes
 

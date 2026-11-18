@@ -391,7 +391,9 @@ def build_training_loader(
         ``scratch_dir`` that does not exist, where a build that persists
         nothing makes its scratch directory there.
     :raises OSError: for a reference `quadrat.cache.window_cache_key`
-        refuses, where ``cache_dir`` is not ``False``.
+        refuses, where ``cache_dir`` is not ``False``, or one
+        `quadrat.loci.load_windows` cannot examine; or for a track
+        `quadrat.stores.track_frame` cannot read.
     :raises ImportError: if a build is needed and the ``pileup`` extra
         is not installed.
 

@@ -281,8 +281,9 @@ class TrackStore(ProcessLocalHandles):
         a one-channel set.
     :raises TypeError: if ``sources`` is itself a path, or if any
         element is not one.
-    :raises ValueError: if any source does not verify complete. See
-        `require_complete`.
+    :raises ValueError: if any source does not verify complete; see
+        `quadrat.require_complete`.
+    :raises OSError: as `quadrat.require_complete` raises it.
 
     .. rubric:: Implementation notes
 
@@ -674,28 +675,29 @@ def track_frame(source):
     :raises TypeError: if ``source`` is none of those shapes.
     :raises FileNotFoundError: if ``source`` is a path at which nothing
         exists.
-    :raises ValueError: if a track directory does not verify complete;
-        see `quadrat.require_complete`.
+    :raises ValueError: if ``source`` is a path that does not verify
+        complete; see `quadrat.require_complete`.
+    :raises OSError: as `quadrat.require_complete` raises it.
 
     .. rubric:: Implementation notes
 
     A missing path is refused here because the scan would not refuse
     it: a scan is a plan, and a plan over a file that is not there
     raises only when it is collected, which a caller with no window to
-    read never does.
+    read never does. A file that is no Parquet is refused for the reason
+    in `quadrat.require_complete`'s notes.
     """
 
     polars = import_on_first_use("polars")
     path = fspath_or_none(source)
     if path is not None:
-        if os.path.isdir(path):
-            signal, scale = track_signal(path)
-            return polars.scan_parquet(os.path.join(path, "*.parquet")), signal, scale
         if not os.path.exists(path):
             raise FileNotFoundError(
                 "{} is not a track; there is no such file or directory.".format(path)
             )
-        return polars.scan_parquet(path), COUNTS, None
+        signal, scale = track_signal(path)
+        scanned = os.path.join(path, "*.parquet") if os.path.isdir(path) else path
+        return polars.scan_parquet(scanned), signal, scale
     if isinstance(source, polars.LazyFrame):
         return source, COUNTS, None
     if isinstance(source, polars.DataFrame):

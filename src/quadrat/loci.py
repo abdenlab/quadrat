@@ -413,12 +413,13 @@ def require_track_contigs(chroms, tracks, label="signals"):
     :param label: The name the caller knows ``tracks`` by, for the
         message.
     :raises ValueError: if no track holds a position on any contig in
-        ``chroms``, or if a track directory does not verify complete.
+        ``chroms``, or for a track `quadrat.stores.track_frame` refuses.
     :raises TypeError: if ``chroms`` is a single name rather than a
         collection of them, if ``tracks`` is a single track or an
         unordered collection of them, or if a track is of no shape a
         track can take.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
 
     .. rubric:: Implementation notes
 
@@ -495,8 +496,9 @@ def extract_signal(windows, tracks, bound_columns=("sig_start", "sig_end")):
         ``tracks`` is a single track or an unordered collection of
         them, or if a track is of no shape a track can take.
     :raises ValueError: if the windows are not all one non-negative
-        width, or if a track directory does not verify complete.
+        width, or for a track `quadrat.stores.track_frame` refuses.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
     :raises ImportError: if the ``pileup`` extra is not installed.
 
     .. rubric:: Implementation notes

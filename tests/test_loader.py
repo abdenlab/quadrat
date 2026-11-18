@@ -48,6 +48,7 @@ from quadrat.rules import Exclusion, Jitter
 from tests import (
     CONFIG_IDS,
     GOLDEN_CONFIGS,
+    NOT_PARQUET,
     SPLICED_READS,
     WORKER_TIMEOUT,
     before_92,
@@ -1814,6 +1815,38 @@ def test_build_training_loader_should_raise_file_not_found_error_when_the_refere
             **arguments(
                 corpus, sequences=str(tmp_path / "missing.fa"), cache_dir=cache_dir
             )
+        )
+    assert not any(entries.iterdir())
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["unkeyed", "keyed"])
+def test_build_training_loader_should_raise_when_a_signal_track_is_not_parquet(
+    corpus, tmp_path, keyed
+):
+    """Test that a file that is no track is refused by name.
+
+    Given:
+        The corpus's loci, a signal track that begins as a bigWig does,
+        and either no cache or an empty cache directory.
+    When:
+        The loader is built.
+    Then:
+        It should raise `ValueError` naming the file and saying it is
+        not a track, rather than fail later in polars' words, and leave
+        the cache directory empty.
+    """
+
+    # Arrange
+    track = tmp_path / "signal.bw"
+    track.write_bytes(NOT_PARQUET["bigwig"])
+    entries = tmp_path / "entries"
+    entries.mkdir()
+    cache_dir = str(entries) if keyed else False
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"signal\.bw is not a track"):
+        loader.build_training_loader(
+            **arguments(corpus, signals=[str(track)], cache_dir=cache_dir)
         )
     assert not any(entries.iterdir())
 

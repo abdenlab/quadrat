@@ -85,6 +85,10 @@ _TRASH_INFIX = ".trash."
 _MARKER_TMP_SUFFIX = ".tmp"
 
 
+# The four bytes every Parquet file begins with.
+_PARQUET_MAGIC = b"PAR1"
+
+
 class TrackWriter(object):
     """One track, assembled from one or more frames.
 
@@ -514,9 +518,11 @@ def require_complete(source):
     before manifests existed fail here and must be rebuilt; they are
     genuinely unverifiable, not merely old.
 
-    In-memory frames and single-file tables pass through untouched -- a
-    frame has no partial state, and a truncated Parquet file fails on its
-    own footer.
+    In-memory frames pass through untouched, having no partial state. A
+    single-file table has none this can see either -- a truncated
+    Parquet file fails on its own footer -- so of a single file only
+    its first four bytes are read, to refuse one that is not Parquet at
+    all.
 
     What this accepts it accepts whatever the ``signal``, since nothing
     here reads a value: a table of coverage deltas passes as a table of
@@ -534,8 +540,11 @@ def require_complete(source):
     :returns: ``source``, unchanged.
     :raises TypeError: if ``source`` is neither a path nor a polars
         frame.
-    :raises ValueError: if nothing exists at ``source``; if a directory
-        has no record beside it, or one that is not a readable JSON
+    :raises ValueError: if nothing exists at ``source``; if a single
+        file does not begin as a Parquet file does; if a directory
+        is neither named as a track, nor holds a Parquet file, nor has
+        a record beside it, naming it as no track; if
+        a directory has no record beside it, or one that is not a readable JSON
         object; if the record's ``signal`` is not one `read_manifest`
         documents, its ``version`` is not the integer that ``signal``
         implies, or its ``scale`` is absent or not one `read_manifest`
@@ -544,6 +553,14 @@ def require_complete(source):
         if its ``files`` is neither an object nor empty, or lists a
         file the directory does not hold; or if it states ``rows`` and
         a file declares no count or the counts do not add up to it.
+    :raises OSError: if a single file exists but cannot be read.
+
+    .. rubric:: Implementation notes
+
+    A single file is told by its content rather than its suffix,
+    because a single-file table need carry no suffix. Without the test
+    a bigWig passed as a track passes here, and fails later in polars'
+    words, naming no file.
     """
 
     track_signal(source)
@@ -575,6 +592,11 @@ def track_contigs(source):
         accepts them, a path being a `str`, `bytes` or `os.PathLike`.
     :returns: The contig names, as a `set`.
     :raises TypeError: if ``source`` is none of those.
+    :raises ValueError: if ``source`` is a path at which nothing
+        exists, or a single file that does not begin as a Parquet file
+        does.
+    :raises OSError: if ``source`` is a single file that exists but
+        cannot be read.
     """
 
     path = fspath_or_none(source)
@@ -588,7 +610,9 @@ def track_contigs(source):
     polars = import_on_first_use("polars")
     if path is not None:
         # A plain file is still read, so tables written before the
-        # per-contig layout keep loading.
+        # per-contig layout keep loading. Its first bytes are tested
+        # first, for the reason in `require_complete`'s notes.
+        track_signal(path)
         frame = polars.scan_parquet(path)
     elif isinstance(source, polars.LazyFrame):
         frame = source
@@ -618,6 +642,7 @@ def track_signal(source):
         counts, whose values are already scaled.
     :raises TypeError: as `require_complete` raises it.
     :raises ValueError: as `require_complete` raises it.
+    :raises OSError: as `require_complete` raises it.
     """
 
     path = fspath_or_none(source)
@@ -637,7 +662,17 @@ def track_signal(source):
 
     if os.path.isfile(path):
         # A single-file table has no partial state this can see: a
-        # truncated Parquet file fails on its own footer.
+        # truncated Parquet file fails on its own footer. Whether it is
+        # Parquet at all is told by its first bytes, for the reason in
+        # `require_complete`'s notes.
+        with open(path, "rb") as handle:
+            head = handle.read(len(_PARQUET_MAGIC))
+        if head != _PARQUET_MAGIC:
+            raise ValueError(
+                "{} is not a track: a track is a {} directory or a single "
+                "Parquet file with chrom, pos and value columns, and this "
+                "file does not begin as a Parquet file does.".format(path, TRACK_SUFFIX)
+            )
         return COUNTS, None
 
     if not os.path.isdir(path):
@@ -668,6 +703,25 @@ def track_signal(source):
                 "its top-level value is not an object. The table cannot "
                 "be verified complete without it. Rebuild it by piling "
                 "up the alignments again.".format(path, os.path.basename(marker))
+            )
+        # A directory neither named as a track nor holding any Parquet
+        # was never one, and telling its caller to pile up again names
+        # the wrong fix. One that cannot be listed is left to the
+        # refusal below, which is true of it either way.
+        try:
+            names = os.listdir(path)
+        except OSError:
+            names = None
+        if (
+            names is not None
+            and not path.rstrip(os.sep).endswith(TRACK_SUFFIX)
+            and not any(name.endswith(".parquet") for name in names)
+        ):
+            raise ValueError(
+                "{} is not a track: a track is a {} directory of Parquet "
+                "files with a {} beside it, or a single Parquet file, and "
+                "this directory holds no Parquet file and has no record "
+                "beside it.".format(path, TRACK_SUFFIX, os.path.basename(marker))
             )
         raise ValueError(
             "{} has no {} beside it and cannot be verified complete. A "

@@ -21,7 +21,7 @@ from hypothesis import strategies as st
 
 import quadrat
 from quadrat import tables
-from tests import FILE_BACKED
+from tests import FILE_BACKED, NOT_PARQUET, builders
 
 
 def manifest_for(table, rows, files):
@@ -232,6 +232,85 @@ def test_read_manifest_should_find_the_record_of_a_track_under_the_former_suffix
     # Act & assert
     assert not str(legacy).endswith(tables.TRACK_SUFFIX)
     assert tables.read_manifest(str(legacy))["rows"] == 2
+
+
+def test_require_complete_should_say_what_a_track_is_for_a_directory_of_no_parquet(
+    tmp_path,
+):
+    """Test the refusal of a directory that was never a track.
+
+    Given:
+        A directory holding a bigWig and no record.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` naming the path and saying what a
+        track is, rather than telling the caller to pile up again.
+    """
+
+    # Arrange
+    folder = tmp_path / "bigwigs"
+    folder.mkdir()
+    (folder / "signal.bw").write_bytes(NOT_PARQUET["bigwig"])
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"bigwigs is not a track: a track is a"):
+        tables.require_complete(str(folder))
+
+
+def test_require_complete_should_ask_for_a_rebuild_of_unrecorded_parquet(tmp_path):
+    """Test that an interrupted track under any name is told to rebuild.
+
+    Given:
+        A directory under a name that is not a track's, holding a
+        Parquet file and no record.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` saying it cannot be verified
+        complete, and not that it is no track, since a write that was
+        interrupted leaves exactly this.
+    """
+
+    # Arrange
+    folder = tmp_path / "parts"
+    folder.mkdir()
+    builders.write_flat_track(folder / "chr1.parquet", [("chr1", 5, 2.0)])
+
+    # Act & assert
+    with pytest.raises(ValueError, match="cannot be verified complete") as caught:
+        tables.require_complete(str(folder))
+    assert "is not a track" not in str(caught.value)
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root lists any directory"
+)
+def test_require_complete_should_ask_for_a_rebuild_of_a_directory_it_cannot_list(
+    tmp_path,
+):
+    """Test that a directory that cannot be listed is refused as unverifiable.
+
+    Given:
+        A directory with no record whose permissions forbid listing it.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` saying it cannot be verified
+        complete, rather than an undocumented `PermissionError`.
+    """
+
+    # Arrange
+    folder = tmp_path / "locked"
+    folder.mkdir()
+    folder.chmod(0)
+
+    # Act & assert
+    try:
+        with pytest.raises(ValueError, match="cannot be verified complete"):
+            tables.require_complete(str(folder))
+    finally:
+        folder.chmod(0o700)
 
 
 def test_require_complete_should_raise_when_the_path_does_not_exist(tmp_path):
@@ -488,7 +567,8 @@ def test_require_complete_should_return_the_path_of_a_single_file_table(tmp_path
     """Test the documented pass-through for a plain file.
 
     Given:
-        A path naming a single Parquet file rather than a directory.
+        A path naming a single Parquet file rather than a directory,
+        with no manifest beside it.
     When:
         Completeness is required.
     Then:
@@ -497,11 +577,73 @@ def test_require_complete_should_return_the_path_of_a_single_file_table(tmp_path
     """
 
     # Arrange
-    table = tmp_path / "one.parquet"
-    table.write_bytes(b"")
+    table = builders.write_flat_track(tmp_path / "one.parquet", [("chr1", 5, 2.0)])
 
     # Act & assert
     assert tables.require_complete(str(table)) == str(table)
+
+
+@pytest.mark.parametrize("kind", sorted(NOT_PARQUET))
+def test_require_complete_should_raise_when_a_single_file_is_not_parquet(tmp_path, kind):
+    """Test the refusal of a file that is no track, by its content.
+
+    Given:
+        A file beginning as a bigWig does, or an empty file, under a
+        name a single-file table could have.
+    When:
+        Completeness is required.
+    Then:
+        It should raise `ValueError` naming the path and saying what a
+        track is, rather than pass it through to fail in polars' words.
+    """
+
+    # Arrange
+    path = tmp_path / "signal.parquet"
+    path.write_bytes(NOT_PARQUET[kind])
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"signal\.parquet is not a track: a track is"):
+        tables.require_complete(str(path))
+
+
+def test_require_complete_should_pass_a_parquet_file_under_any_name(tmp_path):
+    """Test that the content test refuses nothing a suffix test would refuse.
+
+    Given:
+        A single-file table written under a name with no Parquet
+        suffix.
+    When:
+        Completeness is required.
+    Then:
+        It should return the path.
+    """
+
+    # Arrange
+    table = builders.write_flat_track(tmp_path / "signal.bin", [("chr1", 5, 2.0)])
+
+    # Act & assert
+    assert tables.require_complete(table) == table
+
+
+def test_track_contigs_should_raise_when_a_single_file_is_not_parquet(tmp_path):
+    """Test the contig listing of a file that is no track.
+
+    Given:
+        A file beginning as a bigWig does.
+    When:
+        Its contigs are listed.
+    Then:
+        It should raise `ValueError` naming the path, rather than fail
+        in polars' words naming no file.
+    """
+
+    # Arrange
+    path = tmp_path / "signal.bw"
+    path.write_bytes(NOT_PARQUET["bigwig"])
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"signal\.bw is not a track"):
+        tables.track_contigs(str(path))
 
 
 def test_track_contigs_should_name_the_contigs_its_manifest_lists(tmp_path):
@@ -1054,16 +1196,19 @@ def test_track_signal_should_answer_counts_for_a_track_with_no_record(tmp_path):
     assert answers == [("counts", None)] * 2
 
 
-def test_track_signal_should_raise_when_the_track_does_not_verify(tmp_path):
+@pytest.mark.parametrize("trailing", ["", os.sep], ids=["bare", "trailing-separator"])
+def test_track_signal_should_raise_when_the_track_does_not_verify(tmp_path, trailing):
     """Test that the signal is not answered for an unverifiable track.
 
     Given:
-        A track directory with no record beside it.
+        A track directory with no record beside it, named with or
+        without a trailing separator.
     When:
         Its signal is asked for.
     Then:
         It should raise `ValueError` as `require_complete` does, rather
-        than answer counts for a directory that cannot say.
+        than answer counts for a directory that cannot say, and should
+        not call a track's directory no track.
     """
 
     # Arrange
@@ -1071,8 +1216,9 @@ def test_track_signal_should_raise_when_the_track_does_not_verify(tmp_path):
     bare.mkdir()
 
     # Act & assert
-    with pytest.raises(ValueError, match=r"cannot be verified complete"):
-        tables.track_signal(str(bare))
+    with pytest.raises(ValueError, match=r"cannot be verified complete") as caught:
+        tables.track_signal(str(bare) + trailing)
+    assert "is not a track" not in str(caught.value)
 
 
 def test_track_signal_should_raise_when_the_signal_is_unknown(tmp_path):
