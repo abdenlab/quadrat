@@ -10,6 +10,7 @@ imports ``torch``, which `import quadrat` does not.
 import numpy
 import torch
 
+from quadrat._engine import require_integer
 from quadrat.cache import joint_windows, require_index, require_windows
 from quadrat.groups import channel_permutation_from_groups
 from quadrat.sampling import LocusDraw, PeakNegativeMixSampler
@@ -25,8 +26,9 @@ class LocusDataset(torch.utils.data.Dataset):
     integer is named as such, since it says neither which locus set
     to read from nor which epoch's plan.
 
-    A pair's epoch and slot and a draw's ``index`` are integers as
-    `quadrat.cache.require_index` takes them, and anything else raises
+    A pair's epoch is an integer as `quadrat._engine.require_integer`
+    takes one, and its slot and a draw's ``index`` are integers as
+    `quadrat.cache.require_index` takes them; anything else raises
     `TypeError`. The epoch is planned as given. A slot outside the
     plan, or a draw's ``index`` outside the set its ``is_peak`` picks,
     raises `IndexError` rather than reading from the end.
@@ -106,7 +108,9 @@ class LocusDataset(torch.utils.data.Dataset):
         ``None``. An attribute of the same name, which may be assigned
         later and is checked as it is here.
     :raises TypeError: if either window frame is not a
-        `polars.DataFrame`; if ``sampler`` is neither ``None`` nor a
+        `polars.DataFrame`; if ``in_window`` or ``out_window`` is not an
+        integer as `quadrat._engine.require_integer` takes one; if
+        ``sampler`` is neither ``None`` nor a
         `quadrat.sampling.PeakNegativeMixSampler`; or for a grouping
         `quadrat.groups.validate_signal_groups` refuses by type.
     :raises ValueError: if ``peak_windows`` is empty; if
@@ -169,8 +173,8 @@ class LocusDataset(torch.utils.data.Dataset):
         self.sequence_store = sequence_store
         self.signal_cache = signal_cache
         self.control_cache = control_cache
-        self.in_window = in_window
-        self.out_window = out_window
+        self.in_window = require_integer("in_window", in_window)
+        self.out_window = require_integer("out_window", out_window)
         self.signal_groups, self.signal_perm = _grouping(
             "signal_groups", signal_groups, signal_cache
         )
@@ -204,7 +208,9 @@ class LocusDataset(torch.utils.data.Dataset):
                     "index it with a LocusDraw."
                 )
             epoch, slot = draw
-            plan = self.sampler.plan(require_index("(epoch, index) pair's epoch", epoch))
+            plan = self.sampler.plan(
+                require_integer("(epoch, index) pair's epoch", epoch)
+            )
             slot = require_index(
                 "(epoch, index) pair's index",
                 slot,

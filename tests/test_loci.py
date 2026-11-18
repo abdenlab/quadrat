@@ -1000,6 +1000,33 @@ def test_load_windows_should_raise_type_error_when_sequences_is_no_path(corpus):
         loci.load_windows(corpus.peaks, {"chr1": "ACGT"}, 60, 30)
 
 
+@pytest.mark.parametrize(
+    "label,widths",
+    [("in_window", (True, 30)), ("out_window", (60, True)), ("in_window", (60.0, 30))],
+    ids=["in-bool", "out-bool", "in-float"],
+)
+def test_load_windows_should_raise_type_error_when_a_width_is_not_an_integer(
+    corpus, label, widths
+):
+    """Test the integer rule on the two window widths.
+
+    Given:
+        The module's peaks, with ``True`` or a float as one width.
+    When:
+        Their windows are loaded.
+    Then:
+        It should raise `TypeError` naming the width, rather than build
+        one-base windows or float bounds.
+    """
+
+    # Arrange
+    in_window, out_window = widths
+
+    # Act & assert
+    with pytest.raises(TypeError, match="{} must be an integer".format(label)):
+        loci.load_windows(corpus.peaks, corpus.fasta, in_window, out_window)
+
+
 def test_load_windows_should_raise_file_not_found_error_when_the_reference_is_missing(
     tmp_path, recwarn
 ):

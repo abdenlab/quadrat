@@ -470,6 +470,28 @@ class TestLocusDataset:
         assert controlled.signal_perm.tolist() == [0, 2, 1]
         assert controlled.control_perm.tolist() == [1, 0]
 
+    @pytest.mark.parametrize("field", ["in_window", "out_window"])
+    def test___init___should_raise_type_error_when_a_width_is_not_an_integer(
+        self, corpus, field
+    ):
+        """Test the integer rule on the widths a dataset reads at.
+
+        Given:
+            The kept windows, with ``True`` as one width.
+        When:
+            A dataset is constructed.
+        Then:
+            It should raise `TypeError` naming the width.
+        """
+
+        # Arrange
+        peak_windows, negative_windows = kept_windows(corpus)
+        widths = {"in_window": IN_WINDOW, "out_window": OUT_WINDOW, field: True}
+
+        # Act & assert
+        with pytest.raises(TypeError, match="{} must be an integer".format(field)):
+            dataset.LocusDataset(peak_windows, negative_windows, None, None, **widths)
+
     def test___init___should_accept_an_empty_negative_set(self, corpus):
         """Test a peak-only dataset.
 

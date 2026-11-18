@@ -1122,7 +1122,7 @@ def require_windows(caller, windows):
         )
 
 
-def require_index(label, index, size=None, of=None):
+def require_index(label, index, size, of=None):
     """Return ``index`` as an `int`, refusing a non-integer or one outside ``range(size)``.
 
     An index is an integer as `quadrat._engine.require_integer` takes
@@ -1130,19 +1130,18 @@ def require_index(label, index, size=None, of=None):
 
     :param label: The name of the index, for the message.
     :param index: The value given as an index.
-    :param size: The number of rows it indexes, or ``None`` to check
-        only that it is an integer.
+    :param size: The number of rows it indexes.
     :param of: What the rows are, for the message, e.g., ``"the
         windows this cache was built for"``, or ``None`` to leave them
         unnamed.
     :returns: ``index`` as an `int`.
     :raises TypeError: as `quadrat._engine.require_integer` raises it.
-    :raises IndexError: if ``size`` is given and ``index`` is negative
-        or not less than it.
+    :raises IndexError: if ``index`` is negative or not less than
+        ``size``.
     """
 
     index = require_integer(label, index)
-    if size is not None and not 0 <= index < size:
+    if not 0 <= index < size:
         raise IndexError(
             "{} must be in range(0, {}){}; got {}.".format(
                 label, size, "" if of is None else ", " + of, index

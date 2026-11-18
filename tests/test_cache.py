@@ -392,33 +392,15 @@ def test_require_index_should_raise_type_error_when_not_an_integer(index):
     Given:
         A ``bool``, a numpy ``bool``, a float and a string.
     When:
-        Each is required to be an index, with no row count.
+        Each is required to index ten rows.
     Then:
-        It should raise `TypeError` naming the label.
+        It should raise `TypeError` naming the label, before the range
+        is tested.
     """
 
     # Act & assert
     with pytest.raises(TypeError, match="row must be an integer"):
-        cache.require_index("row", index)
-
-
-@pytest.mark.parametrize("index", [-5, 0, 2**70], ids=repr)
-def test_require_index_should_answer_any_integer_when_given_no_size(index):
-    """Test the integer rule alone.
-
-    Given:
-        A negative integer, zero, and one past any row count.
-    When:
-        Each is required to be an index with no row count.
-    Then:
-        It should be answered unchanged.
-    """
-
-    # Act
-    answered = cache.require_index("row", index)
-
-    # Assert
-    assert answered == index
+        cache.require_index("row", index, 10)
 
 
 def test_require_index_should_leave_the_rows_unnamed_when_of_is_none():

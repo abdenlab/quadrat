@@ -25,6 +25,7 @@ from quadrat._engine import (
     item_list,
     name_list,
     registered_frames,
+    require_integer,
     transpile_intervals,
 )
 from quadrat.cache import group_track, require_windows, track_list, window_columns
@@ -125,7 +126,9 @@ def load_windows(
     :returns: A `polars.DataFrame` with the columns above.
     :raises TypeError: if ``loci`` is of none of those shapes, if
         ``chroms`` is a single name rather than a collection of them,
-        if ``sequences`` is not a path, or for a ``max_jitter``
+        if ``sequences`` is not a path, if ``in_window`` or
+        ``out_window`` is not an integer as
+        `quadrat._engine.require_integer` takes one, or for a ``max_jitter``
         `quadrat.rules.as_jitter` refuses by type.
     :raises FileNotFoundError: if nothing exists at ``sequences`` or at
         a locus file's path.
@@ -158,6 +161,8 @@ def load_windows(
 
     pandas = import_on_first_use("pandas")
     polars = import_on_first_use("polars")
+    in_window = require_integer("in_window", in_window)
+    out_window = require_integer("out_window", out_window)
     margin = as_jitter(max_jitter).margin
     sources = _locus_sources("loci", loci)
     chroms = _contig_names(chroms)

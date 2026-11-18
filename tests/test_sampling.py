@@ -304,6 +304,46 @@ class TestPeakNegativeMixSampler:
         # Assert
         assert result is None
 
+    @pytest.mark.parametrize("bad", [True, 2.0], ids=repr)
+    def test_validate_arguments_should_raise_type_error_when_the_count_is_not_an_integer(
+        self, bad
+    ):
+        """Test the integer rule on a negative count given to the validator.
+
+        Given:
+            A positive ratio, and ``True`` or ``2.0`` as the negative
+            count.
+        When:
+            The arguments are validated without a sampler.
+        Then:
+            It should raise `TypeError` naming ``n_negatives``, as the
+            constructor does, rather than read ``True`` as one.
+        """
+
+        # Act & assert
+        with pytest.raises(TypeError, match="n_negatives must be an integer"):
+            sampling.PeakNegativeMixSampler.validate_arguments(0.5, 2, bad)
+
+    def test_validate_arguments_should_answer_the_count_as_an_int(self):
+        """Test the normalised count validation hands back.
+
+        Given:
+            A negative count given as a numpy integer.
+        When:
+            The arguments are validated.
+        Then:
+            It should answer the count as a plain `int`.
+        """
+
+        # Act
+        answered = sampling.PeakNegativeMixSampler.validate_arguments(
+            0.5, 2, numpy.int64(4)
+        )
+
+        # Assert
+        assert answered == 4
+        assert type(answered) is int
+
     def test___init___should_raise_when_max_jitter_is_negative(self):
         """Test the refusal of a negative jitter bound.
 
@@ -926,6 +966,98 @@ class TestPeakNegativeMixSampler:
             make_sampler("baseline").plan(0)
         )
 
+    @pytest.mark.parametrize("bad", [True, 2.0], ids=repr)
+    @pytest.mark.parametrize("field", ["n_peaks", "n_negatives", "random_state"])
+    def test___init___should_raise_type_error_when_a_count_is_not_an_integer(
+        self, field, bad
+    ):
+        """Test the integer rule on the sampler's counts and seed.
+
+        Given:
+            ``True`` or ``2.0`` as the peak count, the negative count
+            or the seed, every other argument valid.
+        When:
+            A sampler is constructed.
+        Then:
+            It should raise `TypeError` naming the argument, rather
+            than read ``True`` as one or truncate a float.
+        """
+
+        # Arrange
+        arguments = dict(n_peaks=4, n_negatives=4, random_state=0)
+        arguments[field] = bad
+
+        # Act & assert
+        with pytest.raises(TypeError, match="{} must be an integer".format(field)):
+            sampling.PeakNegativeMixSampler(**arguments)
+
+    def test___init___should_hold_numpy_integers_as_ints(self):
+        """Test that numpy integers are still integers to the sampler.
+
+        Given:
+            A peak count, a negative count, a seed and an epoch given
+            as numpy integers.
+        When:
+            A sampler is constructed and that epoch planned.
+        Then:
+            It should hold the counts as `int` and plan what the same
+            plain integers plan.
+        """
+
+        # Arrange
+        plain = sampling.PeakNegativeMixSampler(6, 3, 0.5, 2, random_state=11)
+
+        # Act
+        typed = sampling.PeakNegativeMixSampler(
+            numpy.int64(6), numpy.int32(3), 0.5, 2, random_state=numpy.int64(11)
+        )
+
+        # Assert
+        assert (type(typed.n_peaks), type(typed.n_negatives)) == (int, int)
+        assert draws(typed.plan(numpy.int64(4))) == draws(plain.plan(4))
+
+    @pytest.mark.parametrize("bad", [True, 1.0], ids=repr)
+    def test_set_epoch_should_raise_type_error_when_the_epoch_is_not_an_integer(
+        self, bad
+    ):
+        """Test the integer rule on the epoch a pass is set to.
+
+        Given:
+            A sampler at epoch zero, and ``True`` or ``1.0``.
+        When:
+            The epoch is set to it.
+        Then:
+            It should raise `TypeError` naming ``epoch``, and leave the
+            sampler at epoch zero.
+        """
+
+        # Arrange
+        sampler = make_sampler("baseline")
+
+        # Act & assert
+        with pytest.raises(TypeError, match="epoch must be an integer"):
+            sampler.set_epoch(bad)
+        assert sampler.epoch == 0
+
+    def test_plan_should_raise_type_error_when_the_epoch_is_a_bool(self):
+        """Test the integer rule on the epoch a plan is made for.
+
+        Given:
+            A sampler.
+        When:
+            The plan of epoch ``True`` is asked for.
+        Then:
+            It should raise `TypeError` naming ``epoch``, rather than
+            answer epoch one's plan.
+        """
+
+        # Arrange
+        sampler = make_sampler("baseline")
+
+        # Act & assert
+        with pytest.raises(TypeError, match="epoch must be an integer"):
+            sampler.plan(True)
+
     def test_set_epoch_should_choose_the_plan_the_next_pass_emits(self):
         """Test positioning a sampler at an epoch.
 
@@ -978,6 +1110,90 @@ class TestShardedEpochSampler:
         # Act & assert
         with pytest.raises(ValueError, match=match):
             sampling.ShardedEpochSampler.validate_arguments(batch_size, rank, world_size)
+
+    @pytest.mark.parametrize("bad", [True, 2.0], ids=repr)
+    @pytest.mark.parametrize("field", ["batch_size", "rank", "world_size"])
+    def test_validate_arguments_should_raise_type_error_when_not_an_integer(
+        self, field, bad
+    ):
+        """Test the integer rule on the shard's arguments.
+
+        Given:
+            ``True`` or ``2.0`` as the batch size, the rank or the world
+            size, every other argument valid.
+        When:
+            The arguments are validated without a sampler.
+        Then:
+            It should raise `TypeError` naming the argument.
+        """
+
+        # Arrange
+        arguments = dict(batch_size=4, rank=0, world_size=1)
+        arguments[field] = bad
+
+        # Act & assert
+        with pytest.raises(TypeError, match="{} must be an integer".format(field)):
+            sampling.ShardedEpochSampler.validate_arguments(**arguments)
+
+    def test_validate_arguments_should_answer_the_three_as_ints(self):
+        """Test the normalised values validation hands back.
+
+        Given:
+            A batch size, rank and world size given as numpy integers.
+        When:
+            They are validated.
+        Then:
+            It should answer them as plain `int`, in order.
+        """
+
+        # Act
+        answered = sampling.ShardedEpochSampler.validate_arguments(
+            numpy.int64(8), numpy.int32(1), numpy.int64(2)
+        )
+
+        # Assert
+        assert answered == (8, 1, 2)
+        assert [type(value) for value in answered] == [int, int, int]
+
+    def test___init___should_hold_numpy_integers_as_ints(self):
+        """Test that numpy integers are held as plain ones.
+
+        Given:
+            An index count, batch size, rank and world size given as
+            numpy integers.
+        When:
+            The sampler is constructed.
+        Then:
+            It should hold each as a plain `int`.
+        """
+
+        # Act
+        sampler = sampling.ShardedEpochSampler(
+            numpy.int64(16), numpy.int64(8), numpy.int32(1), numpy.int64(2)
+        )
+
+        # Assert
+        held = (sampler.n, sampler.batch_size, sampler.rank, sampler.world_size)
+        assert held == (16, 8, 1, 2)
+        assert [type(value) for value in held] == [int, int, int, int]
+
+    @pytest.mark.parametrize("bad", [True, 4.0], ids=repr)
+    def test___init___should_raise_type_error_when_the_count_is_not_an_integer(
+        self, bad
+    ):
+        """Test the integer rule on the epoch's index count.
+
+        Given:
+            ``True`` or ``4.0`` as the number of indices an epoch holds.
+        When:
+            The sampler is constructed.
+        Then:
+            It should raise `TypeError` naming ``n``.
+        """
+
+        # Act & assert
+        with pytest.raises(TypeError, match="n must be an integer"):
+            sampling.ShardedEpochSampler(bad, 4)
 
     def test___init___should_raise_when_the_ranks_cannot_split_a_batch(self):
         """Test the refusal of a batch the world does not divide.
@@ -1183,3 +1399,22 @@ class TestShardedEpochSampler:
 
         # Assert
         assert yielded == [(3, index) for index in range(8)]
+
+    def test_set_epoch_should_raise_type_error_when_the_epoch_is_a_bool(self):
+        """Test the integer rule on the epoch every index is paired with.
+
+        Given:
+            A sampler.
+        When:
+            The epoch is set to ``True``.
+        Then:
+            It should raise `TypeError` naming ``epoch``, rather than
+            pair every index with ``True``.
+        """
+
+        # Arrange
+        sampler = sampling.ShardedEpochSampler(8, 4)
+
+        # Act & assert
+        with pytest.raises(TypeError, match="epoch must be an integer"):
+            sampler.set_epoch(True)

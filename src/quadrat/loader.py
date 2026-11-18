@@ -11,11 +11,11 @@ marker and none is re-exported from `quadrat`. Importing this module
 imports ``torch``, which `import quadrat` does not.
 """
 
-import numbers
 import os
 
 import torch
 
+from quadrat._engine import require_integer
 from quadrat.cache import (
     default_cache_dir,
     resolve_residency,
@@ -81,9 +81,12 @@ class RechunkedLoader(object):
         `torch.utils.data.DataLoader` whose ``batch_size`` is the fetch
         size, which keeps its last partial fetch, and whose batches are
         sequences of tensors.
-    :param batch_size: The batch to hand the consumer. Kept as the
-        attribute of the same name, beside ``fetch_size`` and
-        ``loader``.
+    :param batch_size: The batch to hand the consumer, as an integer
+        `quadrat._engine.require_integer` takes. Kept as the attribute of
+        the same name, beside ``fetch_size`` and ``loader``.
+    :raises TypeError: if ``batch_size`` or ``loader``'s
+        ``batch_size`` is not an integer as
+        `quadrat._engine.require_integer` takes one.
     :raises ValueError: if ``batch_size`` is below ``1``; if
         ``loader`` has no ``batch_size``, as one batching through a
         ``batch_sampler`` has not; if ``loader`` drops its last partial
@@ -113,6 +116,7 @@ class RechunkedLoader(object):
     """
 
     def __init__(self, loader, batch_size):
+        batch_size = require_integer("batch_size", batch_size)
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1, got {}".format(batch_size))
         fetch_size = getattr(loader, "batch_size", None)
@@ -122,6 +126,7 @@ class RechunkedLoader(object):
                 "batch_size, and this one has none; it batches through a "
                 "batch_sampler, whose fetches need not be one size"
             )
+        fetch_size = require_integer("the wrapped loader's batch_size", fetch_size)
         # Refused for the reason in the notes.
         if getattr(loader, "drop_last", False):
             raise ValueError(
@@ -138,8 +143,8 @@ class RechunkedLoader(object):
             )
 
         self.loader = loader
-        self.batch_size = int(batch_size)
-        self.fetch_size = int(fetch_size)
+        self.batch_size = batch_size
+        self.fetch_size = fetch_size
 
     def __getattr__(self, name):
         # Reached only for a name this object does not hold. `loader`
@@ -353,7 +358,7 @@ def build_training_loader(
         refuses by value of ``negative_ratio`` and ``max_jitter``,
         ``negatives`` being ``None`` counting as no negative; for anything
         `quadrat.sampling.ShardedEpochSampler.validate_arguments`
-        refuses of ``batch_size``, ``rank`` and ``world_size``, not
+        refuses by value of ``batch_size``, ``rank`` and ``world_size``, not
         sharding counting as rank ``0`` of a world of ``1``; for a
         ``cache_residency`` `quadrat.cache.resolve_residency` refuses;
         for a ``num_workers`` or ``timeout``
@@ -369,9 +374,16 @@ def build_training_loader(
         list or a track is held in memory while ``cache_dir`` is not
         ``False``; for a ``max_jitter``
         `quadrat.sampling.PeakNegativeMixSampler.validate_arguments`
-        refuses by type, before anything is read or keyed; or for
-        anything `quadrat.loci.load_windows` refuses
-        by type.
+        refuses by type; for a ``batch_size``, ``rank`` or
+        ``world_size``
+        `quadrat.sampling.ShardedEpochSampler.validate_arguments`
+        refuses by type; if ``in_window``, ``out_window``,
+        ``num_workers`` or ``max_fetch_bytes`` is not an integer as
+        `quadrat._engine.require_integer` takes one; if ``fetch_size``
+        or ``random_state`` is given and is not one; or for anything
+        `quadrat.loci.load_windows` refuses by type. Each is made before
+        anything is read or keyed, except the second, which is made as
+        the cache is keyed, and the last.
     :raises FileNotFoundError: for a reference, a locus file or an
         exclusion list `quadrat.loci.readable_windows` finds nothing
         at, or a track `quadrat.loci.require_track_contigs` finds
@@ -419,6 +431,15 @@ def build_training_loader(
             "rank and world_size are given together or not at all; got "
             "rank={!r} and world_size={!r}".format(rank, world_size)
         )
+    for label, value in (
+        ("in_window", in_window),
+        ("out_window", out_window),
+        ("num_workers", num_workers),
+        ("max_fetch_bytes", max_fetch_bytes),
+    ):
+        require_integer(label, value)
+    if random_state is not None:
+        require_integer("random_state", random_state)
     # Refused for the reason in the notes.
     if world_size is not None and world_size > 1 and random_state is None:
         raise ValueError(
@@ -436,16 +457,13 @@ def build_training_loader(
         1 if world_size is None else world_size,
     )
     step = batch_size // (1 if world_size is None else world_size)
-    if fetch_size is not None and (
-        isinstance(fetch_size, bool)
-        or not isinstance(fetch_size, numbers.Integral)
-        or fetch_size < 1
-        or fetch_size % step != 0
-    ):
-        raise ValueError(
-            "fetch_size must be a positive whole multiple of the {} samples "
-            "a batch holds here, got {!r}".format(step, fetch_size)
-        )
+    if fetch_size is not None:
+        fetch_size = require_integer("fetch_size", fetch_size)
+        if fetch_size < 1 or fetch_size % step != 0:
+            raise ValueError(
+                "fetch_size must be a positive whole multiple of the {} samples "
+                "a batch holds here, got {!r}".format(step, fetch_size)
+            )
     resolve_residency(cache_residency)
     # A loader over nothing, for the refusals `torch.utils.data.DataLoader`
     # makes of these two, so they come before the build and not after.
@@ -662,11 +680,32 @@ def auto_fetch_size(
     :param bytes_per_sample: The size of one sample's tensors, in
         bytes, as `sample_nbytes` gives it.
     :param prefetch_factor: How many fetches each worker keeps ready,
-        as `torch.utils.data.DataLoader` takes it.
+        as `torch.utils.data.DataLoader` takes it, ``None`` included,
+        which is ``2`` as it is to torch.
     :param max_fetch_bytes: The ceiling on one fetch, in bytes.
     :returns: The fetch size, as an `int`.
+    :raises TypeError: if any argument but a ``None``
+        ``prefetch_factor`` is not an integer as
+        `quadrat._engine.require_integer` takes one.
     """
 
+    n_draws, batch_size, num_workers, bytes_per_sample, max_fetch_bytes = (
+        require_integer(label, value)
+        for label, value in (
+            ("n_draws", n_draws),
+            ("batch_size", batch_size),
+            ("num_workers", num_workers),
+            ("bytes_per_sample", bytes_per_sample),
+            ("max_fetch_bytes", max_fetch_bytes),
+        )
+    )
+    # `None` is what a loader without workers holds, and torch's own
+    # default for one with them.
+    prefetch_factor = (
+        2
+        if prefetch_factor is None
+        else require_integer("prefetch_factor", prefetch_factor)
+    )
     if num_workers <= 0 or n_draws <= 0:
         return batch_size
 

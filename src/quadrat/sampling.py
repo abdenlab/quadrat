@@ -15,6 +15,7 @@ import typing
 import numpy
 import torch
 
+from quadrat._engine import require_integer
 from quadrat.rules import as_jitter
 
 #: The multiplier that spreads consecutive epochs across the seed
@@ -130,8 +131,10 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
     Pickles, holding nothing but its arguments, its seed, its epoch,
     and the last plan it made.
 
-    :param n_peaks: How many peaks there are to draw.
-    :param n_negatives: How many negatives there are to draw from.
+    :param n_peaks: How many peaks there are to draw, as an integer
+        `quadrat._engine.require_integer` takes.
+    :param n_negatives: How many negatives there are to draw from,
+        likewise.
     :param negative_ratio: Negative slots per peak, per epoch. ``0``
         draws no negative.
     :param max_jitter: The jitter, as `quadrat.rules.as_jitter` takes
@@ -145,8 +148,10 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         take among them are random either way.
     :param random_state: The seed, as an `int`, or ``None`` to draw
         one from numpy's global generator at construction.
-    :raises TypeError: for anything `validate_arguments` refuses by
-        type.
+    :raises TypeError: if ``n_peaks``, ``n_negatives`` or a given
+        ``random_state`` is not an integer as
+        `quadrat._engine.require_integer` takes one; or for
+        anything `validate_arguments` refuses by type.
     :raises ValueError: for anything `validate_arguments` refuses by
         value.
 
@@ -171,10 +176,14 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         shuffle=True,
         random_state=None,
     ):
-        self.validate_arguments(negative_ratio, max_jitter, int(n_negatives))
+        n_peaks = require_integer("n_peaks", n_peaks)
+        # Required here, where ``validate_arguments`` reads ``None`` as
+        # a count not known yet.
+        n_negatives = require_integer("n_negatives", n_negatives)
+        self.validate_arguments(negative_ratio, max_jitter, n_negatives)
 
-        self.n_peaks = int(n_peaks)
-        self.n_negatives = int(n_negatives)
+        self.n_peaks = n_peaks
+        self.n_negatives = n_negatives
         self.negative_ratio = negative_ratio
         self.jitter = as_jitter(max_jitter)
         self.reverse_complement = reverse_complement
@@ -182,7 +191,7 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
 
         if random_state is None:
             random_state = int(numpy.random.randint(0, _SEED_MODULUS))
-        self._base_seed = int(random_state) % _SEED_MODULUS
+        self._base_seed = require_integer("random_state", random_state) % _SEED_MODULUS
 
         self._epoch = 0
         self._cached = None
@@ -213,8 +222,11 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         :param n_negatives: As the class takes it, or ``None`` where the
             count is not known yet, which skips the one refusal that
             needs it.
-        :raises TypeError: for a ``max_jitter`` `quadrat.rules.as_jitter`
-            refuses by type.
+        :returns: ``n_negatives`` as an `int`, or ``None`` where it was
+            not given.
+        :raises TypeError: if ``n_negatives`` is given and is not an
+            integer as `quadrat._engine.require_integer` takes one, or for
+            a ``max_jitter`` `quadrat.rules.as_jitter` refuses by type.
         :raises ValueError: for a ``max_jitter`` `quadrat.rules.as_jitter`
             refuses by value, if ``negative_ratio`` is negative, or if
             ``negative_ratio`` is positive while ``n_negatives`` is
@@ -227,6 +239,8 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         set, which fails somewhere far from the cause.
         """
 
+        if n_negatives is not None:
+            n_negatives = require_integer("n_negatives", n_negatives)
         as_jitter(max_jitter)
         if negative_ratio < 0:
             raise ValueError(
@@ -239,6 +253,7 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
                     negative_ratio
                 )
             )
+        return n_negatives
 
     def set_epoch(self, epoch):
         """Choose the epoch the next iteration emits.
@@ -246,10 +261,12 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         Needed only to resume a run partway through or to pin one
         epoch, since iterating advances the epoch by itself.
 
-        :param epoch: The epoch, counting from ``0``.
+        :param epoch: The epoch, counting from ``0``, as an integer
+            `quadrat._engine.require_integer` takes.
+        :raises TypeError: if ``epoch`` is not one.
         """
 
-        self._epoch = int(epoch)
+        self._epoch = require_integer("epoch", epoch)
 
     def plan(self, epoch):
         """Return the `EpochPlan` of ``epoch``.
@@ -258,10 +275,12 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         ``epoch``, the seed and the sampler's other arguments, and
         nothing else, and does not move the epoch iteration is at.
 
-        :param epoch: The epoch to plan, counting from ``0``.
+        :param epoch: The epoch to plan, counting from ``0``, as an
+            integer `quadrat._engine.require_integer` takes.
         :returns: The plan. The same object is answered while the same
             epoch is asked for again, so its arrays must not be
             written to.
+        :raises TypeError: if ``epoch`` is not one.
 
         .. rubric:: Implementation notes
 
@@ -287,6 +306,7 @@ class PeakNegativeMixSampler(torch.utils.data.Sampler):
         batch of every run while still looking correct.
         """
 
+        epoch = require_integer("epoch", epoch)
         if self._cached is not None and self._cached.epoch == epoch:
             return self._cached
 
@@ -349,11 +369,18 @@ class ShardedEpochSampler(torch.utils.data.Sampler):
     :param batch_size: The global batch size, summed over ranks.
     :param rank: This process's rank, counting from ``0``.
     :param world_size: How many ranks there are.
-    :raises ValueError: for anything `validate_arguments` refuses.
+    :raises TypeError: if ``n`` is not an integer as
+        `quadrat._engine.require_integer` takes one, or for anything
+        `validate_arguments` refuses by type.
+    :raises ValueError: for anything `validate_arguments` refuses by
+        value.
     """
 
     def __init__(self, n, batch_size, rank=0, world_size=1):
-        self.validate_arguments(batch_size, rank, world_size)
+        n = require_integer("n", n)
+        batch_size, rank, world_size = self.validate_arguments(
+            batch_size, rank, world_size
+        )
 
         self.n = n
         self.batch_size = batch_size
@@ -382,6 +409,9 @@ class ShardedEpochSampler(torch.utils.data.Sampler):
         :param batch_size: As the class takes it.
         :param rank: As the class takes it.
         :param world_size: As the class takes it.
+        :returns: ``(batch_size, rank, world_size)``, each as an `int`.
+        :raises TypeError: if any of the three is not an integer as
+            `quadrat._engine.require_integer` takes one.
         :raises ValueError: if ``batch_size`` or ``world_size`` is less
             than ``1``, if ``world_size`` does not divide
             ``batch_size``, or if ``rank`` is not in
@@ -395,6 +425,14 @@ class ShardedEpochSampler(torch.utils.data.Sampler):
         partition the epoch.
         """
 
+        batch_size, rank, world_size = (
+            require_integer(label, value)
+            for label, value in (
+                ("batch_size", batch_size),
+                ("rank", rank),
+                ("world_size", world_size),
+            )
+        )
         if batch_size < 1 or world_size < 1:
             raise ValueError(
                 "batch_size and world_size must be at least 1, got {} and {}".format(
@@ -412,11 +450,14 @@ class ShardedEpochSampler(torch.utils.data.Sampler):
             raise ValueError(
                 "rank must be in range({}), got {}".format(world_size, rank)
             )
+        return batch_size, rank, world_size
 
     def set_epoch(self, epoch):
         """Choose the epoch every index of the next pass is paired with.
 
-        :param epoch: The epoch, counting from ``0``.
+        :param epoch: The epoch, counting from ``0``, as an integer
+            `quadrat._engine.require_integer` takes.
+        :raises TypeError: if ``epoch`` is not one.
         """
 
-        self.epoch = epoch
+        self.epoch = require_integer("epoch", epoch)
