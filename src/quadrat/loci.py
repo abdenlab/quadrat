@@ -683,9 +683,14 @@ def extract_loci(
     :param signals: One track per signal channel, in channel order, as
         `extract_signal` takes them, or ``None`` to read no signal.
         Every track is opened before any locus is read, so one that is
-        no track is refused whether or not a locus reaches it.
+        no track is refused whether or not a locus reaches it. An empty
+        sequence is refused rather than read as no channel, since it
+        would answer zero-channel tensors that ``target_idx`` cannot
+        name; ``None`` asks for none.
     :param controls: One track per control channel, in the same form,
-        or ``None``.
+        or ``None``, an empty sequence refused likewise. This differs
+        from `quadrat.loader.build_training_loader`, which reads an
+        empty ``controls`` as none.
     :param chroms: The contigs to keep, as `load_windows` takes them.
     :param max_jitter: The jitter, as `load_windows` takes it.
     :param min_counts: The lowest count a kept locus may have, or
@@ -702,22 +707,23 @@ def extract_loci(
         them, or ``None`` to exclude nothing.
     :returns: An `ExtractedLoci`.
     :raises TypeError: if ``signals`` or ``controls`` is a single
-        track, an unordered collection of them, or holds something that
-        is no track, or for anything `readable_windows` refuses by
-        type.
-    :raises ValueError: if ``signals`` is given without ``out_window``;
+        track, an unordered collection of them, or holds a track of no
+        shape `quadrat.stores.track_frame` accepts, or for anything
+        `readable_windows` refuses by type.
+    :raises ValueError: if ``signals`` or ``controls`` is an empty
+        sequence; if ``signals`` is given without ``out_window``;
         if a count threshold is given without ``signals``; if
-        ``target_idx`` names no signal track where ``signals`` holds
-        one or a count threshold is given; if a track directory does
-        not verify complete; for anything `load_windows` refuses by
+        ``signals`` is given and ``target_idx`` names none of its
+        tracks; for a track `quadrat.stores.track_frame` refuses; for
+        anything `load_windows` refuses by
         value; for the one `require_track_contigs` refuses; or for a
         residue `extract_sequences` refuses.
-    :raises FileNotFoundError: if nothing exists at ``sequences``, as
-        `quadrat.chrom_lengths` refuses it; if a track
+    :raises FileNotFoundError: for a reference `quadrat.chrom_lengths` refuses as missing; if a track
         path does not exist; or for a locus file or an exclusion list
         `readable_windows` finds nothing at.
     :raises OSError: if the reference cannot otherwise be read, or has
-        no index and none can be written beside it.
+        no index and none can be written beside it, or for a track
+        `quadrat.stores.track_frame` cannot read.
     :raises ImportError: if the ``pileup`` extra is needed and not
         installed.
 
@@ -736,6 +742,11 @@ def extract_loci(
         if tracks is None:
             continue
         track_sets[label] = track_list("extract_loci", label, tracks)
+        if not track_sets[label]:
+            raise ValueError(
+                "extract_loci reads one channel per track: `{0}` holds no "
+                "track. Pass {0}=None to read none.".format(label)
+            )
         # Opened here for the reason the ``signals`` parameter gives.
         for track in track_sets[label]:
             track_frame(track)
@@ -754,7 +765,7 @@ def extract_loci(
             "extract_loci reads signal over the output window: `signals` "
             "needs `out_window`, and none was given."
         )
-    elif (signals or counting) and not -len(signals) <= target_idx < len(signals):
+    elif not -len(signals) <= target_idx < len(signals):
         raise ValueError(
             "extract_loci counts over one signal track: target_idx {} "
             "names none of the {} given.".format(target_idx, len(signals))
