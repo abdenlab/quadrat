@@ -214,6 +214,20 @@ class WindowSignalCache(ProcessLocalHandles):
 
         return int(self._n_channels)
 
+    @property
+    def n_windows(self):
+        """Return how many windows this cache was built for, as `array_meta` counts them.
+
+        Read from ``meta``, which every cache `build`, `from_arrays` and
+        `adopt` make carries, so nothing is mapped to answer it; a cache
+        constructed with no ``meta`` is counted from its arrays.
+        """
+
+        meta = self.meta
+        if meta is None:
+            meta = array_meta((*self._arrays(), self.n_channels))
+        return int(meta["n_windows"])
+
     @classmethod
     def build(
         cls,

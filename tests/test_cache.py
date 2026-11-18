@@ -2936,6 +2936,61 @@ class TestWindowSignalCache:
         assert built.n_channels == 2
         assert tuple(built.window(0, 0, 8).shape) == (2, 8)
 
+    @pytest.mark.parametrize("residency", ["memory", "mapped", "adopted"])
+    @pytest.mark.parametrize("n_windows", [0, 1, 3])
+    def test_n_windows_should_count_the_windows_it_was_built_for(
+        self, tmp_path, n_windows, residency
+    ):
+        """Test the window count a reader checks a cache against.
+
+        Given:
+            Grouped arrays over no, one or three windows, none holding
+            a row, held in memory, memory-mapped, or written as an
+            entry and adopted.
+        When:
+            A cache is made from them and its window count read.
+        Then:
+            It should be the number of windows, whatever the residency.
+        """
+
+        # Arrange
+        grouped = builders.empty_grouped(n_windows)
+        if residency == "adopted":
+            root = str(tmp_path / "entry")
+            os.makedirs(root)
+            cache.write_cache_arrays(root, *grouped[:4])
+
+        # Act
+        if residency == "adopted":
+            made = cache.WindowSignalCache.adopt(root, 1, cache.array_meta(grouped))
+        else:
+            made = cache.WindowSignalCache.from_arrays(grouped, residency=residency)
+
+        # Assert
+        assert made.n_windows == n_windows
+
+    def test_n_windows_should_count_the_arrays_of_a_cache_built_with_no_meta(self):
+        """Test the count of a cache constructed directly.
+
+        Given:
+            Grouped arrays over three windows, handed to the
+            constructor with no ``meta``.
+        When:
+            Its window count is read.
+        Then:
+            It should be three, counted from the arrays, rather than
+            fail on the missing record.
+        """
+
+        # Arrange
+        offsets, pos, val, chan, n_channels = builders.empty_grouped(3)
+
+        # Act
+        made = cache.WindowSignalCache(offsets, pos, val, chan, n_channels=n_channels)
+
+        # Assert
+        assert made.n_windows == 3
+
     @pytest.mark.parametrize("residency", ["memory", "mapped"])
     def test_meta_should_report_what_the_arrays_hold(self, tracks, residency):
         """Test the counts a cache carries beside its arrays.
