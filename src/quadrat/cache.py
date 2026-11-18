@@ -20,7 +20,6 @@ import functools
 import hashlib
 import json
 import multiprocessing
-import numbers
 import os
 import shutil
 import sys
@@ -35,6 +34,7 @@ from quadrat._engine import (
     import_on_first_use,
     item_list,
     registered_frames,
+    require_integer,
     transpile_intervals,
 )
 from quadrat.rules import as_exclusions, as_jitter
@@ -1125,9 +1125,8 @@ def require_windows(caller, windows):
 def require_index(label, index, size=None, of=None):
     """Return ``index`` as an `int`, refusing a non-integer or one outside ``range(size)``.
 
-    An index is any `numbers.Integral`, numpy's integers included,
-    except a ``bool``; a float, an array and a tensor are not integers,
-    whatever their value or size.
+    An index is an integer as `quadrat._engine.require_integer` takes
+    one.
 
     :param label: The name of the index, for the message.
     :param index: The value given as an index.
@@ -1137,21 +1136,12 @@ def require_index(label, index, size=None, of=None):
         windows this cache was built for"``, or ``None`` to leave them
         unnamed.
     :returns: ``index`` as an `int`.
-    :raises TypeError: if ``index`` is not an integer, or is a
-        ``bool``.
+    :raises TypeError: as `quadrat._engine.require_integer` raises it.
     :raises IndexError: if ``size`` is given and ``index`` is negative
         or not less than it.
-
-    .. rubric:: Implementation notes
-
-    A ``bool`` is refused although Python counts it an integer, because
-    ``True`` in an index is almost always a field passed in the wrong
-    place, and reading it as ``1`` would answer row 1 silently.
     """
 
-    if isinstance(index, bool) or not isinstance(index, numbers.Integral):
-        raise TypeError("{} must be an integer, got {!r}.".format(label, index))
-    index = int(index)
+    index = require_integer(label, index)
     if size is not None and not 0 <= index < size:
         raise IndexError(
             "{} must be in range(0, {}){}; got {}.".format(

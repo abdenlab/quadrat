@@ -25,6 +25,7 @@ unsupported for the same reason.
 
 import contextlib
 import importlib
+import numbers
 import os
 import threading
 
@@ -157,6 +158,42 @@ def item_list(value):
     """
 
     return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def require_integer(label, value):
+    """Return ``value`` as an `int`, refusing anything that is not an integer.
+
+    An integer is any `numbers.Integral`, numpy's integers included,
+    except a ``bool``; a float, an array and a tensor are not integers,
+    whatever their value or size.
+
+    :param label: The name of the argument, for the message, e.g.,
+        ``"batch_size"`` or ``"Exclusion.bin_width"``.
+    :param value: The value given.
+    :returns: ``value`` as an `int`.
+    :raises TypeError: if ``value`` is not an integer, or is a
+        ``bool``.
+
+    .. rubric:: Implementation notes
+
+    A ``bool`` is refused although Python counts it an integer, because
+    ``True`` in an integer argument is almost always a field passed in
+    the wrong place, and reading it as ``1`` would answer silently. A
+    float is refused rather than truncated for the same reason.
+
+    `quadrat.rules.as_jitter` and `quadrat.groups.validate_signal_groups`
+    refuse the same values in their own words, because their messages
+    name what this one cannot: that a `quadrat.rules.Jitter` is also accepted, and the
+    whole specification an entry sits in.
+    """
+
+    # A plain `int` is answered before the ABC test, which costs several
+    # times the call on the epoch path; `bool` is a subclass and fails it.
+    if type(value) is int:
+        return value
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise TypeError("{} must be an integer, got {!r}.".format(label, value))
+    return int(value)
 
 
 def name_list(names, empty, limit=3):

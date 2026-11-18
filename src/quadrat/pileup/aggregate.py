@@ -10,6 +10,7 @@ import math
 import numbers
 import sys
 
+from quadrat._engine import require_integer
 from quadrat.tables import COUNTS, COVERAGE_DELTAS
 
 #: The position rules `Aggregate` accepts, in the order its docstring
@@ -212,17 +213,9 @@ class Aggregate:
         if self.max_template_length is not None:
             integers.append("max_template_length")
         for name in integers:
-            value = getattr(self, name)
-            # `bool` is an `Integral`, and `True` read as a mask of one
-            # is the mistake this exists to refuse.
-            if not isinstance(value, numbers.Integral) or isinstance(value, bool):
-                raise TypeError(
-                    "Aggregate.{} must be an integer, got {}.".format(
-                        name, type(value).__name__
-                    )
-                )
             # Normalized so a numpy integer pickles and records as one.
-            object.__setattr__(self, name, int(value))
+            value = require_integer("Aggregate." + name, getattr(self, name))
+            object.__setattr__(self, name, value)
         if self.unstranded is not None:
             if not _is_bool(self.unstranded):
                 raise TypeError(

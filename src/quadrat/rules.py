@@ -16,6 +16,8 @@ marker and none is re-exported from `quadrat`.
 import dataclasses
 import numbers
 
+from quadrat._engine import require_integer
+
 #: Width of the bins an `Exclusion` tests on by default, in bases.
 EXCLUSION_BIN_WIDTH = 100
 
@@ -43,8 +45,8 @@ class Jitter:
 
     :param low: The smallest shift, in bases.
     :param high: The largest shift, in bases.
-    :raises TypeError: if either bound is not an integer, a `bool`
-        included.
+    :raises TypeError: if either bound is not an integer as
+        `quadrat._engine.require_integer` takes one.
     :raises ValueError: if ``low`` is above ``high``.
     """
 
@@ -53,17 +55,9 @@ class Jitter:
 
     def __post_init__(self):
         for name in ("low", "high"):
-            value = getattr(self, name)
-            # `bool` is an `Integral`, and `True` read as one base is
-            # the mistake this exists to refuse.
-            if not isinstance(value, numbers.Integral) or isinstance(value, bool):
-                raise TypeError(
-                    "Jitter.{} must be an integer, got {}.".format(
-                        name, type(value).__name__
-                    )
-                )
             # Normalized so a numpy integer pickles and keys as one.
-            object.__setattr__(self, name, int(value))
+            value = require_integer("Jitter." + name, getattr(self, name))
+            object.__setattr__(self, name, value)
         if self.low > self.high:
             raise ValueError(
                 "Jitter draws shifts from low through high, so low must not "
@@ -144,20 +138,14 @@ class Exclusion:
         if isinstance(self.regions, list):
             object.__setattr__(self, "regions", tuple(self.regions))
         for name, floor in (("bin_width", 1), ("end_padding", 0)):
-            value = getattr(self, name)
-            if not isinstance(value, numbers.Integral) or isinstance(value, bool):
-                raise TypeError(
-                    "Exclusion.{} must be an integer, got {}.".format(
-                        name, type(value).__name__
-                    )
-                )
+            value = require_integer("Exclusion." + name, getattr(self, name))
             if value < floor:
                 raise ValueError(
                     "Exclusion.{} must be at least {}, got {}.".format(
                         name, floor, value
                     )
                 )
-            object.__setattr__(self, name, int(value))
+            object.__setattr__(self, name, value)
 
     def __init_subclass__(cls, **kwargs):
         raise TypeError(

@@ -357,6 +357,34 @@ def test_require_index_should_refuse_an_index_out_of_range(kind, data, size):
         cache.require_index("row", kind(index), size, "the rows")
 
 
+@settings(deadline=None, max_examples=200)
+@given(
+    value=st.one_of(
+        st.integers(0, 2**70),
+        st.integers(0, 2**63 - 1).map(numpy.int64),
+        st.integers(0, 2**31 - 1).map(numpy.int32),
+    )
+)
+def test_require_index_should_answer_any_integer_as_an_equal_int(value):
+    """Test the integer rule on every integer it admits.
+
+    Given:
+        Any non-negative Python integer, past any fixed width included,
+        and any numpy ``int64`` or ``int32``.
+    When:
+        It is required to index more rows than any value drawn.
+    Then:
+        It should be answered equal, as a plain `int`.
+    """
+
+    # Act
+    answered = cache.require_index("row", value, 2**71)
+
+    # Assert
+    assert answered == value
+    assert type(answered) is int
+
+
 @pytest.mark.parametrize("index", [True, numpy.bool_(False), 1.0, "1"], ids=repr)
 def test_require_index_should_raise_type_error_when_not_an_integer(index):
     """Test the integer rule on values that are not integers.
