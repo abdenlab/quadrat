@@ -3159,7 +3159,7 @@ def test_extract_sequences_should_count_the_unknown_contigs_it_does_not_list(cor
         loci.extract_sequences(windows, corpus.fasta)
 
 
-def test_extract_sequences_should_raise_os_error_when_the_reference_is_missing(
+def test_extract_sequences_should_raise_file_not_found_error_when_the_reference_is_missing(
     tmp_path,
 ):
     """Test the refusal for a reference that is not there.
@@ -3169,14 +3169,15 @@ def test_extract_sequences_should_raise_os_error_when_the_reference_is_missing(
     When:
         Its sequence is extracted.
     Then:
-        It should raise `OSError` naming the path.
+        It should raise `FileNotFoundError` naming the path, as
+        `load_windows` does.
     """
 
     # Arrange
     windows = window_frame([("chr1", 0, 8)], ("in_start", "in_end"))
 
     # Act & assert
-    with pytest.raises(OSError, match=r"missing\.fa"):
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
         loci.extract_sequences(windows, str(tmp_path / "missing.fa"))
 
 
@@ -3849,7 +3850,7 @@ def test_extract_loci_should_raise_os_error_rather_than_scan_an_unindexable_refe
     assert "samtools faidx" in message
 
 
-def test_extract_loci_should_raise_os_error_when_the_reference_is_missing(
+def test_extract_loci_should_raise_file_not_found_error_when_the_reference_is_missing(
     tmp_path, recwarn
 ):
     """Test the refusal for a reference that is not there.
@@ -3859,15 +3860,16 @@ def test_extract_loci_should_raise_os_error_when_the_reference_is_missing(
     When:
         The locus is extracted.
     Then:
-        It should raise `OSError` naming the path, without first
-        warning of a scan for the reference's lengths.
+        It should raise `FileNotFoundError` naming the path, as
+        `load_windows` does, without first warning of a scan for the
+        reference's lengths.
     """
 
     # Arrange
     locus = pandas.DataFrame([("chr1", 100, 140)])
 
     # Act & assert
-    with pytest.raises(OSError, match=r"missing\.fa"):
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
         loci.extract_loci(locus, str(tmp_path / "missing.fa"), 60)
     assert not [caught for caught in recwarn.list if "scanning" in str(caught.message)]
 

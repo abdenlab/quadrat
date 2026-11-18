@@ -12,7 +12,6 @@ marker and none is re-exported from `quadrat`.
 
 import csv
 import functools
-import os
 import typing
 
 import numpy
@@ -130,8 +129,10 @@ def load_windows(
         ``out_window`` is not an integer as
         `quadrat._engine.require_integer` takes one, or for a ``max_jitter``
         `quadrat.rules.as_jitter` refuses by type.
-    :raises FileNotFoundError: if nothing exists at ``sequences`` or at
-        a locus file's path.
+    :raises FileNotFoundError: for a reference `quadrat.chrom_lengths` refuses as missing, or if
+        nothing exists at a locus file's path.
+    :raises OSError: for a reference `quadrat.chrom_lengths` cannot
+        examine.
     :raises ValueError: if ``chroms`` leaves no locus where the loci
         hold some, which is a naming mismatch between the two; if any
         locus is on a contig the reference does not name; or if a
@@ -152,11 +153,6 @@ def load_windows(
 
     ``in_bounds`` counts the odd base of an odd-width window, so a
     window marked in bounds can always be read whole.
-
-    A missing reference is refused here because `chrom_lengths` would
-    not refuse it: it reads as a reference with no usable index, and
-    the scan that follows fails in the engine's words, or for want of
-    the extra.
     """
 
     pandas = import_on_first_use("pandas")
@@ -166,16 +162,6 @@ def load_windows(
     margin = as_jitter(max_jitter).margin
     sources = _locus_sources("loci", loci)
     chroms = _contig_names(chroms)
-    # Ahead of `chrom_lengths`, for the reason in the notes. A
-    # reference that is no path is left for it to refuse by type.
-    path = fspath_or_none(sequences)
-    if path is not None:
-        try:
-            os.stat(path)
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                "{} is not a reference; there is no such file or directory.".format(path)
-            ) from None
     lengths = chrom_lengths(sequences)
 
     frame = _interleave_loci(sources, chroms, summits)
@@ -359,6 +345,7 @@ def readable_windows(
     :raises ValueError: for anything `load_windows` refuses by value.
     :raises FileNotFoundError: for a path `load_windows` or
         `exclusion_mask` finds nothing at.
+    :raises OSError: for a reference `load_windows` cannot examine.
     :raises ImportError: where `load_windows` or `exclusion_mask` needs
         the ``pileup`` extra and it is not installed.
     """
@@ -563,8 +550,9 @@ def extract_sequences(windows, sequences, alphabet=("A", "C", "G", "T"), ignore=
         width, if a window is on a contig the reference does not name,
         if a window reaches outside its contig, or for a residue
         `quadrat.stores.SequenceStore.window` refuses.
-    :raises OSError: if the reference cannot be read, or has no index
-        and none can be written beside it.
+    :raises FileNotFoundError: for a reference `quadrat.chrom_lengths` refuses as missing.
+    :raises OSError: if the reference cannot otherwise be read, or has
+        no index and none can be written beside it.
 
     .. rubric:: Implementation notes
 
@@ -722,11 +710,12 @@ def extract_loci(
         not verify complete; for anything `load_windows` refuses by
         value; for the one `require_track_contigs` refuses; or for a
         residue `extract_sequences` refuses.
-    :raises FileNotFoundError: if a track path does not exist, or for a
-        locus file or an exclusion list `readable_windows` finds nothing
-        at.
-    :raises OSError: if the reference cannot be read, or has no index
-        and none can be written beside it.
+    :raises FileNotFoundError: if nothing exists at ``sequences``, as
+        `quadrat.chrom_lengths` refuses it; if a track
+        path does not exist; or for a locus file or an exclusion list
+        `readable_windows` finds nothing at.
+    :raises OSError: if the reference cannot otherwise be read, or has
+        no index and none can be written beside it.
     :raises ImportError: if the ``pileup`` extra is needed and not
         installed.
 

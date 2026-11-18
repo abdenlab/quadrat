@@ -201,6 +201,33 @@ def test_pileup_many_should_return_empty_when_the_job_list_is_empty(backend):
     assert run.pileup_many([], backend=backend) == []
 
 
+def test_pileup_many_should_raise_file_not_found_error_when_a_reference_is_missing(
+    corpus, tmp_path
+):
+    """Test that a job's missing reference reaches the caller in its own type.
+
+    Given:
+        One job over real alignments, naming a reference that is not
+        there.
+    When:
+        The pileups are run serially.
+    Then:
+        It should raise `FileNotFoundError` naming the path and saying
+        it is not a reference, as `quadrat.pileup_alignments` does.
+    """
+
+    # Arrange
+    job = {
+        "alignments": corpus.bams[:1],
+        "sequences": str(tmp_path / "missing.fa"),
+        "name": str(tmp_path / "out"),
+    }
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
+        run.pileup_many([job], backend="serial")
+
+
 def test_pileup_many_should_dispatch_through_a_runner_of_the_callers_own(
     corpus, tmp_path, machine
 ):

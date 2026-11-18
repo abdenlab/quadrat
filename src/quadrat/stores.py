@@ -21,6 +21,7 @@ import os
 import numpy
 
 from quadrat._engine import fspath_or_none, import_on_first_use
+from quadrat.reference import require_reference
 from quadrat.tables import (
     COUNTS,
     COVERAGE_DELTAS,
@@ -161,6 +162,9 @@ class SequenceStore(ProcessLocalHandles):
         :raises ValueError: if ``end`` is before ``start``, or if a
             residue read, once upper-cased, is in neither ``alphabet``
             nor ``ignore``.
+        :raises FileNotFoundError: for a reference `quadrat.chrom_lengths` refuses as missing.
+        :raises OSError: if the reference cannot otherwise be read, or
+            has no index and none can be written beside it.
 
         .. rubric:: Implementation notes
 
@@ -208,7 +212,8 @@ class SequenceStore(ProcessLocalHandles):
 
         :returns: A `dict` of contig name to length in bases, in the
             reference's own order.
-        :raises OSError: if the reference cannot be read, or has no
+        :raises FileNotFoundError: for a reference `quadrat.chrom_lengths` refuses as missing.
+        :raises OSError: if the reference cannot otherwise be read, or has no
             index and none can be written beside it.
         """
 
@@ -222,15 +227,18 @@ class SequenceStore(ProcessLocalHandles):
 
         ``pyfaidx`` reports an index it could not write as a bare
         `OSError` about its own ``rebuild`` options, which names
-        nothing a caller of this package passed. A reference that
-        cannot be read at all is its `pyfaidx.FastaNotFoundError`,
-        which already names the path and is left as it is.
+        nothing a caller of this package passed. A missing reference is
+        refused first, as `quadrat.chrom_lengths` states. One that
+        exists and cannot be opened is pyfaidx's
+        `pyfaidx.FastaNotFoundError`, which already names the path and
+        is left as it is.
         """
 
         local = self._handles()
         fasta = local.get("fasta")
         if fasta is None:
             pyfaidx = import_on_first_use("pyfaidx")
+            require_reference(self.path)
             try:
                 fasta = pyfaidx.Fasta(self.path)
             except pyfaidx.FastaNotFoundError:

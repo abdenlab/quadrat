@@ -1786,6 +1786,38 @@ def test_build_training_loader_should_refuse_an_argument_before_building(
     assert not any(cache_dir.iterdir())
 
 
+@pytest.mark.parametrize("keyed", [False, True], ids=["unkeyed", "keyed"])
+def test_build_training_loader_should_raise_file_not_found_error_when_the_reference_is_missing(
+    corpus, tmp_path, keyed
+):
+    """Test the refusal of a reference that is not there.
+
+    Given:
+        The corpus's loci and tracks, a path at which there is no
+        reference, and either no cache or an empty cache directory.
+    When:
+        The loader is built.
+    Then:
+        It should raise `FileNotFoundError` naming the path and saying
+        it is not a reference, as every reader of a reference does, and
+        leave the cache directory empty.
+    """
+
+    # Arrange
+    entries = tmp_path / "entries"
+    entries.mkdir()
+    cache_dir = str(entries) if keyed else False
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
+        loader.build_training_loader(
+            **arguments(
+                corpus, sequences=str(tmp_path / "missing.fa"), cache_dir=cache_dir
+            )
+        )
+    assert not any(entries.iterdir())
+
+
 @pytest.mark.parametrize("fetch_size", [0, BATCH_SIZE + 2, BATCH_SIZE // 2])
 def test_build_training_loader_should_raise_when_the_fetch_is_not_a_whole_multiple(
     corpus, fetch_size

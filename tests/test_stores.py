@@ -485,28 +485,50 @@ class TestSequenceStore:
         ):
             unindexed.window("chr1", 0, 8)
 
-    def test_window_should_raise_as_pyfaidx_does_when_the_reference_is_missing(
+    def test_window_should_raise_file_not_found_when_the_reference_is_missing(
         self, tmp_path
     ):
-        """Test that a missing reference is not reported as a missing index.
+        """Test that a missing reference is refused as `load_windows` refuses it.
 
         Given:
             A path at which there is no reference.
         When:
             A window is read.
         Then:
-            It should raise `pyfaidx.FastaNotFoundError`, an `OSError`,
-            naming the path and saying nothing of an index.
+            It should raise `FileNotFoundError` naming the path and
+            saying it is not a reference, and nothing of an index.
         """
 
         # Arrange
         missing = stores.SequenceStore(str(tmp_path / "missing.fa"))
 
         # Act & assert
-        with pytest.raises(pyfaidx.FastaNotFoundError, match=r"missing\.fa") as caught:
+        with pytest.raises(
+            FileNotFoundError, match=r"missing\.fa is not a reference"
+        ) as caught:
             missing.window("chr1", 0, 8)
-        assert isinstance(caught.value, OSError)
         assert "faidx index" not in str(caught.value)
+
+    def test_contig_lengths_should_raise_file_not_found_when_the_reference_is_missing(
+        self, tmp_path
+    ):
+        """Test the second reader of a store's reference on a missing one.
+
+        Given:
+            A path at which there is no reference.
+        When:
+            Its contig lengths are read.
+        Then:
+            It should raise `FileNotFoundError` naming the path and
+            saying it is not a reference.
+        """
+
+        # Arrange
+        missing = stores.SequenceStore(str(tmp_path / "missing.fa"))
+
+        # Act & assert
+        with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
+            missing.contig_lengths()
 
     @settings(FILE_BACKED, max_examples=25)
     @given(bounds=st.tuples(st.integers(-200, 1200), st.integers(-200, 1200)))
