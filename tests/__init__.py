@@ -120,6 +120,11 @@ UNREADABLE_RECORDS = (
 )
 UNREADABLE_IDS = ("unknown-signal", "counts-at-2", "coverage-deltas-at-1")
 
+# The two kinds of file a track reader refuses by content, as
+# `quadrat.tables.track_signal` refuses them: one beginning as a bigWig
+# does, and an empty one.
+NOT_PARQUET = MappingProxyType({"bigwig": b"\x26\xfc\x8f\x88" + bytes(60), "empty": b""})
+
 # Records placed so a span ends on each contig's last base of
 # `TWO_CONTIGS`, one forward and one reverse, beside one that ends
 # well inside chr1: ``(name, chrom, pos, cigar, flag)``, as

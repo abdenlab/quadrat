@@ -20,7 +20,6 @@ import functools
 import hashlib
 import json
 import multiprocessing
-import numbers
 import os
 import shutil
 import sys
@@ -35,6 +34,7 @@ from quadrat._engine import (
     import_on_first_use,
     item_list,
     registered_frames,
+    require_integer,
     transpile_intervals,
 )
 from quadrat.rules import as_exclusions, as_jitter
@@ -213,6 +213,20 @@ class WindowSignalCache(ProcessLocalHandles):
         """Return how many channels a read of this cache answers with."""
 
         return int(self._n_channels)
+
+    @property
+    def n_windows(self):
+        """Return how many windows this cache was built for, as `array_meta` counts them.
+
+        Read from ``meta``, which every cache `build`, `from_arrays` and
+        `adopt` make carries, so nothing is mapped to answer it; a cache
+        constructed with no ``meta`` is counted from its arrays.
+        """
+
+        meta = self.meta
+        if meta is None:
+            meta = array_meta((*self._arrays(), self.n_channels))
+        return int(meta["n_windows"])
 
     @classmethod
     def build(
@@ -1122,37 +1136,26 @@ def require_windows(caller, windows):
         )
 
 
-def require_index(label, index, size=None, of=None):
+def require_index(label, index, size, of=None):
     """Return ``index`` as an `int`, refusing a non-integer or one outside ``range(size)``.
 
-    An index is any `numbers.Integral`, numpy's integers included,
-    except a ``bool``; a float, an array and a tensor are not integers,
-    whatever their value or size.
+    An index is an integer as `quadrat._engine.require_integer` takes
+    one.
 
     :param label: The name of the index, for the message.
     :param index: The value given as an index.
-    :param size: The number of rows it indexes, or ``None`` to check
-        only that it is an integer.
+    :param size: The number of rows it indexes.
     :param of: What the rows are, for the message, e.g., ``"the
         windows this cache was built for"``, or ``None`` to leave them
         unnamed.
     :returns: ``index`` as an `int`.
-    :raises TypeError: if ``index`` is not an integer, or is a
-        ``bool``.
-    :raises IndexError: if ``size`` is given and ``index`` is negative
-        or not less than it.
-
-    .. rubric:: Implementation notes
-
-    A ``bool`` is refused although Python counts it an integer, because
-    ``True`` in an index is almost always a field passed in the wrong
-    place, and reading it as ``1`` would answer row 1 silently.
+    :raises TypeError: as `quadrat._engine.require_integer` raises it.
+    :raises IndexError: if ``index`` is negative or not less than
+        ``size``.
     """
 
-    if isinstance(index, bool) or not isinstance(index, numbers.Integral):
-        raise TypeError("{} must be an integer, got {!r}.".format(label, index))
-    index = int(index)
-    if size is not None and not 0 <= index < size:
+    index = require_integer(label, index)
+    if not 0 <= index < size:
         raise IndexError(
             "{} must be in range(0, {}){}; got {}.".format(
                 label, size, "" if of is None else ", " + of, index
@@ -1349,9 +1352,9 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
         ``tracks`` is a single track or an unordered collection of
         them, or if a track is of no shape a track can take.
     :raises ValueError: if there are more channels than ``int16`` can
-        index, or if a track directory does not verify complete, as
-        `quadrat.stores.track_frame` refuses it.
+        index, or for a track `quadrat.stores.track_frame` refuses.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
     :raises ImportError: if the ``pileup`` extra is not installed.
 
     .. rubric:: Implementation notes
@@ -1617,12 +1620,13 @@ def window_group_sums(
     :returns: A `torch.Tensor` of shape ``(len(windows),
         len(channel_group_sizes))`` and dtype ``float32``.
     :raises ValueError: if ``channel_group_sizes`` does not sum to
-        the channel count, or if a track is a directory that cannot be
-        verified complete.
+        the channel count, or for a track `quadrat.stores.track_frame`
+        refuses.
     :raises TypeError: if ``tracks`` is a single track or an unordered
         collection of them, or if a track is of no shape a track can
         take.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
 
     .. rubric:: Implementation notes
 

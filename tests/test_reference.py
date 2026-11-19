@@ -53,6 +53,101 @@ def _forget_cached_lengths():
     reference.clear_cache()
 
 
+def test_require_reference_should_raise_file_not_found_error_when_nothing_is_there(
+    tmp_path,
+):
+    """Test the one refusal of a missing reference.
+
+    Given:
+        A path at which nothing exists.
+    When:
+        It is required to be a reference.
+    Then:
+        It should raise `FileNotFoundError` naming the path.
+    """
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
+        reference.require_reference(str(tmp_path / "missing.fa"))
+
+
+def test_require_reference_should_pass_a_path_at_which_a_file_exists(tmp_path):
+    """Test that the refusal is of absence alone.
+
+    Given:
+        A file that exists, whatever it holds.
+    When:
+        It is required to be a reference.
+    Then:
+        It should raise nothing, leaving what the file holds to the
+        reader that opens it.
+    """
+
+    # Arrange
+    path = tmp_path / "genome.fa"
+    path.write_text("not a FASTA")
+
+    # Act
+    answered = reference.require_reference(str(path))
+
+    # Assert
+    assert answered is None
+
+
+def test_require_reference_should_raise_file_not_found_error_through_a_file(tmp_path):
+    """Test that a path running through a file is a missing reference.
+
+    Given:
+        A path whose parent is a regular file, so nothing can exist at
+        it.
+    When:
+        It is required to be a reference.
+    Then:
+        It should raise `FileNotFoundError` naming the path, not the
+        `NotADirectoryError` the operating system reports.
+    """
+
+    # Arrange
+    parent = tmp_path / "genome.fa"
+    parent.write_text(">chr1\nACGT\n")
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match=r"x\.fa is not a reference"):
+        reference.require_reference(str(parent / "x.fa"))
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root searches any directory"
+)
+def test_chrom_lengths_should_raise_os_error_when_the_reference_cannot_be_examined(
+    tmp_path,
+):
+    """Test that a reference that cannot be examined is not called missing.
+
+    Given:
+        A reference inside a directory whose permissions forbid
+        searching it.
+    When:
+        Its contig lengths are read.
+    Then:
+        It should raise an `OSError` that is not a `FileNotFoundError`.
+    """
+
+    # Arrange
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    builders.write_fasta(str(locked / "genome.fa"), TWO_CONTIGS, index=True)
+    locked.chmod(0)
+
+    # Act & assert
+    try:
+        with pytest.raises(OSError) as caught:
+            reference.chrom_lengths(str(locked / "genome.fa"))
+        assert not isinstance(caught.value, FileNotFoundError)
+    finally:
+        locked.chmod(0o700)
+
+
 def test_chrom_lengths_should_report_each_contig_at_its_declared_length(
     reference_fasta,
 ):
@@ -175,6 +270,27 @@ def test_chrom_lengths_should_raise_type_error_for_an_in_memory_mapping():
     # Act & assert
     with pytest.raises(TypeError, match="dict"):
         reference.chrom_lengths(dict(TWO_CONTIGS))
+
+
+def test_chrom_lengths_should_raise_file_not_found_error_when_the_reference_is_missing(
+    tmp_path, recwarn
+):
+    """Test the refusal for a reference that is not there.
+
+    Given:
+        A path at which there is no reference.
+    When:
+        Its contig lengths are read.
+    Then:
+        It should raise `FileNotFoundError` naming the path, without
+        first warning of a scan, rather than fail in the engine's
+        words.
+    """
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
+        reference.chrom_lengths(str(tmp_path / "missing.fa"))
+    assert not [caught for caught in recwarn.list if "scanning" in str(caught.message)]
 
 
 def test_chrom_lengths_should_reread_when_the_fasta_path_changes(corpus_factory):

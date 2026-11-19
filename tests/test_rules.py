@@ -387,15 +387,45 @@ class TestExclusion:
         When:
             The outer `Exclusion` is constructed.
         Then:
-            It should raise `TypeError` telling the caller to list both.
+            It should raise `TypeError` telling the caller to pass the
+            rules side by side.
         """
 
         # Arrange
         inner = Exclusion("a.bed")
 
         # Act & assert
-        with pytest.raises(TypeError, match="Pass both in a list"):
+        with pytest.raises(
+            TypeError,
+            match=r"Pass the rules side by side, as \[Exclusion\(a\), Exclusion\(b\)\]",
+        ):
             Exclusion(inner, end_padding=1)
+
+    @pytest.mark.parametrize("container", [list, tuple])
+    def test___init___should_raise_type_error_when_the_regions_hold_an_exclusion(
+        self, container
+    ):
+        """Test the refusal of a rule nested among the regions of another.
+
+        Given:
+            A `list` or `tuple` of regions holding a path and an
+            `Exclusion`.
+        When:
+            An `Exclusion` is constructed over them.
+        Then:
+            It should raise `TypeError` with the message the top-level
+            nesting gets, rather than fail when the regions are read.
+        """
+
+        # Arrange
+        regions = container(["b.bed", Exclusion("a.bed")])
+
+        # Act & assert
+        with pytest.raises(
+            TypeError,
+            match=r"Pass the rules side by side, as \[Exclusion\(a\), Exclusion\(b\)\]",
+        ):
+            Exclusion(regions)
 
     def test___eq___should_compare_by_identity(self):
         """Test that two rules with equal fields are not equal.

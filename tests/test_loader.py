@@ -31,6 +31,7 @@ import hashlib
 import math
 import os
 import sys
+import types
 import weakref
 from types import MappingProxyType
 
@@ -47,6 +48,7 @@ from quadrat.rules import Exclusion, Jitter
 from tests import (
     CONFIG_IDS,
     GOLDEN_CONFIGS,
+    NOT_PARQUET,
     SPLICED_READS,
     WORKER_TIMEOUT,
     before_92,
@@ -616,6 +618,99 @@ def test_sample_nbytes_should_count_the_bytes_of_a_collated_sample(
 
 
 @pytest.mark.parametrize(
+    "field",
+    [
+        "n_draws",
+        "batch_size",
+        "num_workers",
+        "bytes_per_sample",
+        "prefetch_factor",
+        "max_fetch_bytes",
+    ],
+)
+def test_auto_fetch_size_should_raise_type_error_when_an_argument_is_a_bool(field):
+    """Test the integer rule on every argument of the fetch-size choice.
+
+    Given:
+        Valid arguments with one of them replaced by ``True``.
+    When:
+        A fetch size is chosen.
+    Then:
+        It should raise `TypeError` naming the argument, rather than
+        read ``True`` as one.
+    """
+
+    # Arrange
+    arguments = dict(
+        n_draws=104748,
+        batch_size=64,
+        num_workers=8,
+        bytes_per_sample=1,
+        prefetch_factor=2,
+        max_fetch_bytes=10**9,
+    )
+    arguments[field] = True
+
+    # Act & assert
+    with pytest.raises(TypeError, match="{} must be an integer".format(field)):
+        loader.auto_fetch_size(**arguments)
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_auto_fetch_size_should_take_the_prefetch_factor_a_loader_holds(num_workers):
+    """Test that the prefetch depth is taken as `torch.utils.data.DataLoader` holds it.
+
+    Given:
+        A loader with no workers, which holds ``prefetch_factor=None``,
+        and one with two, which holds torch's default.
+    When:
+        A fetch size is chosen from that loader's own ``num_workers``
+        and ``prefetch_factor``.
+    Then:
+        It should accept what the loader holds, ``None`` included, and
+        answer what a depth of ``2`` answers for that loader.
+    """
+
+    # Arrange
+    held = torch.utils.data.DataLoader(range(4), num_workers=num_workers)
+
+    # Act
+    chosen = loader.auto_fetch_size(
+        104748, 64, held.num_workers, 1, prefetch_factor=held.prefetch_factor
+    )
+
+    # Assert
+    assert chosen == loader.auto_fetch_size(
+        104748, 64, num_workers, 1, prefetch_factor=2
+    )
+
+
+def test_auto_fetch_size_should_read_a_none_prefetch_factor_as_two():
+    """Test the depth a ``None`` prefetch factor stands for.
+
+    Given:
+        Workers, and an epoch long enough that the fetch size depends
+        on how many fetches each worker keeps ready.
+    When:
+        A fetch size is chosen with ``prefetch_factor=None``.
+    Then:
+        It should equal the choice at a depth of ``2``, torch's
+        default, and differ from the choice at a depth of ``1``.
+    """
+
+    # Arrange
+    shape = dict(n_draws=10**7, batch_size=64, num_workers=2, bytes_per_sample=1)
+    shape["max_fetch_bytes"] = 10**12
+
+    # Act
+    chosen = loader.auto_fetch_size(prefetch_factor=None, **shape)
+
+    # Assert
+    assert chosen == loader.auto_fetch_size(prefetch_factor=2, **shape)
+    assert chosen != loader.auto_fetch_size(prefetch_factor=1, **shape)
+
+
+@pytest.mark.parametrize(
     "n_draws,num_workers,bytes_per_sample",
     [(104748, 0, 1), (0, 8, 1), (500, 8, 1), (104748, 8, 10**7)],
     ids=["no_workers", "no_draws", "too_few_batches", "one_batch_at_the_ceiling"],
@@ -841,6 +936,73 @@ class TestRechunkedLoader:
         # Act & assert
         with pytest.raises(ValueError, match="drop_last"):
             loader.RechunkedLoader(inner, 4)
+
+    @pytest.mark.parametrize("batch_size", [True, 4.0], ids=repr)
+    def test___init___should_raise_type_error_when_the_batch_is_not_an_integer(
+        self, batch_size
+    ):
+        """Test the integer rule on the consumer's batch.
+
+        Given:
+            A loader fetching eight samples, and ``True`` or ``4.0`` as
+            the batch size.
+        When:
+            The loader is wrapped.
+        Then:
+            It should raise `TypeError` naming ``batch_size``, rather
+            than slice batches of one or of a float.
+        """
+
+        # Arrange
+        inner, _ = recording_loader(16, 8)
+
+        # Act & assert
+        with pytest.raises(TypeError, match="batch_size must be an integer"):
+            loader.RechunkedLoader(inner, batch_size)
+
+    def test___init___should_raise_type_error_when_the_fetch_is_not_an_integer(self):
+        """Test the integer rule on the wrapped loader's batch, the fetch.
+
+        Given:
+            A stand-in loader whose ``batch_size`` is ``True`` and that
+            keeps its last fetch.
+        When:
+            It is wrapped at a batch of one.
+        Then:
+            It should raise `TypeError` naming the wrapped loader's
+            ``batch_size``.
+        """
+
+        # Arrange
+        inner = types.SimpleNamespace(batch_size=True, drop_last=False)
+
+        # Act & assert
+        with pytest.raises(
+            TypeError, match="the wrapped loader's batch_size must be an integer"
+        ):
+            loader.RechunkedLoader(inner, 1)
+
+    def test___init___should_hold_numpy_integers_as_ints(self):
+        """Test that the two sizes are held as plain integers.
+
+        Given:
+            A stand-in loader fetching ``numpy.int64(12)`` samples, wrapped
+            at a batch of ``numpy.int64(4)``.
+        When:
+            The wrapper's sizes are read.
+        Then:
+            It should hold both as plain `int`.
+        """
+
+        # Arrange
+        inner = types.SimpleNamespace(batch_size=numpy.int64(12), drop_last=False)
+
+        # Act
+        wrapped = loader.RechunkedLoader(inner, numpy.int64(4))
+
+        # Assert
+        assert (wrapped.batch_size, wrapped.fetch_size) == (4, 12)
+        assert (type(wrapped.batch_size), type(wrapped.fetch_size)) == (int, int)
 
     def test___init___should_record_the_two_sizes(self):
         """Test the sizes a wrapper reports.
@@ -1557,7 +1719,16 @@ def test_build_training_loader_should_raise_when_ranks_share_no_seed(corpus):
             ValueError,
             "fetch_size must be a positive whole multiple of the 4 samples",
         ),
-        ({"fetch_size": float(BATCH_SIZE)}, ValueError, "fetch_size must be a positive"),
+        ({"fetch_size": float(BATCH_SIZE)}, TypeError, "fetch_size must be an integer"),
+        ({"fetch_size": True}, TypeError, "fetch_size must be an integer"),
+        ({"batch_size": True}, TypeError, "batch_size must be an integer"),
+        ({"rank": True, "world_size": 1}, TypeError, "rank must be an integer"),
+        ({"world_size": 2.0, "rank": 0}, TypeError, "world_size must be an integer"),
+        ({"random_state": True}, TypeError, "random_state must be an integer"),
+        ({"in_window": True}, TypeError, "in_window must be an integer"),
+        ({"out_window": 30.0}, TypeError, "out_window must be an integer"),
+        ({"num_workers": True}, TypeError, "num_workers must be an integer"),
+        ({"max_fetch_bytes": True}, TypeError, "max_fetch_bytes must be an integer"),
         ({"signals": [[]]}, ValueError, "a signal group is empty"),
         ({"cache_residency": "bogus"}, ValueError, "residency must be one of"),
         ({"num_workers": -1}, ValueError, "num_workers option should be non-negative"),
@@ -1614,6 +1785,70 @@ def test_build_training_loader_should_refuse_an_argument_before_building(
     # Assert
     assert not os.path.exists(fasta + ".fai")
     assert not any(cache_dir.iterdir())
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["unkeyed", "keyed"])
+def test_build_training_loader_should_raise_file_not_found_error_when_the_reference_is_missing(
+    corpus, tmp_path, keyed
+):
+    """Test the refusal of a reference that is not there.
+
+    Given:
+        The corpus's loci and tracks, a path at which there is no
+        reference, and either no cache or an empty cache directory.
+    When:
+        The loader is built.
+    Then:
+        It should raise `FileNotFoundError` naming the path and saying
+        it is not a reference, as every reader of a reference does, and
+        leave the cache directory empty.
+    """
+
+    # Arrange
+    entries = tmp_path / "entries"
+    entries.mkdir()
+    cache_dir = str(entries) if keyed else False
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
+        loader.build_training_loader(
+            **arguments(
+                corpus, sequences=str(tmp_path / "missing.fa"), cache_dir=cache_dir
+            )
+        )
+    assert not any(entries.iterdir())
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["unkeyed", "keyed"])
+def test_build_training_loader_should_raise_when_a_signal_track_is_not_parquet(
+    corpus, tmp_path, keyed
+):
+    """Test that a file that is no track is refused by name.
+
+    Given:
+        The corpus's loci, a signal track that begins as a bigWig does,
+        and either no cache or an empty cache directory.
+    When:
+        The loader is built.
+    Then:
+        It should raise `ValueError` naming the file and saying it is
+        not a track, rather than fail later in polars' words, and leave
+        the cache directory empty.
+    """
+
+    # Arrange
+    track = tmp_path / "signal.bw"
+    track.write_bytes(NOT_PARQUET["bigwig"])
+    entries = tmp_path / "entries"
+    entries.mkdir()
+    cache_dir = str(entries) if keyed else False
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"signal\.bw is not a track"):
+        loader.build_training_loader(
+            **arguments(corpus, signals=[str(track)], cache_dir=cache_dir)
+        )
+    assert not any(entries.iterdir())
 
 
 @pytest.mark.parametrize("fetch_size", [0, BATCH_SIZE + 2, BATCH_SIZE // 2])

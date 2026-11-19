@@ -16,6 +16,8 @@ marker and none is re-exported from `quadrat`.
 import dataclasses
 import numbers
 
+from quadrat._engine import item_list, require_integer
+
 #: Width of the bins an `Exclusion` tests on by default, in bases.
 EXCLUSION_BIN_WIDTH = 100
 
@@ -43,8 +45,8 @@ class Jitter:
 
     :param low: The smallest shift, in bases.
     :param high: The largest shift, in bases.
-    :raises TypeError: if either bound is not an integer, a `bool`
-        included.
+    :raises TypeError: if either bound is not an integer as
+        `quadrat._engine.require_integer` takes one.
     :raises ValueError: if ``low`` is above ``high``.
     """
 
@@ -53,17 +55,9 @@ class Jitter:
 
     def __post_init__(self):
         for name in ("low", "high"):
-            value = getattr(self, name)
-            # `bool` is an `Integral`, and `True` read as one base is
-            # the mistake this exists to refuse.
-            if not isinstance(value, numbers.Integral) or isinstance(value, bool):
-                raise TypeError(
-                    "Jitter.{} must be an integer, got {}.".format(
-                        name, type(value).__name__
-                    )
-                )
             # Normalized so a numpy integer pickles and keys as one.
-            object.__setattr__(self, name, int(value))
+            value = require_integer("Jitter." + name, getattr(self, name))
+            object.__setattr__(self, name, value)
         if self.low > self.high:
             raise ValueError(
                 "Jitter draws shifts from low through high, so low must not "
@@ -116,7 +110,8 @@ class Exclusion:
     a frame it holds can still be changed. It cannot be subclassed:
     its readers trust its fields as validated. ``bin_width`` and
     ``end_padding`` are held as `int` whatever integer type was given.
-    The regions are checked where they are read, not here.
+    The regions are checked where they are read, except that an
+    `Exclusion` among them is refused here.
 
     :param regions: The excluded regions, in any shape
         `quadrat.loci.load_windows` takes loci in. A `list` is held as a
@@ -125,8 +120,8 @@ class Exclusion:
     :param end_padding: Bases added to every interval's end before it
         is binned.
     :raises TypeError: if ``bin_width`` or ``end_padding`` is not an
-        integer, a `bool` included, or if ``regions`` is an
-        `Exclusion`.
+        integer as `quadrat._engine.require_integer` takes one, or if ``regions`` is an
+        `Exclusion` or a `list` or `tuple` holding one.
     :raises ValueError: if ``bin_width`` is below ``1`` or
         ``end_padding`` below ``0``.
     """
@@ -136,28 +131,23 @@ class Exclusion:
     end_padding: int = 0
 
     def __post_init__(self):
-        if isinstance(self.regions, Exclusion):
+        if any(isinstance(region, Exclusion) for region in item_list(self.regions)):
             raise TypeError(
                 "Exclusion.regions is the regions themselves, and got an "
-                "Exclusion. Pass both in a list to apply both rules."
+                "Exclusion among them. Pass the rules side by side, as "
+                "[Exclusion(a), Exclusion(b)], to apply both."
             )
         if isinstance(self.regions, list):
             object.__setattr__(self, "regions", tuple(self.regions))
         for name, floor in (("bin_width", 1), ("end_padding", 0)):
-            value = getattr(self, name)
-            if not isinstance(value, numbers.Integral) or isinstance(value, bool):
-                raise TypeError(
-                    "Exclusion.{} must be an integer, got {}.".format(
-                        name, type(value).__name__
-                    )
-                )
+            value = require_integer("Exclusion." + name, getattr(self, name))
             if value < floor:
                 raise ValueError(
                     "Exclusion.{} must be at least {}, got {}.".format(
                         name, floor, value
                     )
                 )
-            object.__setattr__(self, name, int(value))
+            object.__setattr__(self, name, value)
 
     def __init_subclass__(cls, **kwargs):
         raise TypeError(

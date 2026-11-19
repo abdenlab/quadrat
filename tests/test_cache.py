@@ -357,6 +357,34 @@ def test_require_index_should_refuse_an_index_out_of_range(kind, data, size):
         cache.require_index("row", kind(index), size, "the rows")
 
 
+@settings(deadline=None, max_examples=200)
+@given(
+    value=st.one_of(
+        st.integers(0, 2**70),
+        st.integers(0, 2**63 - 1).map(numpy.int64),
+        st.integers(0, 2**31 - 1).map(numpy.int32),
+    )
+)
+def test_require_index_should_answer_any_integer_as_an_equal_int(value):
+    """Test the integer rule on every integer it admits.
+
+    Given:
+        Any non-negative Python integer, past any fixed width included,
+        and any numpy ``int64`` or ``int32``.
+    When:
+        It is required to index more rows than any value drawn.
+    Then:
+        It should be answered equal, as a plain `int`.
+    """
+
+    # Act
+    answered = cache.require_index("row", value, 2**71)
+
+    # Assert
+    assert answered == value
+    assert type(answered) is int
+
+
 @pytest.mark.parametrize("index", [True, numpy.bool_(False), 1.0, "1"], ids=repr)
 def test_require_index_should_raise_type_error_when_not_an_integer(index):
     """Test the integer rule on values that are not integers.
@@ -364,33 +392,15 @@ def test_require_index_should_raise_type_error_when_not_an_integer(index):
     Given:
         A ``bool``, a numpy ``bool``, a float and a string.
     When:
-        Each is required to be an index, with no row count.
+        Each is required to index ten rows.
     Then:
-        It should raise `TypeError` naming the label.
+        It should raise `TypeError` naming the label, before the range
+        is tested.
     """
 
     # Act & assert
     with pytest.raises(TypeError, match="row must be an integer"):
-        cache.require_index("row", index)
-
-
-@pytest.mark.parametrize("index", [-5, 0, 2**70], ids=repr)
-def test_require_index_should_answer_any_integer_when_given_no_size(index):
-    """Test the integer rule alone.
-
-    Given:
-        A negative integer, zero, and one past any row count.
-    When:
-        Each is required to be an index with no row count.
-    Then:
-        It should be answered unchanged.
-    """
-
-    # Act
-    answered = cache.require_index("row", index)
-
-    # Assert
-    assert answered == index
+        cache.require_index("row", index, 10)
 
 
 def test_require_index_should_leave_the_rows_unnamed_when_of_is_none():
@@ -2925,6 +2935,61 @@ class TestWindowSignalCache:
         # Assert
         assert built.n_channels == 2
         assert tuple(built.window(0, 0, 8).shape) == (2, 8)
+
+    @pytest.mark.parametrize("residency", ["memory", "mapped", "adopted"])
+    @pytest.mark.parametrize("n_windows", [0, 1, 3])
+    def test_n_windows_should_count_the_windows_it_was_built_for(
+        self, tmp_path, n_windows, residency
+    ):
+        """Test the window count a reader checks a cache against.
+
+        Given:
+            Grouped arrays over no, one or three windows, none holding
+            a row, held in memory, memory-mapped, or written as an
+            entry and adopted.
+        When:
+            A cache is made from them and its window count read.
+        Then:
+            It should be the number of windows, whatever the residency.
+        """
+
+        # Arrange
+        grouped = builders.empty_grouped(n_windows)
+        if residency == "adopted":
+            root = str(tmp_path / "entry")
+            os.makedirs(root)
+            cache.write_cache_arrays(root, *grouped[:4])
+
+        # Act
+        if residency == "adopted":
+            made = cache.WindowSignalCache.adopt(root, 1, cache.array_meta(grouped))
+        else:
+            made = cache.WindowSignalCache.from_arrays(grouped, residency=residency)
+
+        # Assert
+        assert made.n_windows == n_windows
+
+    def test_n_windows_should_count_the_arrays_of_a_cache_built_with_no_meta(self):
+        """Test the count of a cache constructed directly.
+
+        Given:
+            Grouped arrays over three windows, handed to the
+            constructor with no ``meta``.
+        When:
+            Its window count is read.
+        Then:
+            It should be three, counted from the arrays, rather than
+            fail on the missing record.
+        """
+
+        # Arrange
+        offsets, pos, val, chan, n_channels = builders.empty_grouped(3)
+
+        # Act
+        made = cache.WindowSignalCache(offsets, pos, val, chan, n_channels=n_channels)
+
+        # Assert
+        assert made.n_windows == 3
 
     @pytest.mark.parametrize("residency", ["memory", "mapped"])
     def test_meta_should_report_what_the_arrays_hold(self, tracks, residency):

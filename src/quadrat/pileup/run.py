@@ -168,6 +168,10 @@ def pileup_many(
         ``aggregate`` that is not an `Aggregate`.
     :raises KeyError: before any job runs, if a job lacks
         ``alignments``, ``sequences`` or ``name``.
+    :raises FileNotFoundError: from a job whose reference
+        `pileup_alignments` refuses as missing.
+    :raises OSError: from a job whose reference `pileup_alignments`
+        cannot examine.
     """
 
     if backend is not None and runner is not None:
