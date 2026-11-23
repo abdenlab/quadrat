@@ -193,6 +193,10 @@ def pileup_alignments(
         first contig batch holding such a record has been grouped,
         before any table is committed; pass ``spliced=True`` to cover
         such records with their skipped runs left out.
+    :raises FileNotFoundError: For a reference `quadrat.chrom_lengths`
+        refuses as missing, before any alignment is read.
+    :raises OSError: For a reference `quadrat.chrom_lengths` cannot
+        examine, likewise.
 
     .. rubric:: Implementation notes
 

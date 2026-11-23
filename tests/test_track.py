@@ -2307,6 +2307,30 @@ def test_pileup_alignments_should_propagate_an_interrupt_from_the_engine(
         )
 
 
+def test_pileup_alignments_should_raise_file_not_found_error_when_the_reference_is_missing(
+    tmp_path, shifted_pair
+):
+    """Test the refusal of a reference that is not there.
+
+    Given:
+        Real alignments and a path at which there is no reference.
+    When:
+        A pileup runs.
+    Then:
+        It should raise `FileNotFoundError` naming the path and saying
+        it is not a reference, as every reader of a reference does.
+    """
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
+        pileup_pkg.pileup_alignments(
+            shifted_pair.bams,
+            str(tmp_path / "missing.fa"),
+            str(tmp_path / "out"),
+            aggregate=UNSTRANDED,
+        )
+
+
 def test_pileup_alignments_should_raise_when_the_partition_count_is_not_a_number(
     tmp_path, shifted_pair
 ):

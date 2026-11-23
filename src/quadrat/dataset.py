@@ -10,6 +10,7 @@ imports ``torch``, which `import quadrat` does not.
 import numpy
 import torch
 
+from quadrat._engine import require_integer
 from quadrat.cache import joint_windows, require_index, require_windows
 from quadrat.groups import channel_permutation_from_groups
 from quadrat.sampling import LocusDraw, PeakNegativeMixSampler
@@ -25,8 +26,9 @@ class LocusDataset(torch.utils.data.Dataset):
     integer is named as such, since it says neither which locus set
     to read from nor which epoch's plan.
 
-    A pair's epoch and slot and a draw's ``index`` are integers as
-    `quadrat.cache.require_index` takes them, and anything else raises
+    A pair's epoch is an integer as `quadrat._engine.require_integer`
+    takes one, and its slot and a draw's ``index`` are integers as
+    `quadrat.cache.require_index` takes them; anything else raises
     `TypeError`. The epoch is planned as given. A slot outside the
     plan, or a draw's ``index`` outside the set its ``is_peak`` picks,
     raises `IndexError` rather than reading from the end.
@@ -82,15 +84,18 @@ class LocusDataset(torch.utils.data.Dataset):
         answering ``window(chrom, start, end)`` as
         `quadrat.stores.SequenceStore` does.
     :param signal_cache: The signal reader, i.e., anything answering
-        ``n_channels`` and ``window(index, jitter, length,
+        ``n_channels``, ``n_windows`` and ``window(index, jitter, length,
         reverse_complement, perm)`` as `quadrat.cache.WindowSignalCache`
         does, built over the `quadrat.cache.joint_windows` of the two
-        frames between their ``sig_start`` and ``sig_end``.
-    :param in_window: The input window's width, in bases.
-    :param out_window: The output window's width, in bases.
+        frames between their ``sig_start`` and ``sig_end``. Kept as the
+        read-only attribute of the same name.
+    :param in_window: The input window's width, in bases, kept as the
+        read-only attribute of the same name.
+    :param out_window: The output window's width, in bases, kept
+        likewise.
     :param control_cache: The control reader, of the same form, built
         over the same windows between ``in_start`` and ``in_end``, or
-        ``None`` for no controls.
+        ``None`` for no controls, kept likewise.
     :param signal_groups: The size of every signal group in channel
         order, as `quadrat.groups.validate_signal_groups` accepts
         them, or ``None`` to leave the channels alone under a mirror.
@@ -106,12 +111,18 @@ class LocusDataset(torch.utils.data.Dataset):
         ``None``. An attribute of the same name, which may be assigned
         later and is checked as it is here.
     :raises TypeError: if either window frame is not a
-        `polars.DataFrame`; if ``sampler`` is neither ``None`` nor a
+        `polars.DataFrame`; if ``in_window`` or ``out_window`` is not an
+        integer as `quadrat._engine.require_integer` takes one; if
+        ``sampler`` is neither ``None`` nor a
         `quadrat.sampling.PeakNegativeMixSampler`; or for a grouping
         `quadrat.groups.validate_signal_groups` refuses by type.
     :raises ValueError: if ``peak_windows`` is empty; if
-        ``control_groups`` is given without ``control_cache``; if a
-        grouping's sizes do not sum to its cache's ``n_channels``; if
+        ``control_groups`` is given without ``control_cache``; if
+        ``signal_cache`` is ``None``; if a
+        grouping's sizes do not sum to its cache's ``n_channels``; if a
+        cache's ``n_windows`` is not the two frames' rows combined (a
+        cache over other windows of the same count is not refused, no
+        count being able to tell it apart); if
         ``sampler`` draws from another number of peaks or negatives
         than the frames hold; or for a grouping
         `quadrat.groups.validate_signal_groups` refuses by value.
@@ -143,7 +154,11 @@ class LocusDataset(torch.utils.data.Dataset):
     A sampler is refused where it is given, rather than at the first
     ``(epoch, index)`` pair, which would fail inside a loader worker far
     from the mistake, or, for a sampler sized for other windows, not
-    fail at all: it would read negatives as peaks and label them so.
+    fail at all: it would read negatives as peaks and label them so. A
+    cache over another number of windows is refused here for the same
+    reason: one over more windows answers whatever window its row names
+    there, which need not be this dataset's, and one over fewer can
+    misread before it fails at the first read past its end.
     """
 
     def __init__(
@@ -165,12 +180,17 @@ class LocusDataset(torch.utils.data.Dataset):
             raise ValueError("peak_windows is empty; there is nothing to draw from")
         if control_groups is not None and control_cache is None:
             raise ValueError("control_groups was supplied but control_cache is None")
+        if signal_cache is None:
+            raise ValueError(
+                "LocusDataset reads signal through signal_cache, and none was "
+                "given; build one over joint_windows of the two frames."
+            )
 
         self.sequence_store = sequence_store
-        self.signal_cache = signal_cache
-        self.control_cache = control_cache
-        self.in_window = in_window
-        self.out_window = out_window
+        self._signal_cache = signal_cache
+        self._control_cache = control_cache
+        self._in_window = require_integer("in_window", in_window)
+        self._out_window = require_integer("out_window", out_window)
         self.signal_groups, self.signal_perm = _grouping(
             "signal_groups", signal_groups, signal_cache
         )
@@ -180,6 +200,23 @@ class LocusDataset(torch.utils.data.Dataset):
 
         self._n_peaks = len(peak_windows)
         self._n_negatives = len(negative_windows)
+        # Refused here for the reason in the notes.
+        readers = [("signal_cache", signal_cache)]
+        if control_cache is not None:
+            readers.append(("control_cache", control_cache))
+        for label, reader in readers:
+            if reader.n_windows != self._n_peaks + self._n_negatives:
+                raise ValueError(
+                    "LocusDataset holds {} peaks and {} negatives, {} windows "
+                    "in all, and its {} was built for {}; build the cache over "
+                    "joint_windows of the same frames.".format(
+                        self._n_peaks,
+                        self._n_negatives,
+                        self._n_peaks + self._n_negatives,
+                        label,
+                        reader.n_windows,
+                    )
+                )
         self.sampler = sampler
         windows = joint_windows(peak_windows, negative_windows)
         names, codes = numpy.unique(windows["chrom"].to_numpy(), return_inverse=True)
@@ -204,7 +241,9 @@ class LocusDataset(torch.utils.data.Dataset):
                     "index it with a LocusDraw."
                 )
             epoch, slot = draw
-            plan = self.sampler.plan(require_index("(epoch, index) pair's epoch", epoch))
+            plan = self.sampler.plan(
+                require_integer("(epoch, index) pair's epoch", epoch)
+            )
             slot = require_index(
                 "(epoch, index) pair's index",
                 slot,
@@ -271,6 +310,30 @@ class LocusDataset(torch.utils.data.Dataset):
         """Return how many negatives there are to draw from."""
 
         return self._n_negatives
+
+    @property
+    def in_window(self):
+        """Return the input window's width, in bases, fixed at construction."""
+
+        return self._in_window
+
+    @property
+    def out_window(self):
+        """Return the output window's width, in bases, fixed at construction."""
+
+        return self._out_window
+
+    @property
+    def signal_cache(self):
+        """Return the signal reader, fixed at construction."""
+
+        return self._signal_cache
+
+    @property
+    def control_cache(self):
+        """Return the control reader, or ``None``, fixed at construction."""
+
+        return self._control_cache
 
     @property
     def sampler(self):

@@ -33,6 +33,7 @@ from tangermeme.io import extract_loci as tangermeme_extract_loci
 from quadrat import loci
 from quadrat.rules import Exclusion, Jitter
 from tests import (
+    NOT_PARQUET,
     TWO_CONTIGS,
     UNREADABLE_IDS,
     UNREADABLE_RECORDS,
@@ -998,6 +999,33 @@ def test_load_windows_should_raise_type_error_when_sequences_is_no_path(corpus):
     # Act & assert
     with pytest.raises(TypeError, match="got dict"):
         loci.load_windows(corpus.peaks, {"chr1": "ACGT"}, 60, 30)
+
+
+@pytest.mark.parametrize(
+    "label,widths",
+    [("in_window", (True, 30)), ("out_window", (60, True)), ("in_window", (60.0, 30))],
+    ids=["in-bool", "out-bool", "in-float"],
+)
+def test_load_windows_should_raise_type_error_when_a_width_is_not_an_integer(
+    corpus, label, widths
+):
+    """Test the integer rule on the two window widths.
+
+    Given:
+        The module's peaks, with ``True`` or a float as one width.
+    When:
+        Their windows are loaded.
+    Then:
+        It should raise `TypeError` naming the width, rather than build
+        one-base windows or float bounds.
+    """
+
+    # Arrange
+    in_window, out_window = widths
+
+    # Act & assert
+    with pytest.raises(TypeError, match="{} must be an integer".format(label)):
+        loci.load_windows(corpus.peaks, corpus.fasta, in_window, out_window)
 
 
 def test_load_windows_should_raise_file_not_found_error_when_the_reference_is_missing(
@@ -3132,7 +3160,7 @@ def test_extract_sequences_should_count_the_unknown_contigs_it_does_not_list(cor
         loci.extract_sequences(windows, corpus.fasta)
 
 
-def test_extract_sequences_should_raise_os_error_when_the_reference_is_missing(
+def test_extract_sequences_should_raise_file_not_found_error_when_the_reference_is_missing(
     tmp_path,
 ):
     """Test the refusal for a reference that is not there.
@@ -3142,14 +3170,15 @@ def test_extract_sequences_should_raise_os_error_when_the_reference_is_missing(
     When:
         Its sequence is extracted.
     Then:
-        It should raise `OSError` naming the path.
+        It should raise `FileNotFoundError` naming the path, as
+        `load_windows` does.
     """
 
     # Arrange
     windows = window_frame([("chr1", 0, 8)], ("in_start", "in_end"))
 
     # Act & assert
-    with pytest.raises(OSError, match=r"missing\.fa"):
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
         loci.extract_sequences(windows, str(tmp_path / "missing.fa"))
 
 
@@ -3822,7 +3851,7 @@ def test_extract_loci_should_raise_os_error_rather_than_scan_an_unindexable_refe
     assert "samtools faidx" in message
 
 
-def test_extract_loci_should_raise_os_error_when_the_reference_is_missing(
+def test_extract_loci_should_raise_file_not_found_error_when_the_reference_is_missing(
     tmp_path, recwarn
 ):
     """Test the refusal for a reference that is not there.
@@ -3832,15 +3861,16 @@ def test_extract_loci_should_raise_os_error_when_the_reference_is_missing(
     When:
         The locus is extracted.
     Then:
-        It should raise `OSError` naming the path, without first
-        warning of a scan for the reference's lengths.
+        It should raise `FileNotFoundError` naming the path, as
+        `load_windows` does, without first warning of a scan for the
+        reference's lengths.
     """
 
     # Arrange
     locus = pandas.DataFrame([("chr1", 100, 140)])
 
     # Act & assert
-    with pytest.raises(OSError, match=r"missing\.fa"):
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
         loci.extract_loci(locus, str(tmp_path / "missing.fa"), 60)
     assert not [caught for caught in recwarn.list if "scanning" in str(caught.message)]
 
@@ -3915,26 +3945,56 @@ def test_extract_loci_should_raise_when_target_idx_names_no_signal_track(
         )
 
 
-def test_extract_loci_should_read_no_channel_from_an_empty_signal_list(corpus, engine):
-    """Test that an empty signal list leaves the default index unrefused.
+def test_extract_loci_should_raise_before_reading_when_a_track_is_not_parquet(
+    corpus, tmp_path
+):
+    """Test that a file that is no track is refused before the reference is opened.
 
     Given:
-        The module's peaks, an empty list of signal tracks, an output
-        window and no count threshold.
+        The module's peaks, a reference written without an index, and
+        a signal track that begins as a bigWig does.
     When:
-        The loci are extracted at the default ``target_idx``.
+        The loci are extracted.
     Then:
-        It should answer a signal tensor with one row per kept locus
-        and no channel, raising nothing.
+        It should raise `ValueError` naming the file and saying it is
+        not a track, and leave the reference unindexed.
     """
 
-    # Act
-    extracted = loci.extract_loci(
-        corpus.peaks, corpus.fasta, IN_WINDOW, OUT_WINDOW, signals=[]
-    )
+    # Arrange
+    fasta = builders.write_fasta(str(tmp_path / "genome.fa"), TWO_CONTIGS, index=False)
+    track = tmp_path / "signal.bw"
+    track.write_bytes(NOT_PARQUET["bigwig"])
 
-    # Assert
-    assert extracted.signals.shape == (int(extracted.kept.sum()), 0, OUT_WINDOW)
+    # Act & assert
+    with pytest.raises(ValueError, match=r"signal\.bw is not a track"):
+        loci.extract_loci(
+            corpus.peaks, fasta, IN_WINDOW, OUT_WINDOW, signals=[str(track)]
+        )
+    assert not os.path.exists(fasta + ".fai")
+
+
+@pytest.mark.parametrize("label", ["signals", "controls"])
+def test_extract_loci_should_raise_when_a_track_list_is_empty(corpus, label):
+    """Test that an empty track list is refused rather than read as no channel.
+
+    Given:
+        The module's peaks and an empty list given as ``signals`` or
+        as ``controls``.
+    When:
+        The loci are extracted.
+    Then:
+        It should raise `ValueError` naming the argument and saying to
+        pass ``None`` to read none.
+    """
+
+    # Arrange
+    given = {"signals": corpus.tracks[:1], label: []}
+
+    # Act & assert
+    with pytest.raises(
+        ValueError, match=r"`{0}` holds no track. Pass {0}=None".format(label)
+    ):
+        loci.extract_loci(corpus.peaks, corpus.fasta, IN_WINDOW, OUT_WINDOW, **given)
 
 
 def test_extract_loci_should_raise_when_a_residue_is_neither_encoded_nor_ignored(

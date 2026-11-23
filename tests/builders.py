@@ -14,6 +14,8 @@ import json
 import os
 import random
 
+import numpy
+
 try:
     import polars
 except ImportError:
@@ -348,6 +350,22 @@ def write_flat_track(path, rows):
 
     track_rows_frame(rows).write_parquet(str(path))
     return str(path)
+
+
+def empty_grouped(n_windows, n_channels=1):
+    """Return grouped arrays over ``n_windows`` windows holding no row.
+
+    The five values `quadrat.cache.group_track` returns, for a cache
+    whose window count matters and whose signal does not.
+    """
+
+    return (
+        numpy.zeros(n_windows + 1, dtype=numpy.int64),
+        numpy.zeros(0, dtype=numpy.int32),
+        numpy.zeros(0, dtype=numpy.float32),
+        numpy.zeros(0, dtype=numpy.int16),
+        n_channels,
+    )
 
 
 def intervals(chrom, start, stop, step, width):

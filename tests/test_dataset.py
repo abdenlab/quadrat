@@ -162,6 +162,20 @@ def piled(corpus_factory, pysam):
     return built
 
 
+def empty_cache(n_windows):
+    """Return a one-channel cache over ``n_windows`` windows holding no row."""
+
+    return cache.WindowSignalCache.from_arrays(
+        builders.empty_grouped(n_windows), residency="memory"
+    )
+
+
+def cache_for(peak_windows, negative_windows):
+    """Return an empty one-channel cache over the two frames' windows."""
+
+    return empty_cache(len(peak_windows) + len(negative_windows))
+
+
 def kept_windows(corpus):
     """Return the in-bounds peak and negative window frames of a corpus."""
 
@@ -335,7 +349,7 @@ class TestLocusDataset:
                 peak_windows,
                 negative_windows,
                 None,
-                None,
+                cache_for(peak_windows, negative_windows),
                 IN_WINDOW,
                 OUT_WINDOW,
                 control_groups=[2],
@@ -405,7 +419,7 @@ class TestLocusDataset:
                 peak_windows,
                 negative_windows,
                 None,
-                None,
+                cache_for(peak_windows, negative_windows),
                 IN_WINDOW,
                 OUT_WINDOW,
                 sampler=sampler,
@@ -443,10 +457,76 @@ class TestLocusDataset:
                 peak_windows,
                 negative_windows,
                 None,
-                None,
+                cache_for(peak_windows, negative_windows),
                 IN_WINDOW,
                 OUT_WINDOW,
                 sampler=sampler,
+            )
+
+    @pytest.mark.parametrize("extra", [1, -1], ids=["more", "fewer"])
+    def test___init___should_raise_when_the_signal_cache_holds_other_windows(
+        self, corpus, extra
+    ):
+        """Test the refusal of a signal cache built over another window count.
+
+        Given:
+            The kept windows and a signal cache over one window more,
+            or one fewer, than the two frames hold together.
+        When:
+            A dataset is constructed with it.
+        Then:
+            It should raise `ValueError` naming ``signal_cache``, the
+            dataset's window total and the cache's, rather than read
+            another window's signal or fail at the first read past the
+            end.
+        """
+
+        # Arrange
+        peak_windows, negative_windows = kept_windows(corpus)
+        total = len(peak_windows) + len(negative_windows)
+        match = r"{} windows in all, and its signal_cache was built for {};".format(
+            total, total + extra
+        )
+
+        # Act & assert
+        with pytest.raises(ValueError, match=match):
+            dataset.LocusDataset(
+                peak_windows,
+                negative_windows,
+                None,
+                empty_cache(total + extra),
+                IN_WINDOW,
+                OUT_WINDOW,
+            )
+
+    def test___init___should_raise_when_the_control_cache_holds_other_windows(
+        self, corpus
+    ):
+        """Test the refusal of a control cache built over another window count.
+
+        Given:
+            The kept windows, a signal cache over exactly them, and a
+            control cache over one window more.
+        When:
+            A dataset is constructed with them.
+        Then:
+            It should raise `ValueError` naming ``control_cache``.
+        """
+
+        # Arrange
+        peak_windows, negative_windows = kept_windows(corpus)
+        total = len(peak_windows) + len(negative_windows)
+
+        # Act & assert
+        with pytest.raises(ValueError, match="its control_cache was built for"):
+            dataset.LocusDataset(
+                peak_windows,
+                negative_windows,
+                None,
+                empty_cache(total),
+                IN_WINDOW,
+                OUT_WINDOW,
+                control_cache=empty_cache(total + 1),
             )
 
     def test___init___should_keep_the_groupings_it_was_given(self, controlled):
@@ -469,6 +549,55 @@ class TestLocusDataset:
         assert reported == ((1, 2), (2,))
         assert controlled.signal_perm.tolist() == [0, 2, 1]
         assert controlled.control_perm.tolist() == [1, 0]
+
+    @pytest.mark.parametrize("field", ["in_window", "out_window"])
+    def test___init___should_raise_type_error_when_a_width_is_not_an_integer(
+        self, corpus, field
+    ):
+        """Test the integer rule on the widths a dataset reads at.
+
+        Given:
+            The kept windows, with ``True`` as one width.
+        When:
+            A dataset is constructed.
+        Then:
+            It should raise `TypeError` naming the width.
+        """
+
+        # Arrange
+        peak_windows, negative_windows = kept_windows(corpus)
+        widths = {"in_window": IN_WINDOW, "out_window": OUT_WINDOW, field: True}
+
+        # Act & assert
+        with pytest.raises(TypeError, match="{} must be an integer".format(field)):
+            dataset.LocusDataset(
+                peak_windows,
+                negative_windows,
+                None,
+                cache_for(peak_windows, negative_windows),
+                **widths,
+            )
+
+    def test___init___should_raise_when_there_is_no_signal_cache(self, corpus):
+        """Test the refusal of a dataset with no signal reader.
+
+        Given:
+            The kept windows and ``None`` as the signal cache.
+        When:
+            A dataset is constructed.
+        Then:
+            It should raise `ValueError` naming ``signal_cache``, rather
+            than construct and fail at its first read.
+        """
+
+        # Arrange
+        peak_windows, negative_windows = kept_windows(corpus)
+
+        # Act & assert
+        with pytest.raises(ValueError, match="through signal_cache, and none was given"):
+            dataset.LocusDataset(
+                peak_windows, negative_windows, None, None, IN_WINDOW, OUT_WINDOW
+            )
 
     def test___init___should_accept_an_empty_negative_set(self, corpus):
         """Test a peak-only dataset.
@@ -533,7 +662,12 @@ class TestLocusDataset:
         # Arrange
         peak_windows, negative_windows = kept_windows(corpus)
         reader = dataset.LocusDataset(
-            peak_windows, negative_windows, None, None, IN_WINDOW, OUT_WINDOW
+            peak_windows,
+            negative_windows,
+            None,
+            cache_for(peak_windows, negative_windows),
+            IN_WINDOW,
+            OUT_WINDOW,
         )
 
         # Act & assert
@@ -560,7 +694,12 @@ class TestLocusDataset:
         # Arrange
         peak_windows, negative_windows = kept_windows(corpus)
         reader = dataset.LocusDataset(
-            peak_windows, negative_windows, None, None, IN_WINDOW, OUT_WINDOW
+            peak_windows,
+            negative_windows,
+            None,
+            cache_for(peak_windows, negative_windows),
+            IN_WINDOW,
+            OUT_WINDOW,
         )
         n_peaks = len(peak_windows) + extra_peaks
         n_negatives = len(negative_windows) + extra_negatives
@@ -572,6 +711,70 @@ class TestLocusDataset:
         # Act & assert
         with pytest.raises(ValueError, match=match):
             reader.sampler = sampler
+
+    def test_signal_cache_should_raise_attribute_error_when_assigned(self, plain):
+        """Test that the signal reader cannot be swapped past its check.
+
+        Given:
+            A dataset built over caches of its windows.
+        When:
+            Another cache is assigned to ``signal_cache``.
+        Then:
+            It should raise `AttributeError`, ``signal_cache`` being fixed at
+            construction.
+        """
+
+        # Act & assert
+        with pytest.raises(AttributeError):
+            plain.signal_cache = empty_cache(1)
+
+    def test_control_cache_should_raise_attribute_error_when_assigned(self, plain):
+        """Test that the control reader cannot be swapped past its check.
+
+        Given:
+            A dataset built over caches of its windows.
+        When:
+            A cache is assigned to ``control_cache``.
+        Then:
+            It should raise `AttributeError`, ``control_cache`` being fixed at
+            construction.
+        """
+
+        # Act & assert
+        with pytest.raises(AttributeError):
+            plain.control_cache = empty_cache(1)
+
+    def test_in_window_should_raise_attribute_error_when_assigned(self, plain):
+        """Test that the input width cannot be swapped past its check.
+
+        Given:
+            A dataset built over caches of its windows.
+        When:
+            A `bool` is assigned to ``in_window``.
+        Then:
+            It should raise `AttributeError`, ``in_window`` being fixed at
+            construction.
+        """
+
+        # Act & assert
+        with pytest.raises(AttributeError):
+            plain.in_window = True
+
+    def test_out_window_should_raise_attribute_error_when_assigned(self, plain):
+        """Test that the output width cannot be swapped past its check.
+
+        Given:
+            A dataset built over caches of its windows.
+        When:
+            A `bool` is assigned to ``out_window``.
+        Then:
+            It should raise `AttributeError`, ``out_window`` being fixed at
+            construction.
+        """
+
+        # Act & assert
+        with pytest.raises(AttributeError):
+            plain.out_window = True
 
     def test___len___should_count_draws_with_a_sampler_and_loci_without(self, corpus):
         """Test what the length means with and without a sampler.

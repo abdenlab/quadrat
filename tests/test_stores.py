@@ -32,6 +32,7 @@ from quadrat import stores, tables
 from tests import (
     DELTA_ROWS,
     FILE_BACKED,
+    NOT_PARQUET,
     SPANS,
     TWO_CONTIGS,
     UNREADABLE_IDS,
@@ -485,28 +486,50 @@ class TestSequenceStore:
         ):
             unindexed.window("chr1", 0, 8)
 
-    def test_window_should_raise_as_pyfaidx_does_when_the_reference_is_missing(
+    def test_window_should_raise_file_not_found_when_the_reference_is_missing(
         self, tmp_path
     ):
-        """Test that a missing reference is not reported as a missing index.
+        """Test that a missing reference is refused as `load_windows` refuses it.
 
         Given:
             A path at which there is no reference.
         When:
             A window is read.
         Then:
-            It should raise `pyfaidx.FastaNotFoundError`, an `OSError`,
-            naming the path and saying nothing of an index.
+            It should raise `FileNotFoundError` naming the path and
+            saying it is not a reference, and nothing of an index.
         """
 
         # Arrange
         missing = stores.SequenceStore(str(tmp_path / "missing.fa"))
 
         # Act & assert
-        with pytest.raises(pyfaidx.FastaNotFoundError, match=r"missing\.fa") as caught:
+        with pytest.raises(
+            FileNotFoundError, match=r"missing\.fa is not a reference"
+        ) as caught:
             missing.window("chr1", 0, 8)
-        assert isinstance(caught.value, OSError)
         assert "faidx index" not in str(caught.value)
+
+    def test_contig_lengths_should_raise_file_not_found_when_the_reference_is_missing(
+        self, tmp_path
+    ):
+        """Test the second reader of a store's reference on a missing one.
+
+        Given:
+            A path at which there is no reference.
+        When:
+            Its contig lengths are read.
+        Then:
+            It should raise `FileNotFoundError` naming the path and
+            saying it is not a reference.
+        """
+
+        # Arrange
+        missing = stores.SequenceStore(str(tmp_path / "missing.fa"))
+
+        # Act & assert
+        with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
+            missing.contig_lengths()
 
     @settings(FILE_BACKED, max_examples=25)
     @given(bounds=st.tuples(st.integers(-200, 1200), st.integers(-200, 1200)))
@@ -1090,6 +1113,28 @@ def test_track_frame_should_raise_when_nothing_is_at_the_path(tmp_path, name):
         stores.track_frame(path)
 
 
+@pytest.mark.parametrize("kind", sorted(NOT_PARQUET))
+def test_track_frame_should_raise_when_the_file_is_not_parquet(tmp_path, kind):
+    """Test a whole-table read of a file that is no track.
+
+    Given:
+        A file beginning as a bigWig does, or an empty file.
+    When:
+        It is read as a whole frame, and the frame is not collected.
+    Then:
+        It should raise `ValueError` naming the path, from the read
+        itself rather than from polars at a later collect.
+    """
+
+    # Arrange
+    path = tmp_path / "signal.bw"
+    path.write_bytes(NOT_PARQUET[kind])
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"signal\.bw is not a track"):
+        stores.track_frame(str(path))
+
+
 def test_track_frame_should_refuse_a_directory_that_does_not_verify(tmp_path):
     """Test a whole-table read of a track whose write did not finish.
 
@@ -1232,6 +1277,66 @@ class TestTrackStore:
         # Act & assert
         with pytest.raises(ValueError, match="cannot be verified complete"):
             stores.TrackStore([corpus.tracks[0], root])
+
+    def test___init___should_raise_when_a_source_is_not_parquet(self, tmp_path, corpus):
+        """Test that a channel that is no track is refused at construction.
+
+        Given:
+            A channel set holding one real track and a file beginning
+            as a bigWig does.
+        When:
+            A store is built from it.
+        Then:
+            It should raise `ValueError` naming the file, rather than
+            build and fail at the first read in polars' words.
+        """
+
+        # Arrange
+        path = tmp_path / "signal.bw"
+        path.write_bytes(NOT_PARQUET["bigwig"])
+
+        # Act & assert
+        with pytest.raises(ValueError, match=r"signal\.bw is not a track"):
+            stores.TrackStore([corpus.tracks[0], str(path)])
+
+    def test___init___should_raise_when_a_source_is_missing(self, tmp_path, corpus):
+        """Test that a channel at which nothing exists is refused at construction.
+
+        Given:
+            A channel set holding one real track and a path at which
+            nothing exists.
+        When:
+            A store is built from it.
+        Then:
+            It should raise `ValueError` naming the path, as
+            `quadrat.require_complete` refuses a missing track.
+        """
+
+        # Act & assert
+        with pytest.raises(ValueError, match=r"absent\.parquet is not a track; there"):
+            stores.TrackStore([corpus.tracks[0], str(tmp_path / "absent.parquet")])
+
+    def test___init___should_accept_a_single_file_track(self, tmp_path):
+        """Test that a real single-file track passes the content test.
+
+        Given:
+            A single-file track holding one position on ``chr1``.
+        When:
+            A store is built from it and a window over that position
+            read.
+        Then:
+            It should answer the position's value there and zero
+            elsewhere.
+        """
+
+        # Arrange
+        path = builders.write_flat_track(tmp_path / "flat.parquet", [("chr1", 5, 2.0)])
+
+        # Act
+        window = stores.TrackStore([path]).window("chr1", 0, 8)
+
+        # Assert
+        assert window.numpy().tolist() == [[0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0]]
 
     @pytest.mark.parametrize("fields, message", UNREADABLE_RECORDS, ids=UNREADABLE_IDS)
     def test___init___should_refuse_a_track_whose_signal_it_cannot_read(

@@ -31,6 +31,8 @@ import hashlib
 import math
 import os
 import sys
+import tempfile
+import types
 import weakref
 from types import MappingProxyType
 
@@ -42,11 +44,23 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from hypothesis.extra import numpy as hnp
 
-from quadrat import cache, dataset, groups, loader, loci, sampling, stores
+from quadrat import (
+    Aggregate,
+    cache,
+    dataset,
+    groups,
+    loader,
+    loci,
+    managed,
+    pileup_alignments,
+    sampling,
+    stores,
+)
 from quadrat.rules import Exclusion, Jitter
 from tests import (
     CONFIG_IDS,
     GOLDEN_CONFIGS,
+    NOT_PARQUET,
     SPLICED_READS,
     WORKER_TIMEOUT,
     before_92,
@@ -215,6 +229,30 @@ def peak_spans(request, corpus_factory, pysam):
         out_window=OUT_WINDOW,
     )
     return (corpus, *pile_up_spans(corpus, "span", pysam, 1 / 3, request.param))
+
+
+@pytest.fixture(scope="module")
+def alignment_corpus(corpus_factory):
+    """Build two indexed alignments over the loader geometry, with peaks and negatives.
+
+    It carries the signal tracks too, which `arguments` reads for its
+    default signals before a test overrides them.
+    """
+
+    pytest.importorskip("polars_bio")
+    return corpus_factory(
+        "loader-alignments",
+        CHROM_SIZES,
+        n_bams=2,
+        n_reads=400,
+        index_fasta=True,
+        peaks=PEAKS,
+        negatives=NEGATIVES,
+        tracks=SIGNAL_ROWS,
+        in_window=IN_WINDOW,
+        out_window=OUT_WINDOW,
+        max_jitter=MAX_JITTER,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -616,6 +654,99 @@ def test_sample_nbytes_should_count_the_bytes_of_a_collated_sample(
 
 
 @pytest.mark.parametrize(
+    "field",
+    [
+        "n_draws",
+        "batch_size",
+        "num_workers",
+        "bytes_per_sample",
+        "prefetch_factor",
+        "max_fetch_bytes",
+    ],
+)
+def test_auto_fetch_size_should_raise_type_error_when_an_argument_is_a_bool(field):
+    """Test the integer rule on every argument of the fetch-size choice.
+
+    Given:
+        Valid arguments with one of them replaced by ``True``.
+    When:
+        A fetch size is chosen.
+    Then:
+        It should raise `TypeError` naming the argument, rather than
+        read ``True`` as one.
+    """
+
+    # Arrange
+    arguments = dict(
+        n_draws=104748,
+        batch_size=64,
+        num_workers=8,
+        bytes_per_sample=1,
+        prefetch_factor=2,
+        max_fetch_bytes=10**9,
+    )
+    arguments[field] = True
+
+    # Act & assert
+    with pytest.raises(TypeError, match="{} must be an integer".format(field)):
+        loader.auto_fetch_size(**arguments)
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_auto_fetch_size_should_take_the_prefetch_factor_a_loader_holds(num_workers):
+    """Test that the prefetch depth is taken as `torch.utils.data.DataLoader` holds it.
+
+    Given:
+        A loader with no workers, which holds ``prefetch_factor=None``,
+        and one with two, which holds torch's default.
+    When:
+        A fetch size is chosen from that loader's own ``num_workers``
+        and ``prefetch_factor``.
+    Then:
+        It should accept what the loader holds, ``None`` included, and
+        answer what a depth of ``2`` answers for that loader.
+    """
+
+    # Arrange
+    held = torch.utils.data.DataLoader(range(4), num_workers=num_workers)
+
+    # Act
+    chosen = loader.auto_fetch_size(
+        104748, 64, held.num_workers, 1, prefetch_factor=held.prefetch_factor
+    )
+
+    # Assert
+    assert chosen == loader.auto_fetch_size(
+        104748, 64, num_workers, 1, prefetch_factor=2
+    )
+
+
+def test_auto_fetch_size_should_read_a_none_prefetch_factor_as_two():
+    """Test the depth a ``None`` prefetch factor stands for.
+
+    Given:
+        Workers, and an epoch long enough that the fetch size depends
+        on how many fetches each worker keeps ready.
+    When:
+        A fetch size is chosen with ``prefetch_factor=None``.
+    Then:
+        It should equal the choice at a depth of ``2``, torch's
+        default, and differ from the choice at a depth of ``1``.
+    """
+
+    # Arrange
+    shape = dict(n_draws=10**7, batch_size=64, num_workers=2, bytes_per_sample=1)
+    shape["max_fetch_bytes"] = 10**12
+
+    # Act
+    chosen = loader.auto_fetch_size(prefetch_factor=None, **shape)
+
+    # Assert
+    assert chosen == loader.auto_fetch_size(prefetch_factor=2, **shape)
+    assert chosen != loader.auto_fetch_size(prefetch_factor=1, **shape)
+
+
+@pytest.mark.parametrize(
     "n_draws,num_workers,bytes_per_sample",
     [(104748, 0, 1), (0, 8, 1), (500, 8, 1), (104748, 8, 10**7)],
     ids=["no_workers", "no_draws", "too_few_batches", "one_batch_at_the_ceiling"],
@@ -841,6 +972,73 @@ class TestRechunkedLoader:
         # Act & assert
         with pytest.raises(ValueError, match="drop_last"):
             loader.RechunkedLoader(inner, 4)
+
+    @pytest.mark.parametrize("batch_size", [True, 4.0], ids=repr)
+    def test___init___should_raise_type_error_when_the_batch_is_not_an_integer(
+        self, batch_size
+    ):
+        """Test the integer rule on the consumer's batch.
+
+        Given:
+            A loader fetching eight samples, and ``True`` or ``4.0`` as
+            the batch size.
+        When:
+            The loader is wrapped.
+        Then:
+            It should raise `TypeError` naming ``batch_size``, rather
+            than slice batches of one or of a float.
+        """
+
+        # Arrange
+        inner, _ = recording_loader(16, 8)
+
+        # Act & assert
+        with pytest.raises(TypeError, match="batch_size must be an integer"):
+            loader.RechunkedLoader(inner, batch_size)
+
+    def test___init___should_raise_type_error_when_the_fetch_is_not_an_integer(self):
+        """Test the integer rule on the wrapped loader's batch, the fetch.
+
+        Given:
+            A stand-in loader whose ``batch_size`` is ``True`` and that
+            keeps its last fetch.
+        When:
+            It is wrapped at a batch of one.
+        Then:
+            It should raise `TypeError` naming the wrapped loader's
+            ``batch_size``.
+        """
+
+        # Arrange
+        inner = types.SimpleNamespace(batch_size=True, drop_last=False)
+
+        # Act & assert
+        with pytest.raises(
+            TypeError, match="the wrapped loader's batch_size must be an integer"
+        ):
+            loader.RechunkedLoader(inner, 1)
+
+    def test___init___should_hold_numpy_integers_as_ints(self):
+        """Test that the two sizes are held as plain integers.
+
+        Given:
+            A stand-in loader fetching ``numpy.int64(12)`` samples, wrapped
+            at a batch of ``numpy.int64(4)``.
+        When:
+            The wrapper's sizes are read.
+        Then:
+            It should hold both as plain `int`.
+        """
+
+        # Arrange
+        inner = types.SimpleNamespace(batch_size=numpy.int64(12), drop_last=False)
+
+        # Act
+        wrapped = loader.RechunkedLoader(inner, numpy.int64(4))
+
+        # Assert
+        assert (wrapped.batch_size, wrapped.fetch_size) == (4, 12)
+        assert (type(wrapped.batch_size), type(wrapped.fetch_size)) == (int, int)
 
     def test___init___should_record_the_two_sizes(self):
         """Test the sizes a wrapper reports.
@@ -1557,7 +1755,16 @@ def test_build_training_loader_should_raise_when_ranks_share_no_seed(corpus):
             ValueError,
             "fetch_size must be a positive whole multiple of the 4 samples",
         ),
-        ({"fetch_size": float(BATCH_SIZE)}, ValueError, "fetch_size must be a positive"),
+        ({"fetch_size": float(BATCH_SIZE)}, TypeError, "fetch_size must be an integer"),
+        ({"fetch_size": True}, TypeError, "fetch_size must be an integer"),
+        ({"batch_size": True}, TypeError, "batch_size must be an integer"),
+        ({"rank": True, "world_size": 1}, TypeError, "rank must be an integer"),
+        ({"world_size": 2.0, "rank": 0}, TypeError, "world_size must be an integer"),
+        ({"random_state": True}, TypeError, "random_state must be an integer"),
+        ({"in_window": True}, TypeError, "in_window must be an integer"),
+        ({"out_window": 30.0}, TypeError, "out_window must be an integer"),
+        ({"num_workers": True}, TypeError, "num_workers must be an integer"),
+        ({"max_fetch_bytes": True}, TypeError, "max_fetch_bytes must be an integer"),
         ({"signals": [[]]}, ValueError, "a signal group is empty"),
         ({"cache_residency": "bogus"}, ValueError, "residency must be one of"),
         ({"num_workers": -1}, ValueError, "num_workers option should be non-negative"),
@@ -1614,6 +1821,70 @@ def test_build_training_loader_should_refuse_an_argument_before_building(
     # Assert
     assert not os.path.exists(fasta + ".fai")
     assert not any(cache_dir.iterdir())
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["unkeyed", "keyed"])
+def test_build_training_loader_should_raise_file_not_found_error_when_the_reference_is_missing(
+    corpus, tmp_path, keyed
+):
+    """Test the refusal of a reference that is not there.
+
+    Given:
+        The corpus's loci and tracks, a path at which there is no
+        reference, and either no cache or an empty cache directory.
+    When:
+        The loader is built.
+    Then:
+        It should raise `FileNotFoundError` naming the path and saying
+        it is not a reference, as every reader of a reference does, and
+        leave the cache directory empty.
+    """
+
+    # Arrange
+    entries = tmp_path / "entries"
+    entries.mkdir()
+    cache_dir = str(entries) if keyed else False
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError, match=r"missing\.fa is not a reference"):
+        loader.build_training_loader(
+            **arguments(
+                corpus, sequences=str(tmp_path / "missing.fa"), cache_dir=cache_dir
+            )
+        )
+    assert not any(entries.iterdir())
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["unkeyed", "keyed"])
+def test_build_training_loader_should_raise_when_a_signal_track_is_not_parquet(
+    corpus, tmp_path, keyed
+):
+    """Test that a file that is no track is refused by name.
+
+    Given:
+        The corpus's loci, a signal track that begins as a bigWig does,
+        and either no cache or an empty cache directory.
+    When:
+        The loader is built.
+    Then:
+        It should raise `ValueError` naming the file and saying it is
+        not a track, rather than fail later in polars' words, and leave
+        the cache directory empty.
+    """
+
+    # Arrange
+    track = tmp_path / "signal.bw"
+    track.write_bytes(NOT_PARQUET["bigwig"])
+    entries = tmp_path / "entries"
+    entries.mkdir()
+    cache_dir = str(entries) if keyed else False
+
+    # Act & assert
+    with pytest.raises(ValueError, match=r"signal\.bw is not a track"):
+        loader.build_training_loader(
+            **arguments(corpus, signals=[str(track)], cache_dir=cache_dir)
+        )
+    assert not any(entries.iterdir())
 
 
 @pytest.mark.parametrize("fetch_size", [0, BATCH_SIZE + 2, BATCH_SIZE // 2])
@@ -2571,3 +2842,370 @@ def test_build_training_loader_should_print_nothing_when_not_verbose(corpus, cap
 
     # Assert
     assert capsys.readouterr().out == ""
+
+
+def test_build_training_loader_should_draw_from_alignments_what_it_draws_from_their_tracks(
+    alignment_corpus, tmp_path
+):
+    """Test that a channel given as alignments reads as the tracks they pile up into.
+
+    Given:
+        Two alignments piled up directly, stranded as the signal and
+        unstranded as the control; and the same two given as
+        `quadrat.managed.Alignments`, the stranded one as a group of
+        its own.
+    When:
+        A loader is built from each, with one seed, and one epoch is
+        drawn from both.
+    Then:
+        The two streams should be equal batch for batch, and the
+        loaders' datasets should group the signal as one pair.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    stranded = pileup_alignments(corpus.bams, corpus.fasta, str(tmp_path / "s"))
+    (pooled,) = pileup_alignments(
+        corpus.bams,
+        corpus.fasta,
+        str(tmp_path / "c"),
+        aggregate=Aggregate(unstranded=True),
+    )
+    shared = arguments(corpus, cache_dir=False)
+    direct = loader.build_training_loader(
+        **dict(shared, signals=[stranded], controls=[pooled])
+    )
+
+    # Act
+    piled = loader.build_training_loader(
+        **dict(
+            shared,
+            signals=[managed.Alignments(corpus.bams)],
+            controls=[managed.Alignments(corpus.bams, Aggregate(unstranded=True))],
+        )
+    )
+
+    # Assert
+    assert piled.dataset.signal_groups == direct.dataset.signal_groups == (2,)
+    assert same_batches(drain(piled, n_epochs=1), drain(direct, n_epochs=1))
+
+
+def test_build_training_loader_should_reuse_piled_up_tracks_across_window_sets(
+    alignment_corpus,
+):
+    """Test that managed tracks outlive the window entry they were grouped into.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments`, which
+        persists its tracks under the default managed track directory.
+    When:
+        A second loader is built from it over another window geometry,
+        which misses the window cache.
+    Then:
+        The managed track directory should hold the one entry it held
+        after the first build, the same directory, and the window cache
+        two entries.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(corpus, signals=[managed.Alignments(corpus.bams)])
+    loader.build_training_loader(**given)
+    tracks = cache.default_cache_dir("tracks")
+    (entry,) = [name for name in os.listdir(tracks) if "." not in name]
+    inode = os.stat(os.path.join(tracks, entry)).st_ino
+
+    # Act
+    loader.build_training_loader(**dict(given, max_jitter=MAX_JITTER - 2))
+
+    # Assert
+    assert [name for name in os.listdir(tracks) if "." not in name] == [entry]
+    assert os.stat(os.path.join(tracks, entry)).st_ino == inode
+    windows = cache.default_cache_dir("windows")
+    assert len([name for name in os.listdir(windows) if "." not in name]) == 2
+
+
+def test_build_training_loader_should_persist_no_track_when_nothing_is_cached(
+    alignment_corpus, tmp_path, monkeypatch, mocker
+):
+    """Test that a build that persists nothing piles up into its scratch and removes it.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with
+        ``cache_dir=False`` and a named ``scratch_dir``, its mtime set to
+        the epoch, with ``QUADRAT_SCRATCH_DIR`` and the platform
+        temporary directory each pointed at a directory of their own.
+    When:
+        It is built and drawn from.
+    Then:
+        The named scratch directory should have been written to and be
+        empty again, the other two should be untouched, and nothing
+        should exist under the cache root.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    named, variable, platform = (tmp_path / name for name in ("named", "var", "tmp"))
+    for directory in (named, variable, platform):
+        directory.mkdir()
+        os.utime(directory, ns=(0, 0))
+    monkeypatch.setenv("QUADRAT_SCRATCH_DIR", str(variable))
+    mocker.patch.object(tempfile, "tempdir", str(platform))
+
+    # Act
+    built = loader.build_training_loader(
+        **arguments(
+            corpus,
+            signals=[managed.Alignments(corpus.bams)],
+            cache_dir=False,
+            cache_residency="memory",
+            scratch_dir=str(named),
+        )
+    )
+    drain(built, n_epochs=1)
+
+    # Assert
+    assert named.stat().st_mtime_ns != 0 and list(named.iterdir()) == []
+    for untouched in (variable, platform):
+        assert untouched.stat().st_mtime_ns == 0 and list(untouched.iterdir()) == []
+    assert not os.path.exists(os.path.dirname(cache.default_cache_dir("tracks")))
+
+
+def test_build_training_loader_should_raise_file_not_found_error_for_a_missing_scratch_dir(
+    alignment_corpus, tmp_path
+):
+    """Test the refusal of a scratch directory that does not exist, for a pileup.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with
+        ``cache_dir=False`` and a ``scratch_dir`` with nothing at it.
+    When:
+        It is built.
+    Then:
+        It should raise `FileNotFoundError`.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(
+        corpus,
+        signals=[managed.Alignments(corpus.bams)],
+        cache_dir=False,
+        cache_residency="memory",
+        scratch_dir=str(tmp_path / "absent"),
+    )
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError):
+        loader.build_training_loader(**given)
+
+
+def test_build_training_loader_should_keep_tracks_in_the_default_directory_when_cache_dir_is_named(
+    alignment_corpus, tmp_path
+):
+    """Test that naming the window cache directory does not move the tracks.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with a
+        named ``cache_dir``.
+    When:
+        It is built.
+    Then:
+        The default managed track directory should hold one entry, and
+        the named directory's parent should hold only the named
+        directory.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    windows = tmp_path / "named" / "windows"
+
+    # Act
+    loader.build_training_loader(
+        **arguments(
+            corpus, signals=[managed.Alignments(corpus.bams)], cache_dir=str(windows)
+        )
+    )
+
+    # Assert
+    tracks = cache.default_cache_dir("tracks")
+    assert len([name for name in os.listdir(tracks) if "." not in name]) == 1
+    assert os.listdir(windows.parent) == ["windows"]
+
+
+def test_build_training_loader_should_print_nothing_from_a_pileup_when_not_verbose(
+    alignment_corpus, capsys
+):
+    """Test the silence of a build that piles up.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments`, with
+        ``verbose`` off.
+    When:
+        It is built cold, piling the alignments up.
+    Then:
+        It should print nothing.
+    """
+
+    # Act
+    loader.build_training_loader(
+        **arguments(
+            alignment_corpus,
+            signals=[managed.Alignments(alignment_corpus.bams)],
+            cache_dir=False,
+        )
+    )
+
+    # Assert
+    assert capsys.readouterr().out == ""
+
+
+def test_build_training_loader_should_print_pileup_progress_when_verbose(
+    alignment_corpus, capsys
+):
+    """Test that ``verbose`` reaches the pileup.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments`, with
+        ``verbose`` on.
+    When:
+        It is built cold, piling the alignments up.
+    Then:
+        It should print the pileup's progress, which names the
+        positions it wrote.
+    """
+
+    # Act
+    loader.build_training_loader(
+        **arguments(
+            alignment_corpus,
+            signals=[managed.Alignments(alignment_corpus.bams)],
+            cache_dir=False,
+            verbose=True,
+        )
+    )
+
+    # Assert
+    assert "positions" in capsys.readouterr().out
+
+
+def test_build_training_loader_should_pile_up_into_a_named_track_dir(
+    alignment_corpus, tmp_path
+):
+    """Test that a managed track directory the caller names is used and kept.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with a
+        ``track_dir`` named and ``cache_dir=False``.
+    When:
+        It is built.
+    Then:
+        The named directory should hold one committed entry, and the
+        default managed track directory should not exist.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    named = tmp_path / "named"
+
+    # Act
+    loader.build_training_loader(
+        **arguments(
+            corpus,
+            signals=[managed.Alignments(corpus.bams)],
+            cache_dir=False,
+            track_dir=named,
+        )
+    )
+
+    # Assert
+    entries = [path for path in named.iterdir() if "." not in path.name]
+    assert len(entries) == 1
+    assert (named / (entries[0].name + ".manifest.json")).is_file()
+    assert not os.path.exists(cache.default_cache_dir("tracks"))
+
+
+@pytest.mark.parametrize("track_dir", [False, True])
+def test_build_training_loader_should_refuse_a_track_dir_before_piling_up(
+    alignment_corpus, track_dir
+):
+    """Test the refusal of a managed track directory that is not one.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with
+        ``track_dir`` ``False``, which is not how scratch is asked for,
+        and ``True``.
+    When:
+        It is built.
+    Then:
+        It should raise `TypeError`, with nothing written under the
+        cache root.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(
+        corpus, signals=[managed.Alignments(corpus.bams)], track_dir=track_dir
+    )
+
+    # Act & assert
+    with pytest.raises(TypeError, match="track_dir is a directory"):
+        loader.build_training_loader(**given)
+    assert not os.path.exists(os.path.dirname(cache.default_cache_dir("tracks")))
+
+
+def test_build_training_loader_should_refuse_a_stranded_alignments_inside_a_group(
+    alignment_corpus,
+):
+    """Test the refusal of a stranded pair given inside a larger group.
+
+    Given:
+        A loader whose signals are one group of a track and a stranded
+        `quadrat.managed.Alignments`.
+    When:
+        It is built.
+    Then:
+        It should raise `ValueError` saying a stranded `Alignments` is a
+        group of its own, with nothing written under the cache root.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(
+        corpus, signals=[[corpus.tracks[0], managed.Alignments(corpus.bams)]]
+    )
+
+    # Act & assert
+    with pytest.raises(ValueError, match="a signal group of its own"):
+        loader.build_training_loader(**given)
+    assert not os.path.exists(os.path.dirname(cache.default_cache_dir("tracks")))
+
+
+def test_build_training_loader_should_refuse_a_control_group_before_piling_up_signals(
+    alignment_corpus,
+):
+    """Test that a refused control group piles nothing up for the signals.
+
+    Given:
+        A loader whose signals are one stranded
+        `quadrat.managed.Alignments`, which would be piled up, and whose
+        controls are one group of a track and a stranded `Alignments`.
+    When:
+        It is built.
+    Then:
+        It should raise `ValueError` saying a stranded `Alignments` is a
+        group of its own, with nothing written under the cache root.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(
+        corpus,
+        signals=[managed.Alignments(corpus.bams)],
+        controls=[[corpus.tracks[0], managed.Alignments(corpus.bams[:1])]],
+    )
+
+    # Act & assert
+    with pytest.raises(ValueError, match="a signal group of its own"):
+        loader.build_training_loader(**given)
+    assert not os.path.exists(os.path.dirname(cache.default_cache_dir("tracks")))

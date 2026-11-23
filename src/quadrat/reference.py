@@ -78,6 +78,17 @@ def chrom_lengths(sequences):
         argument of the wrong type is `TypeError`, which is what
         `quadrat.require_complete` raises for the same mistake and
         what a caller guarding argument validation writes.
+    :raises FileNotFoundError: if nothing exists at ``sequences``, a
+        path running through a file included, naming it as no
+        reference.
+    :raises OSError: if the path cannot be examined, e.g., a directory
+        on it cannot be searched, whether or not a file is there.
+
+    .. rubric:: Implementation notes
+
+    A missing reference is refused before the index is looked for,
+    because it would otherwise read as a reference with no usable
+    index, and the scan that follows would fail in the engine's words.
     """
 
     # Normalized through the one normalizer and refused here. The
@@ -94,6 +105,8 @@ def chrom_lengths(sequences):
             )
         )
     sequences = path
+    # Refused first, for the reason in the notes.
+    require_reference(sequences)
 
     # One read of the slot, and one write of it. The pair is read into
     # a local so a concurrent write cannot change what this call
@@ -145,6 +158,22 @@ def chrom_lengths(sequences):
     return collections.OrderedDict(lengths)
 
 
+def require_reference(path):
+    """Refuse a reference path at which nothing exists, as `quadrat.chrom_lengths` states.
+
+    :param path: The reference, as a `str`.
+    :raises FileNotFoundError: as `quadrat.chrom_lengths` raises it.
+    :raises OSError: as `quadrat.chrom_lengths` raises it.
+    """
+
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        raise FileNotFoundError(
+            "{} is not a reference; there is no such file or directory.".format(path)
+        ) from None
+
+
 def clear_cache():
     """Forget the cached chromosome lengths.
 
@@ -171,9 +200,9 @@ def _fasta_key(sequences):
 
     .. rubric:: Implementation notes
 
-    A path that cannot be stat'd is keyed on the path alone. There is
-    nothing better to key on, and the read that follows fails on the
-    same path.
+    `require_reference` has refused a path that cannot be stat'd before
+    this runs, so the fallback here keys only a path that vanished in
+    between, on the path alone; the read that follows fails on it.
     """
 
     try:

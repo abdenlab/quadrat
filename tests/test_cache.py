@@ -33,6 +33,7 @@ fundamental failure.
 """
 
 import gc
+import hashlib
 import inspect
 import json
 import multiprocessing
@@ -357,6 +358,34 @@ def test_require_index_should_refuse_an_index_out_of_range(kind, data, size):
         cache.require_index("row", kind(index), size, "the rows")
 
 
+@settings(deadline=None, max_examples=200)
+@given(
+    value=st.one_of(
+        st.integers(0, 2**70),
+        st.integers(0, 2**63 - 1).map(numpy.int64),
+        st.integers(0, 2**31 - 1).map(numpy.int32),
+    )
+)
+def test_require_index_should_answer_any_integer_as_an_equal_int(value):
+    """Test the integer rule on every integer it admits.
+
+    Given:
+        Any non-negative Python integer, past any fixed width included,
+        and any numpy ``int64`` or ``int32``.
+    When:
+        It is required to index more rows than any value drawn.
+    Then:
+        It should be answered equal, as a plain `int`.
+    """
+
+    # Act
+    answered = cache.require_index("row", value, 2**71)
+
+    # Assert
+    assert answered == value
+    assert type(answered) is int
+
+
 @pytest.mark.parametrize("index", [True, numpy.bool_(False), 1.0, "1"], ids=repr)
 def test_require_index_should_raise_type_error_when_not_an_integer(index):
     """Test the integer rule on values that are not integers.
@@ -364,33 +393,15 @@ def test_require_index_should_raise_type_error_when_not_an_integer(index):
     Given:
         A ``bool``, a numpy ``bool``, a float and a string.
     When:
-        Each is required to be an index, with no row count.
+        Each is required to index ten rows.
     Then:
-        It should raise `TypeError` naming the label.
+        It should raise `TypeError` naming the label, before the range
+        is tested.
     """
 
     # Act & assert
     with pytest.raises(TypeError, match="row must be an integer"):
-        cache.require_index("row", index)
-
-
-@pytest.mark.parametrize("index", [-5, 0, 2**70], ids=repr)
-def test_require_index_should_answer_any_integer_when_given_no_size(index):
-    """Test the integer rule alone.
-
-    Given:
-        A negative integer, zero, and one past any row count.
-    When:
-        Each is required to be an index with no row count.
-    Then:
-        It should be answered unchanged.
-    """
-
-    # Act
-    answered = cache.require_index("row", index)
-
-    # Assert
-    assert answered == index
+        cache.require_index("row", index, 10)
 
 
 def test_require_index_should_leave_the_rows_unnamed_when_of_is_none():
@@ -2287,6 +2298,50 @@ def test_write_cache_arrays_should_write_the_four_the_layout_names(tmp_path, tra
     )
 
 
+def test_make_scratch_dir_should_make_an_empty_directory_where_named(tmp_path):
+    """Test a scratch directory made under a named root.
+
+    Given:
+        A named scratch root and a prefix.
+    When:
+        A scratch directory is made.
+    Then:
+        It should be an empty directory under that root whose name
+        starts with the prefix.
+    """
+
+    # Act
+    made = cache.make_scratch_dir("quadrat-x-", str(tmp_path))
+
+    # Assert
+    assert os.path.dirname(made) == str(tmp_path)
+    assert os.path.basename(made).startswith("quadrat-x-")
+    assert os.listdir(made) == []
+
+
+def test_make_scratch_dir_should_follow_the_environment_when_unnamed(
+    tmp_path, monkeypatch
+):
+    """Test the scratch root a caller names nothing for.
+
+    Given:
+        No scratch root, and ``QUADRAT_SCRATCH_DIR`` set.
+    When:
+        A scratch directory is made.
+    Then:
+        It should sit under the directory the variable names.
+    """
+
+    # Arrange
+    monkeypatch.setenv("QUADRAT_SCRATCH_DIR", str(tmp_path))
+
+    # Act
+    made = cache.make_scratch_dir("quadrat-x-")
+
+    # Assert
+    assert os.path.dirname(made) == str(tmp_path)
+
+
 class TestWindowSignalCache:
     """The grouped cache, read by draw."""
 
@@ -2925,6 +2980,61 @@ class TestWindowSignalCache:
         # Assert
         assert built.n_channels == 2
         assert tuple(built.window(0, 0, 8).shape) == (2, 8)
+
+    @pytest.mark.parametrize("residency", ["memory", "mapped", "adopted"])
+    @pytest.mark.parametrize("n_windows", [0, 1, 3])
+    def test_n_windows_should_count_the_windows_it_was_built_for(
+        self, tmp_path, n_windows, residency
+    ):
+        """Test the window count a reader checks a cache against.
+
+        Given:
+            Grouped arrays over no, one or three windows, none holding
+            a row, held in memory, memory-mapped, or written as an
+            entry and adopted.
+        When:
+            A cache is made from them and its window count read.
+        Then:
+            It should be the number of windows, whatever the residency.
+        """
+
+        # Arrange
+        grouped = builders.empty_grouped(n_windows)
+        if residency == "adopted":
+            root = str(tmp_path / "entry")
+            os.makedirs(root)
+            cache.write_cache_arrays(root, *grouped[:4])
+
+        # Act
+        if residency == "adopted":
+            made = cache.WindowSignalCache.adopt(root, 1, cache.array_meta(grouped))
+        else:
+            made = cache.WindowSignalCache.from_arrays(grouped, residency=residency)
+
+        # Assert
+        assert made.n_windows == n_windows
+
+    def test_n_windows_should_count_the_arrays_of_a_cache_built_with_no_meta(self):
+        """Test the count of a cache constructed directly.
+
+        Given:
+            Grouped arrays over three windows, handed to the
+            constructor with no ``meta``.
+        When:
+            Its window count is read.
+        Then:
+            It should be three, counted from the arrays, rather than
+            fail on the missing record.
+        """
+
+        # Arrange
+        offsets, pos, val, chan, n_channels = builders.empty_grouped(3)
+
+        # Act
+        made = cache.WindowSignalCache(offsets, pos, val, chan, n_channels=n_channels)
+
+        # Assert
+        assert made.n_windows == 3
 
     @pytest.mark.parametrize("residency", ["memory", "mapped"])
     def test_meta_should_report_what_the_arrays_hold(self, tracks, residency):
@@ -3709,17 +3819,55 @@ def test_default_cache_dir_should_follow_the_environment_on_every_call(monkeypat
     assert second == os.path.join("/tmp/second", "windows")
 
 
-def test_default_cache_dir_should_fall_back_to_the_xdg_convention(monkeypatch):
+def test_default_cache_dir_should_put_each_kind_in_a_directory_of_its_own(monkeypatch):
+    """Test that window entries and managed track entries share a root.
+
+    Given:
+        A cache directory named in the environment.
+    When:
+        The default is asked for windows and for tracks.
+    Then:
+        Each should be a directory of its own, named for its kind,
+        under that root.
+    """
+
+    # Arrange
+    monkeypatch.setenv("QUADRAT_CACHE_DIR", "/tmp/root")
+
+    # Act & assert
+    assert cache.default_cache_dir("windows") == os.path.join("/tmp/root", "windows")
+    assert cache.default_cache_dir("tracks") == os.path.join("/tmp/root", "tracks")
+
+
+def test_default_cache_dir_should_raise_value_error_for_an_unknown_kind():
+    """Test the refusal of a kind of entry this package does not persist.
+
+    Given:
+        A kind that is neither ``"windows"`` nor ``"tracks"``.
+    When:
+        The default is asked for it.
+    Then:
+        It should raise `ValueError` naming the two kinds.
+    """
+
+    # Act & assert
+    with pytest.raises(ValueError, match="'windows', 'tracks'"):
+        cache.default_cache_dir("bigwigs")
+
+
+@pytest.mark.parametrize("kind", ["windows", "tracks"])
+def test_default_cache_dir_should_fall_back_to_the_xdg_convention(monkeypatch, kind):
     """Test where entries go with no variable of our own set.
 
     Given:
-        No ``QUADRAT_CACHE_DIR`` and an ``XDG_CACHE_HOME``.
+        No ``QUADRAT_CACHE_DIR`` and an ``XDG_CACHE_HOME``, for window
+        entries and for managed track entries.
     When:
         The default is asked for.
     Then:
-        It should sit under the XDG directory, named for this package,
-        so caching works with no configuration and relocating the
-        whole user cache relocates this too.
+        It should sit under the XDG directory, named for this package
+        and then for the kind, so caching works with no configuration
+        and relocating the whole user cache relocates this too.
     """
 
     # Arrange
@@ -3727,15 +3875,19 @@ def test_default_cache_dir_should_fall_back_to_the_xdg_convention(monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", "/tmp/xdg")
 
     # Act & assert
-    assert cache.default_cache_dir() == os.path.join("/tmp/xdg", "quadrat", "windows")
+    assert cache.default_cache_dir(kind) == os.path.join("/tmp/xdg", "quadrat", kind)
 
 
-def test_default_cache_dir_should_fall_back_to_a_home_relative_default(monkeypatch):
+@pytest.mark.parametrize("kind", ["windows", "tracks"])
+def test_default_cache_dir_should_fall_back_to_a_home_relative_default(
+    monkeypatch, kind
+):
     """Test where entries go with nothing in the environment at all.
 
     Given:
         Neither the package's variable nor the XDG one set, and a home
-        directory of its own.
+        directory of its own, for window entries and for managed track
+        entries.
     When:
         The default is asked for.
     Then:
@@ -3749,10 +3901,10 @@ def test_default_cache_dir_should_fall_back_to_a_home_relative_default(monkeypat
     monkeypatch.setenv("HOME", "/home/someone")
 
     # Act
-    resolved = cache.default_cache_dir()
+    resolved = cache.default_cache_dir(kind)
 
     # Assert
-    assert resolved == os.path.join("/home/someone", ".cache", "quadrat", "windows")
+    assert resolved == os.path.join("/home/someone", ".cache", "quadrat", kind)
 
 
 @pytest.mark.parametrize("variable", ["QUADRAT_CACHE_DIR", "XDG_CACHE_HOME"])
@@ -3804,6 +3956,158 @@ def test_default_cache_dir_should_ignore_a_variable_set_to_nothing(monkeypatch):
 
     # Assert
     assert resolved == os.path.join("/xdg", "quadrat", "windows")
+
+
+def test_hash_reference_should_index_a_reference_before_hashing_it(tmp_path):
+    """Test that a reference with no index is indexed first.
+
+    Given:
+        A reference with no index.
+    When:
+        It is folded into a digest, and then into a second.
+    Then:
+        An index should exist beside it, and the two digests should be
+        equal.
+    """
+
+    # Arrange
+    fasta = tmp_path / "ref.fa"
+    fasta.write_text(">chr1\nACGTACGT\n")
+    digests = [hashlib.sha256(), hashlib.sha256()]
+
+    # Act
+    for digest in digests:
+        cache.hash_reference(digest, str(fasta))
+
+    # Assert
+    assert (tmp_path / "ref.fa.fai").is_file()
+    assert digests[0].hexdigest() == digests[1].hexdigest()
+
+
+def test_hash_reference_should_ignore_the_sequence(tmp_path):
+    """Test that a key follows a reference's index and not its sequence.
+
+    Given:
+        An indexed reference, and then the same reference rewritten to
+        other bases of the same lengths and line widths, so its index
+        is unchanged.
+    When:
+        Each is folded into a fresh digest.
+    Then:
+        The two digests should be equal.
+    """
+
+    # Arrange
+    fasta = tmp_path / "ref.fa"
+    fasta.write_text(">chr1\nACGTACGT\n")
+    cache.hash_reference(hashlib.sha256(), str(fasta))
+    digests = []
+
+    # Act
+    for residues in ("ACGTACGT", "TTTTTTTT"):
+        fasta.write_text(">chr1\n{}\n".format(residues))
+        digest = hashlib.sha256()
+        cache.hash_reference(digest, str(fasta))
+        digests.append(digest.hexdigest())
+
+    # Assert
+    assert digests[0] == digests[1]
+
+
+def test_hash_reference_should_change_with_the_contigs(tmp_path):
+    """Test that a reference with other contigs keys differently.
+
+    Given:
+        Two references at one path, the second with a longer contig.
+    When:
+        Each is folded into a fresh digest, its stale index removed
+        between them.
+    Then:
+        The two digests should differ.
+    """
+
+    # Arrange
+    fasta = tmp_path / "ref.fa"
+    digests = []
+
+    # Act
+    for residues in ("ACGT", "ACGTACGT"):
+        fasta.write_text(">chr1\n{}\n".format(residues))
+        if (tmp_path / "ref.fa.fai").exists():
+            (tmp_path / "ref.fa.fai").unlink()
+        hashed = hashlib.sha256()
+        cache.hash_reference(hashed, str(fasta))
+        digests.append(hashed.hexdigest())
+
+    # Assert
+    assert digests[0] != digests[1]
+
+
+def test_file_stamp_should_answer_the_size_and_modification_time(tmp_path):
+    """Test the text a key holds for a file it does not hash.
+
+    Given:
+        A file of five bytes.
+    When:
+        Its stamp is taken.
+    Then:
+        It should be the size and the nanosecond modification time,
+        colon-separated.
+    """
+
+    # Arrange
+    path = tmp_path / "f"
+    path.write_bytes(b"12345")
+    info = os.stat(path)
+
+    # Act
+    stamp = cache.file_stamp(str(path))
+
+    # Assert
+    assert stamp == "5:{}".format(info.st_mtime_ns)
+
+
+def test_file_stamp_should_change_with_the_size(tmp_path):
+    """Test that a rewritten file stamps differently.
+
+    Given:
+        A file of five bytes, stamped, then rewritten with six and its
+        modification time set back to what it was.
+    When:
+        It is stamped again.
+    Then:
+        The two stamps should differ.
+    """
+
+    # Arrange
+    path = tmp_path / "f"
+    path.write_bytes(b"12345")
+    info = os.stat(path)
+    before = cache.file_stamp(str(path))
+    path.write_bytes(b"123456")
+    os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+
+    # Act
+    after = cache.file_stamp(str(path))
+
+    # Assert
+    assert after != before
+
+
+def test_file_stamp_should_raise_file_not_found_error_for_a_missing_file(tmp_path):
+    """Test the refusal of a file that does not exist.
+
+    Given:
+        A path with nothing at it.
+    When:
+        Its stamp is taken.
+    Then:
+        It should raise `FileNotFoundError`.
+    """
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError):
+        cache.file_stamp(str(tmp_path / "absent"))
 
 
 def test_window_cache_key_should_answer_the_same_key_for_the_same_inputs(tmp_path):

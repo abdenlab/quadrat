@@ -234,7 +234,7 @@ def warn_unindexed_split(alignments, available, batches):
     missing = [
         alignment
         for alignment, known in zip(alignments, available.values())
-        if known is not None and not _has_bam_index(alignment)
+        if known is not None and bam_index_path(alignment) is None
     ]
     if not missing:
         return
@@ -343,20 +343,28 @@ def contig_batches(lengths, available, groups):
     ]
 
 
-def _has_bam_index(path):
-    """Whether a BAM has an index the engine can restrict a scan with.
+def bam_index_path(path):
+    """Return the index the engine can restrict a scan of a BAM with, or ``None``.
 
     Both of htslib's conventions count -- ``x.bam.bai`` beside the file
     and ``x.bai`` in place of its extension -- though only the former
-    appears in practice.
+    appears in practice, and it is the one answered where both exist.
 
     A ``.csi`` deliberately does not count. polars-bio cannot open a
     CSI-indexed BAM at all, failing with ``invalid BAI header`` on a
     plain scan with no region predicate, so treating one as indexed
     would promise a pushdown that does not exist.
+
+    :param path: The alignment, as a `str` or `os.PathLike`.
+    :returns: The index's path, as a `str`, or ``None`` where neither
+        exists.
     """
 
     path = str(path)
-    return os.path.exists(path + ".bai") or (
-        path.endswith(".bam") and os.path.exists(path[: -len(".bam")] + ".bai")
-    )
+    candidates = [path + ".bai"]
+    if path.endswith(".bam"):
+        candidates.append(path[: -len(".bam")] + ".bai")
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None

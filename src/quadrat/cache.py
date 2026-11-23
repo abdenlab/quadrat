@@ -5,10 +5,13 @@ cache holds, `window_group_sums` for per-window totals over the same
 rows, the functions that key, write and read a persisted entry,
 `window_cache` that reads an entry or builds it, `joint_windows` that
 lays peaks and negatives out as one window set,
-`resolve_residency` that decides where a cache keeps its arrays, and
-`require_windows`, `require_index`, `track_list` and `window_columns`,
-the argument checks and the window decomposition this package's readers
-of window sets share.
+`resolve_residency` that decides where a cache keeps its arrays,
+`default_cache_dir` and `make_scratch_dir` that decide where entries
+and scratch directories go, `hash_reference` and `file_stamp` that a
+key folds a reference and a file in with, and `require_windows`,
+`require_index`, `track_list` and `window_columns`, the argument
+checks and the window decomposition this package's readers of window
+sets share.
 
 Everything here is package-internal: no name carries a ``# public``
 marker and none is re-exported from `quadrat`.
@@ -20,7 +23,6 @@ import functools
 import hashlib
 import json
 import multiprocessing
-import numbers
 import os
 import shutil
 import sys
@@ -35,6 +37,7 @@ from quadrat._engine import (
     import_on_first_use,
     item_list,
     registered_frames,
+    require_integer,
     transpile_intervals,
 )
 from quadrat.rules import as_exclusions, as_jitter
@@ -82,6 +85,11 @@ RESIDENCIES = ("memory", "mapped")
 #: rather than once, so a process that sets it after importing this
 #: package is not left pointed at the real user cache.
 _CACHE_DIR_ENV = "QUADRAT_CACHE_DIR"
+
+
+#: The kinds of persisted entry `default_cache_dir` resolves a
+#: directory for, each a directory of its own under one root.
+_CACHE_KINDS = ("windows", "tracks")
 
 
 #: Where a scratch directory is made when none is named. Read on every
@@ -214,6 +222,20 @@ class WindowSignalCache(ProcessLocalHandles):
 
         return int(self._n_channels)
 
+    @property
+    def n_windows(self):
+        """Return how many windows this cache was built for, as `array_meta` counts them.
+
+        Read from ``meta``, which every cache `build`, `from_arrays` and
+        `adopt` make carries, so nothing is mapped to answer it; a cache
+        constructed with no ``meta`` is counted from its arrays.
+        """
+
+        meta = self.meta
+        if meta is None:
+            meta = array_meta((*self._arrays(), self.n_channels))
+        return int(meta["n_windows"])
+
     @classmethod
     def build(
         cls,
@@ -330,9 +352,7 @@ class WindowSignalCache(ProcessLocalHandles):
                 meta=array_meta(arrays),
             )
 
-        if scratch_dir is None:
-            scratch_dir = os.environ.get(_SCRATCH_DIR_ENV) or None
-        root = tempfile.mkdtemp(prefix="quadrat-cache-", dir=scratch_dir)
+        root = make_scratch_dir("quadrat-cache-", scratch_dir)
         # Registered before the arrays are written, not after the cache
         # exists, so that every exit path from here on is covered: the
         # write failing, `array_meta` failing, or the process ending
@@ -531,38 +551,79 @@ class WindowSignalCache(ProcessLocalHandles):
         return arrays
 
 
-def default_cache_dir():
-    """Return where persisted entries go when the caller names no directory.
+def default_cache_dir(kind="windows"):
+    """Return where persisted entries of one kind go when the caller names no directory.
 
     Resolved from the environment on every call. ``QUADRAT_CACHE_DIR``
     wins, then the XDG convention, then a home-relative default -- so
     caching needs no configuration and relocating it needs one
-    variable.
+    variable. Each kind is a directory of its own under that root.
 
-    **Nothing in this package reclaims what accumulates here.** An
-    entry is keyed by the whole of what decides its contents, window
-    geometry included, so a sweep over geometries mints a fresh entry
-    per configuration and keeps every one of them; each is the size of
-    the grouped arrays, which is gigabytes at a realistic locus set.
+    **Nothing in this package reclaims what accumulates here.** A
+    window entry is keyed by the whole of what decides its contents,
+    window geometry included, so a sweep over geometries mints a fresh
+    entry per configuration and keeps every one of them; each is the
+    size of the grouped arrays, which is gigabytes at a realistic locus
+    set. A managed track entry, as `quadrat.managed.managed_tracks`
+    writes one, is keyed as `quadrat.managed.alignments_key` states,
+    so one is kept per alignment specification whatever the window
+    sets, and each is the Parquet tracks of one pileup over the whole
+    reference, which grow with the positions its alignments cover. The
+    key holds the package's version, so each release piles every
+    specification up again and leaves the earlier entries in place.
     There is no eviction, no age limit and no size cap, deliberately:
     a retention policy for someone else's disk is the caller's to set,
     and a sweep that deletes gigabytes should not be something a
     library does on its own initiative. A caller who needs the space
     bounded should point ``QUADRAT_CACHE_DIR`` somewhere they manage
     and delete entry directories outright -- each is self-contained,
-    and a missing one is a miss rather than an error.
+    and a missing one is a miss rather than an error. A window entry
+    built from managed tracks is keyed on their files, though, so
+    deleting a track entry also strands every window entry built from
+    it: the entry piled up in its place holds the same rows in new
+    files, which no such window entry's key names. Delete those window
+    entries with it.
+
+    :param kind: ``"windows"`` for window cache entries or
+        ``"tracks"`` for managed track entries.
+    :returns: The directory, as a `str`. It is not created.
+    :raises ValueError: if ``kind`` is neither.
     """
 
+    if kind not in _CACHE_KINDS:
+        raise ValueError(
+            "default_cache_dir resolves one of {}, got {!r}.".format(
+                ", ".join(repr(name) for name in _CACHE_KINDS), kind
+            )
+        )
     named = os.environ.get(_CACHE_DIR_ENV)
     if named:
-        return os.path.join(os.path.expanduser(named), "windows")
+        return os.path.join(os.path.expanduser(named), kind)
     xdg = os.environ.get("XDG_CACHE_HOME")
     root = (
         os.path.expanduser(xdg)
         if xdg
         else os.path.join(os.path.expanduser("~"), ".cache")
     )
-    return os.path.join(root, "quadrat", "windows")
+    return os.path.join(root, "quadrat", kind)
+
+
+def make_scratch_dir(prefix, scratch_dir=None):
+    """Create an empty scratch directory and return its path.
+
+    :param prefix: The directory name's prefix.
+    :param scratch_dir: Where to make it, or ``None`` for
+        ``QUADRAT_SCRATCH_DIR`` where that is set and the platform
+        temporary directory where not.
+    :returns: The directory, as a `str`. Removing it is the caller's.
+    :raises FileNotFoundError: if the directory to make it in does not
+        exist.
+    :raises OSError: if it cannot be made there.
+    """
+
+    if scratch_dir is None:
+        scratch_dir = os.environ.get(_SCRATCH_DIR_ENV) or None
+    return tempfile.mkdtemp(prefix=prefix, dir=scratch_dir)
 
 
 def window_cache_key(
@@ -603,15 +664,8 @@ def window_cache_key(
     Every input is a file, and one held in memory, whether a locus
     set, an exclusion list or a track, is refused rather than keyed.
 
-    **The reference is indexed before it is hashed.** A reference with
-    no FASTA index has one written beside it, as
-    `quadrat.stores.SequenceStore.contig_lengths` writes it, so the key
-    is the one a build over the reference, which indexes it, leaves
-    behind. A reference that exists and cannot be indexed, nothing
-    being writable beside it, is refused, since a training read takes
-    its sequence through the index. A reference that does not exist is
-    keyed by its path and an absent index, and left for whatever reads
-    it to refuse.
+    The reference is folded in as `hash_reference` states, indexed
+    first.
 
     :param signals: The signal tracks, in channel order, as
         `track_list` takes them, each a path. A single path is refused
@@ -658,8 +712,7 @@ def window_cache_key(
         for a ``max_jitter`` `quadrat.rules.as_jitter` refuses by type.
     :raises ValueError: for a ``max_jitter`` `quadrat.rules.as_jitter`
         refuses by value.
-    :raises OSError: if the reference exists and has no usable index,
-        and none can be written beside it, or cannot be read.
+    :raises OSError: for a reference `hash_reference` refuses.
 
     .. rubric:: Implementation notes
 
@@ -669,15 +722,6 @@ def window_cache_key(
     the row count of every file and the pileup arguments that produced
     them, so a regenerated track almost always changes it, and the
     sizes and modification times catch one rewritten to the same shape.
-
-    The reference is hashed through its index, not its sequence --
-    tens of kilobytes against gigabytes -- and `chrom_lengths` reads
-    the index too, so it is the part that decides anything here.
-
-    It is indexed first because the build writes an index where there
-    is none, after the key is taken: a key over the absent index would
-    file the first build's entry under a key no later run, which finds
-    the index, ever takes again.
 
     The domain tag `_KEY_DOMAIN` names this package, so two packages
     that group the same tracks the same way never read each other's
@@ -706,16 +750,7 @@ def window_cache_key(
             digest.update(os.path.abspath(path).encode())
             _hash_file(digest, path)
 
-    digest.update(b"sequences")
-    digest.update(os.path.abspath(reference).encode())
-    # Indexed first, as the docstring states.
-    if os.path.exists(reference):
-        SequenceStore(reference).contig_lengths()
-    # The index rather than `reference` itself, for the reason in the
-    # notes, and through the normalized path: a name spelled with `str`
-    # from a `bytes` reference is a repr naming no file, and every
-    # absent index hashes alike, so two genomes would collide.
-    _hash_file(digest, reference + ".fai")
+    hash_reference(digest, reference)
 
     digest.update(
         json.dumps(
@@ -750,6 +785,64 @@ def window_cache_key(
             _hash_track(digest, path)
 
     return digest.hexdigest()
+
+
+def hash_reference(digest, reference):
+    """Fold a reference's identity into ``digest``: its path and its index.
+
+    A reference with no FASTA index has one written beside it first,
+    as `quadrat.stores.SequenceStore.contig_lengths` writes it, and its
+    ``.fai`` is hashed rather than its sequence. A reference that exists
+    and cannot be indexed, nothing being writable beside it, is
+    refused, since a training read takes its sequence through the
+    index. A reference that does not exist is folded in by its path and
+    an absent index, and left for whatever reads it to refuse. The
+    refusal of a reference that is not a path stays with each caller,
+    as `quadrat._engine.fspath_or_none` says a refusal does.
+
+    :param digest: A `hashlib` hash object, updated in place.
+    :param reference: The reference, as a `str`.
+    :raises OSError: if the reference exists and has no usable index,
+        and none can be written beside it, or cannot be read.
+
+    .. rubric:: Implementation notes
+
+    Through the index rather than the sequence -- tens of kilobytes
+    against gigabytes -- and `quadrat.reference.chrom_lengths` reads
+    the index too, so it is the part that decides anything a key
+    covers.
+
+    Indexed first because a build writes an index where there is none,
+    after the key is taken: a key over the absent index would file the
+    first build's entry under a key no later run, which finds the
+    index, ever takes again.
+    """
+
+    digest.update(b"sequences")
+    digest.update(os.path.abspath(reference).encode())
+    if os.path.exists(reference):
+        SequenceStore(reference).contig_lengths()
+    # The index rather than `reference` itself, and through the
+    # normalized path: a name spelled with `str` from a `bytes`
+    # reference is a repr naming no file, and every absent index
+    # hashes alike, so two genomes would collide.
+    _hash_file(digest, reference + ".fai")
+
+
+def file_stamp(path):
+    """Return a file's size and modification time, as the text a key folds in.
+
+    What a key holds for a file it does not hash by content, as
+    `window_cache_key` holds a track's Parquet files.
+
+    :param path: The file, as a `str`.
+    :returns: ``"<size>:<mtime_ns>"``.
+    :raises OSError: if the file cannot be stat'd, `FileNotFoundError`
+        included.
+    """
+
+    info = os.stat(path)
+    return "{}:{}".format(info.st_size, info.st_mtime_ns)
 
 
 def read_window_cache(cache_dir, key, residency=None):
@@ -1122,37 +1215,26 @@ def require_windows(caller, windows):
         )
 
 
-def require_index(label, index, size=None, of=None):
+def require_index(label, index, size, of=None):
     """Return ``index`` as an `int`, refusing a non-integer or one outside ``range(size)``.
 
-    An index is any `numbers.Integral`, numpy's integers included,
-    except a ``bool``; a float, an array and a tensor are not integers,
-    whatever their value or size.
+    An index is an integer as `quadrat._engine.require_integer` takes
+    one.
 
     :param label: The name of the index, for the message.
     :param index: The value given as an index.
-    :param size: The number of rows it indexes, or ``None`` to check
-        only that it is an integer.
+    :param size: The number of rows it indexes.
     :param of: What the rows are, for the message, e.g., ``"the
         windows this cache was built for"``, or ``None`` to leave them
         unnamed.
     :returns: ``index`` as an `int`.
-    :raises TypeError: if ``index`` is not an integer, or is a
-        ``bool``.
-    :raises IndexError: if ``size`` is given and ``index`` is negative
-        or not less than it.
-
-    .. rubric:: Implementation notes
-
-    A ``bool`` is refused although Python counts it an integer, because
-    ``True`` in an index is almost always a field passed in the wrong
-    place, and reading it as ``1`` would answer row 1 silently.
+    :raises TypeError: as `quadrat._engine.require_integer` raises it.
+    :raises IndexError: if ``index`` is negative or not less than
+        ``size``.
     """
 
-    if isinstance(index, bool) or not isinstance(index, numbers.Integral):
-        raise TypeError("{} must be an integer, got {!r}.".format(label, index))
-    index = int(index)
-    if size is not None and not 0 <= index < size:
+    index = require_integer(label, index)
+    if not 0 <= index < size:
         raise IndexError(
             "{} must be in range(0, {}){}; got {}.".format(
                 label, size, "" if of is None else ", " + of, index
@@ -1349,9 +1431,9 @@ def group_track(windows, tracks, bound_columns=("sig_start", "sig_end")):
         ``tracks`` is a single track or an unordered collection of
         them, or if a track is of no shape a track can take.
     :raises ValueError: if there are more channels than ``int16`` can
-        index, or if a track directory does not verify complete, as
-        `quadrat.stores.track_frame` refuses it.
+        index, or for a track `quadrat.stores.track_frame` refuses.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
     :raises ImportError: if the ``pileup`` extra is not installed.
 
     .. rubric:: Implementation notes
@@ -1617,12 +1699,13 @@ def window_group_sums(
     :returns: A `torch.Tensor` of shape ``(len(windows),
         len(channel_group_sizes))`` and dtype ``float32``.
     :raises ValueError: if ``channel_group_sizes`` does not sum to
-        the channel count, or if a track is a directory that cannot be
-        verified complete.
+        the channel count, or for a track `quadrat.stores.track_frame`
+        refuses.
     :raises TypeError: if ``tracks`` is a single track or an unordered
         collection of them, or if a track is of no shape a track can
         take.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
 
     .. rubric:: Implementation notes
 
@@ -2100,8 +2183,9 @@ def _hash_track(digest, path):
     for name in entries:
         if not name.endswith(".parquet"):
             continue
-        info = os.stat(os.path.join(path, name))
-        digest.update("{}:{}:{}".format(name, info.st_size, info.st_mtime_ns).encode())
+        digest.update(
+            "{}:{}".format(name, file_stamp(os.path.join(path, name))).encode()
+        )
 
 
 def _reap_scratch(root, owner_pid):

@@ -12,7 +12,6 @@ marker and none is re-exported from `quadrat`.
 
 import csv
 import functools
-import os
 import typing
 
 import numpy
@@ -25,6 +24,7 @@ from quadrat._engine import (
     item_list,
     name_list,
     registered_frames,
+    require_integer,
     transpile_intervals,
 )
 from quadrat.cache import group_track, require_windows, track_list, window_columns
@@ -125,10 +125,14 @@ def load_windows(
     :returns: A `polars.DataFrame` with the columns above.
     :raises TypeError: if ``loci`` is of none of those shapes, if
         ``chroms`` is a single name rather than a collection of them,
-        if ``sequences`` is not a path, or for a ``max_jitter``
+        if ``sequences`` is not a path, if ``in_window`` or
+        ``out_window`` is not an integer as
+        `quadrat._engine.require_integer` takes one, or for a ``max_jitter``
         `quadrat.rules.as_jitter` refuses by type.
-    :raises FileNotFoundError: if nothing exists at ``sequences`` or at
-        a locus file's path.
+    :raises FileNotFoundError: for a reference `quadrat.chrom_lengths` refuses as missing, or if
+        nothing exists at a locus file's path.
+    :raises OSError: for a reference `quadrat.chrom_lengths` cannot
+        examine.
     :raises ValueError: if ``chroms`` leaves no locus where the loci
         hold some, which is a naming mismatch between the two; if any
         locus is on a contig the reference does not name; or if a
@@ -149,28 +153,15 @@ def load_windows(
 
     ``in_bounds`` counts the odd base of an odd-width window, so a
     window marked in bounds can always be read whole.
-
-    A missing reference is refused here because `chrom_lengths` would
-    not refuse it: it reads as a reference with no usable index, and
-    the scan that follows fails in the engine's words, or for want of
-    the extra.
     """
 
     pandas = import_on_first_use("pandas")
     polars = import_on_first_use("polars")
+    in_window = require_integer("in_window", in_window)
+    out_window = require_integer("out_window", out_window)
     margin = as_jitter(max_jitter).margin
     sources = _locus_sources("loci", loci)
     chroms = _contig_names(chroms)
-    # Ahead of `chrom_lengths`, for the reason in the notes. A
-    # reference that is no path is left for it to refuse by type.
-    path = fspath_or_none(sequences)
-    if path is not None:
-        try:
-            os.stat(path)
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                "{} is not a reference; there is no such file or directory.".format(path)
-            ) from None
     lengths = chrom_lengths(sequences)
 
     frame = _interleave_loci(sources, chroms, summits)
@@ -354,6 +345,7 @@ def readable_windows(
     :raises ValueError: for anything `load_windows` refuses by value.
     :raises FileNotFoundError: for a path `load_windows` or
         `exclusion_mask` finds nothing at.
+    :raises OSError: for a reference `load_windows` cannot examine.
     :raises ImportError: where `load_windows` or `exclusion_mask` needs
         the ``pileup`` extra and it is not installed.
     """
@@ -421,12 +413,13 @@ def require_track_contigs(chroms, tracks, label="signals"):
     :param label: The name the caller knows ``tracks`` by, for the
         message.
     :raises ValueError: if no track holds a position on any contig in
-        ``chroms``, or if a track directory does not verify complete.
+        ``chroms``, or for a track `quadrat.stores.track_frame` refuses.
     :raises TypeError: if ``chroms`` is a single name rather than a
         collection of them, if ``tracks`` is a single track or an
         unordered collection of them, or if a track is of no shape a
         track can take.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
 
     .. rubric:: Implementation notes
 
@@ -503,8 +496,9 @@ def extract_signal(windows, tracks, bound_columns=("sig_start", "sig_end")):
         ``tracks`` is a single track or an unordered collection of
         them, or if a track is of no shape a track can take.
     :raises ValueError: if the windows are not all one non-negative
-        width, or if a track directory does not verify complete.
+        width, or for a track `quadrat.stores.track_frame` refuses.
     :raises FileNotFoundError: if a track path does not exist.
+    :raises OSError: for a track `quadrat.stores.track_frame` cannot read.
     :raises ImportError: if the ``pileup`` extra is not installed.
 
     .. rubric:: Implementation notes
@@ -558,8 +552,9 @@ def extract_sequences(windows, sequences, alphabet=("A", "C", "G", "T"), ignore=
         width, if a window is on a contig the reference does not name,
         if a window reaches outside its contig, or for a residue
         `quadrat.stores.SequenceStore.window` refuses.
-    :raises OSError: if the reference cannot be read, or has no index
-        and none can be written beside it.
+    :raises FileNotFoundError: for a reference `quadrat.chrom_lengths` refuses as missing.
+    :raises OSError: if the reference cannot otherwise be read, or has
+        no index and none can be written beside it.
 
     .. rubric:: Implementation notes
 
@@ -688,9 +683,14 @@ def extract_loci(
     :param signals: One track per signal channel, in channel order, as
         `extract_signal` takes them, or ``None`` to read no signal.
         Every track is opened before any locus is read, so one that is
-        no track is refused whether or not a locus reaches it.
+        no track is refused whether or not a locus reaches it. An empty
+        sequence is refused rather than read as no channel, since it
+        would answer zero-channel tensors that ``target_idx`` cannot
+        name; ``None`` asks for none.
     :param controls: One track per control channel, in the same form,
-        or ``None``.
+        or ``None``, an empty sequence refused likewise. This differs
+        from `quadrat.loader.build_training_loader`, which reads an
+        empty ``controls`` as none.
     :param chroms: The contigs to keep, as `load_windows` takes them.
     :param max_jitter: The jitter, as `load_windows` takes it.
     :param min_counts: The lowest count a kept locus may have, or
@@ -707,21 +707,23 @@ def extract_loci(
         them, or ``None`` to exclude nothing.
     :returns: An `ExtractedLoci`.
     :raises TypeError: if ``signals`` or ``controls`` is a single
-        track, an unordered collection of them, or holds something that
-        is no track, or for anything `readable_windows` refuses by
-        type.
-    :raises ValueError: if ``signals`` is given without ``out_window``;
+        track, an unordered collection of them, or holds a track of no
+        shape `quadrat.stores.track_frame` accepts, or for anything
+        `readable_windows` refuses by type.
+    :raises ValueError: if ``signals`` or ``controls`` is an empty
+        sequence; if ``signals`` is given without ``out_window``;
         if a count threshold is given without ``signals``; if
-        ``target_idx`` names no signal track where ``signals`` holds
-        one or a count threshold is given; if a track directory does
-        not verify complete; for anything `load_windows` refuses by
+        ``signals`` is given and ``target_idx`` names none of its
+        tracks; for a track `quadrat.stores.track_frame` refuses; for
+        anything `load_windows` refuses by
         value; for the one `require_track_contigs` refuses; or for a
         residue `extract_sequences` refuses.
-    :raises FileNotFoundError: if a track path does not exist, or for a
-        locus file or an exclusion list `readable_windows` finds nothing
-        at.
-    :raises OSError: if the reference cannot be read, or has no index
-        and none can be written beside it.
+    :raises FileNotFoundError: for a reference `quadrat.chrom_lengths` refuses as missing; if a track
+        path does not exist; or for a locus file or an exclusion list
+        `readable_windows` finds nothing at.
+    :raises OSError: if the reference cannot otherwise be read, or has
+        no index and none can be written beside it, or for a track
+        `quadrat.stores.track_frame` cannot read.
     :raises ImportError: if the ``pileup`` extra is needed and not
         installed.
 
@@ -740,6 +742,11 @@ def extract_loci(
         if tracks is None:
             continue
         track_sets[label] = track_list("extract_loci", label, tracks)
+        if not track_sets[label]:
+            raise ValueError(
+                "extract_loci reads one channel per track: `{0}` holds no "
+                "track. Pass {0}=None to read none.".format(label)
+            )
         # Opened here for the reason the ``signals`` parameter gives.
         for track in track_sets[label]:
             track_frame(track)
@@ -758,7 +765,7 @@ def extract_loci(
             "extract_loci reads signal over the output window: `signals` "
             "needs `out_window`, and none was given."
         )
-    elif (signals or counting) and not -len(signals) <= target_idx < len(signals):
+    elif not -len(signals) <= target_idx < len(signals):
         raise ValueError(
             "extract_loci counts over one signal track: target_idx {} "
             "names none of the {} given.".format(target_idx, len(signals))
