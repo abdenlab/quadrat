@@ -7,9 +7,11 @@ rows, the functions that key, write and read a persisted entry,
 lays peaks and negatives out as one window set,
 `resolve_residency` that decides where a cache keeps its arrays,
 `default_cache_dir` and `make_scratch_dir` that decide where entries
-and scratch directories go, and `require_windows`, `require_index`,
-`track_list` and `window_columns`, the argument checks and the window
-decomposition this package's readers of window sets share.
+and scratch directories go, `hash_reference` and `file_stamp` that a
+key folds a reference and a file in with, and `require_windows`,
+`require_index`, `track_list` and `window_columns`, the argument
+checks and the window decomposition this package's readers of window
+sets share.
 
 Everything here is package-internal: no name carries a ``# public``
 marker and none is re-exported from `quadrat`.
@@ -653,15 +655,8 @@ def window_cache_key(
     Every input is a file, and one held in memory, whether a locus
     set, an exclusion list or a track, is refused rather than keyed.
 
-    **The reference is indexed before it is hashed.** A reference with
-    no FASTA index has one written beside it, as
-    `quadrat.stores.SequenceStore.contig_lengths` writes it, so the key
-    is the one a build over the reference, which indexes it, leaves
-    behind. A reference that exists and cannot be indexed, nothing
-    being writable beside it, is refused, since a training read takes
-    its sequence through the index. A reference that does not exist is
-    keyed by its path and an absent index, and left for whatever reads
-    it to refuse.
+    The reference is folded in as `hash_reference` states, indexed
+    first.
 
     :param signals: The signal tracks, in channel order, as
         `track_list` takes them, each a path. A single path is refused
@@ -708,8 +703,7 @@ def window_cache_key(
         for a ``max_jitter`` `quadrat.rules.as_jitter` refuses by type.
     :raises ValueError: for a ``max_jitter`` `quadrat.rules.as_jitter`
         refuses by value.
-    :raises OSError: if the reference exists and has no usable index,
-        and none can be written beside it, or cannot be read.
+    :raises OSError: for a reference `hash_reference` refuses.
 
     .. rubric:: Implementation notes
 
@@ -719,15 +713,6 @@ def window_cache_key(
     the row count of every file and the pileup arguments that produced
     them, so a regenerated track almost always changes it, and the
     sizes and modification times catch one rewritten to the same shape.
-
-    The reference is hashed through its index, not its sequence --
-    tens of kilobytes against gigabytes -- and `chrom_lengths` reads
-    the index too, so it is the part that decides anything here.
-
-    It is indexed first because the build writes an index where there
-    is none, after the key is taken: a key over the absent index would
-    file the first build's entry under a key no later run, which finds
-    the index, ever takes again.
 
     The domain tag `_KEY_DOMAIN` names this package, so two packages
     that group the same tracks the same way never read each other's
@@ -756,16 +741,7 @@ def window_cache_key(
             digest.update(os.path.abspath(path).encode())
             _hash_file(digest, path)
 
-    digest.update(b"sequences")
-    digest.update(os.path.abspath(reference).encode())
-    # Indexed first, as the docstring states.
-    if os.path.exists(reference):
-        SequenceStore(reference).contig_lengths()
-    # The index rather than `reference` itself, for the reason in the
-    # notes, and through the normalized path: a name spelled with `str`
-    # from a `bytes` reference is a repr naming no file, and every
-    # absent index hashes alike, so two genomes would collide.
-    _hash_file(digest, reference + ".fai")
+    hash_reference(digest, reference)
 
     digest.update(
         json.dumps(
@@ -800,6 +776,64 @@ def window_cache_key(
             _hash_track(digest, path)
 
     return digest.hexdigest()
+
+
+def hash_reference(digest, reference):
+    """Fold a reference's identity into ``digest``: its path and its index.
+
+    A reference with no FASTA index has one written beside it first,
+    as `quadrat.stores.SequenceStore.contig_lengths` writes it, and its
+    ``.fai`` is hashed rather than its sequence. A reference that exists
+    and cannot be indexed, nothing being writable beside it, is
+    refused, since a training read takes its sequence through the
+    index. A reference that does not exist is folded in by its path and
+    an absent index, and left for whatever reads it to refuse. The
+    refusal of a reference that is not a path stays with each caller,
+    as `quadrat._engine.fspath_or_none` says a refusal does.
+
+    :param digest: A `hashlib` hash object, updated in place.
+    :param reference: The reference, as a `str`.
+    :raises OSError: if the reference exists and has no usable index,
+        and none can be written beside it, or cannot be read.
+
+    .. rubric:: Implementation notes
+
+    Through the index rather than the sequence -- tens of kilobytes
+    against gigabytes -- and `quadrat.reference.chrom_lengths` reads
+    the index too, so it is the part that decides anything a key
+    covers.
+
+    Indexed first because a build writes an index where there is none,
+    after the key is taken: a key over the absent index would file the
+    first build's entry under a key no later run, which finds the
+    index, ever takes again.
+    """
+
+    digest.update(b"sequences")
+    digest.update(os.path.abspath(reference).encode())
+    if os.path.exists(reference):
+        SequenceStore(reference).contig_lengths()
+    # The index rather than `reference` itself, and through the
+    # normalized path: a name spelled with `str` from a `bytes`
+    # reference is a repr naming no file, and every absent index
+    # hashes alike, so two genomes would collide.
+    _hash_file(digest, reference + ".fai")
+
+
+def file_stamp(path):
+    """Return a file's size and modification time, as the text a key folds in.
+
+    What a key holds for a file it does not hash by content, as
+    `window_cache_key` holds a track's Parquet files.
+
+    :param path: The file, as a `str`.
+    :returns: ``"<size>:<mtime_ns>"``.
+    :raises OSError: if the file cannot be stat'd, `FileNotFoundError`
+        included.
+    """
+
+    info = os.stat(path)
+    return "{}:{}".format(info.st_size, info.st_mtime_ns)
 
 
 def read_window_cache(cache_dir, key, residency=None):
@@ -2140,8 +2174,9 @@ def _hash_track(digest, path):
     for name in entries:
         if not name.endswith(".parquet"):
             continue
-        info = os.stat(os.path.join(path, name))
-        digest.update("{}:{}:{}".format(name, info.st_size, info.st_mtime_ns).encode())
+        digest.update(
+            "{}:{}".format(name, file_stamp(os.path.join(path, name))).encode()
+        )
 
 
 def _reap_scratch(root, owner_pid):

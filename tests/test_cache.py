@@ -33,6 +33,7 @@ fundamental failure.
 """
 
 import gc
+import hashlib
 import inspect
 import json
 import multiprocessing
@@ -3955,6 +3956,158 @@ def test_default_cache_dir_should_ignore_a_variable_set_to_nothing(monkeypatch):
 
     # Assert
     assert resolved == os.path.join("/xdg", "quadrat", "windows")
+
+
+def test_hash_reference_should_index_a_reference_before_hashing_it(tmp_path):
+    """Test that a reference with no index is indexed first.
+
+    Given:
+        A reference with no index.
+    When:
+        It is folded into a digest, and then into a second.
+    Then:
+        An index should exist beside it, and the two digests should be
+        equal.
+    """
+
+    # Arrange
+    fasta = tmp_path / "ref.fa"
+    fasta.write_text(">chr1\nACGTACGT\n")
+    digests = [hashlib.sha256(), hashlib.sha256()]
+
+    # Act
+    for digest in digests:
+        cache.hash_reference(digest, str(fasta))
+
+    # Assert
+    assert (tmp_path / "ref.fa.fai").is_file()
+    assert digests[0].hexdigest() == digests[1].hexdigest()
+
+
+def test_hash_reference_should_ignore_the_sequence(tmp_path):
+    """Test that a key follows a reference's index and not its sequence.
+
+    Given:
+        An indexed reference, and then the same reference rewritten to
+        other bases of the same lengths and line widths, so its index
+        is unchanged.
+    When:
+        Each is folded into a fresh digest.
+    Then:
+        The two digests should be equal.
+    """
+
+    # Arrange
+    fasta = tmp_path / "ref.fa"
+    fasta.write_text(">chr1\nACGTACGT\n")
+    cache.hash_reference(hashlib.sha256(), str(fasta))
+    digests = []
+
+    # Act
+    for residues in ("ACGTACGT", "TTTTTTTT"):
+        fasta.write_text(">chr1\n{}\n".format(residues))
+        digest = hashlib.sha256()
+        cache.hash_reference(digest, str(fasta))
+        digests.append(digest.hexdigest())
+
+    # Assert
+    assert digests[0] == digests[1]
+
+
+def test_hash_reference_should_change_with_the_contigs(tmp_path):
+    """Test that a reference with other contigs keys differently.
+
+    Given:
+        Two references at one path, the second with a longer contig.
+    When:
+        Each is folded into a fresh digest, its stale index removed
+        between them.
+    Then:
+        The two digests should differ.
+    """
+
+    # Arrange
+    fasta = tmp_path / "ref.fa"
+    digests = []
+
+    # Act
+    for residues in ("ACGT", "ACGTACGT"):
+        fasta.write_text(">chr1\n{}\n".format(residues))
+        if (tmp_path / "ref.fa.fai").exists():
+            (tmp_path / "ref.fa.fai").unlink()
+        hashed = hashlib.sha256()
+        cache.hash_reference(hashed, str(fasta))
+        digests.append(hashed.hexdigest())
+
+    # Assert
+    assert digests[0] != digests[1]
+
+
+def test_file_stamp_should_answer_the_size_and_modification_time(tmp_path):
+    """Test the text a key holds for a file it does not hash.
+
+    Given:
+        A file of five bytes.
+    When:
+        Its stamp is taken.
+    Then:
+        It should be the size and the nanosecond modification time,
+        colon-separated.
+    """
+
+    # Arrange
+    path = tmp_path / "f"
+    path.write_bytes(b"12345")
+    info = os.stat(path)
+
+    # Act
+    stamp = cache.file_stamp(str(path))
+
+    # Assert
+    assert stamp == "5:{}".format(info.st_mtime_ns)
+
+
+def test_file_stamp_should_change_with_the_size(tmp_path):
+    """Test that a rewritten file stamps differently.
+
+    Given:
+        A file of five bytes, stamped, then rewritten with six and its
+        modification time set back to what it was.
+    When:
+        It is stamped again.
+    Then:
+        The two stamps should differ.
+    """
+
+    # Arrange
+    path = tmp_path / "f"
+    path.write_bytes(b"12345")
+    info = os.stat(path)
+    before = cache.file_stamp(str(path))
+    path.write_bytes(b"123456")
+    os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+
+    # Act
+    after = cache.file_stamp(str(path))
+
+    # Assert
+    assert after != before
+
+
+def test_file_stamp_should_raise_file_not_found_error_for_a_missing_file(tmp_path):
+    """Test the refusal of a file that does not exist.
+
+    Given:
+        A path with nothing at it.
+    When:
+        Its stamp is taken.
+    Then:
+        It should raise `FileNotFoundError`.
+    """
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError):
+        cache.file_stamp(str(tmp_path / "absent"))
 
 
 def test_window_cache_key_should_answer_the_same_key_for_the_same_inputs(tmp_path):
