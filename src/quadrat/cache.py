@@ -5,10 +5,11 @@ cache holds, `window_group_sums` for per-window totals over the same
 rows, the functions that key, write and read a persisted entry,
 `window_cache` that reads an entry or builds it, `joint_windows` that
 lays peaks and negatives out as one window set,
-`resolve_residency` that decides where a cache keeps its arrays, and
-`require_windows`, `require_index`, `track_list` and `window_columns`,
-the argument checks and the window decomposition this package's readers
-of window sets share.
+`resolve_residency` that decides where a cache keeps its arrays,
+`default_cache_dir` and `make_scratch_dir` that decide where entries
+and scratch directories go, and `require_windows`, `require_index`,
+`track_list` and `window_columns`, the argument checks and the window
+decomposition this package's readers of window sets share.
 
 Everything here is package-internal: no name carries a ``# public``
 marker and none is re-exported from `quadrat`.
@@ -82,6 +83,11 @@ RESIDENCIES = ("memory", "mapped")
 #: rather than once, so a process that sets it after importing this
 #: package is not left pointed at the real user cache.
 _CACHE_DIR_ENV = "QUADRAT_CACHE_DIR"
+
+
+#: The kinds of persisted entry `default_cache_dir` resolves a
+#: directory for, each a directory of its own under one root.
+_CACHE_KINDS = ("windows", "tracks")
 
 
 #: Where a scratch directory is made when none is named. Read on every
@@ -344,9 +350,7 @@ class WindowSignalCache(ProcessLocalHandles):
                 meta=array_meta(arrays),
             )
 
-        if scratch_dir is None:
-            scratch_dir = os.environ.get(_SCRATCH_DIR_ENV) or None
-        root = tempfile.mkdtemp(prefix="quadrat-cache-", dir=scratch_dir)
+        root = make_scratch_dir("quadrat-cache-", scratch_dir)
         # Registered before the arrays are written, not after the cache
         # exists, so that every exit path from here on is covered: the
         # write failing, `array_meta` failing, or the process ending
@@ -545,19 +549,22 @@ class WindowSignalCache(ProcessLocalHandles):
         return arrays
 
 
-def default_cache_dir():
-    """Return where persisted entries go when the caller names no directory.
+def default_cache_dir(kind="windows"):
+    """Return where persisted entries of one kind go when the caller names no directory.
 
     Resolved from the environment on every call. ``QUADRAT_CACHE_DIR``
     wins, then the XDG convention, then a home-relative default -- so
     caching needs no configuration and relocating it needs one
-    variable.
+    variable. Each kind is a directory of its own under that root.
 
-    **Nothing in this package reclaims what accumulates here.** An
-    entry is keyed by the whole of what decides its contents, window
-    geometry included, so a sweep over geometries mints a fresh entry
-    per configuration and keeps every one of them; each is the size of
-    the grouped arrays, which is gigabytes at a realistic locus set.
+    **Nothing in this package reclaims what accumulates here.** A
+    window entry is keyed by the whole of what decides its contents,
+    window geometry included, so a sweep over geometries mints a fresh
+    entry per configuration and keeps every one of them; each is the
+    size of the grouped arrays, which is gigabytes at a realistic locus
+    set. A track entry is the Parquet tracks of one pileup over the
+    whole reference, which grow with the positions its alignments
+    cover.
     There is no eviction, no age limit and no size cap, deliberately:
     a retention policy for someone else's disk is the caller's to set,
     and a sweep that deletes gigabytes should not be something a
@@ -565,18 +572,47 @@ def default_cache_dir():
     bounded should point ``QUADRAT_CACHE_DIR`` somewhere they manage
     and delete entry directories outright -- each is self-contained,
     and a missing one is a miss rather than an error.
+
+    :param kind: ``"windows"`` for window cache entries or
+        ``"tracks"`` for track entries.
+    :returns: The directory, as a `str`. It is not created.
+    :raises ValueError: if ``kind`` is neither.
     """
 
+    if kind not in _CACHE_KINDS:
+        raise ValueError(
+            "default_cache_dir resolves one of {}, got {!r}.".format(
+                ", ".join(repr(name) for name in _CACHE_KINDS), kind
+            )
+        )
     named = os.environ.get(_CACHE_DIR_ENV)
     if named:
-        return os.path.join(os.path.expanduser(named), "windows")
+        return os.path.join(os.path.expanduser(named), kind)
     xdg = os.environ.get("XDG_CACHE_HOME")
     root = (
         os.path.expanduser(xdg)
         if xdg
         else os.path.join(os.path.expanduser("~"), ".cache")
     )
-    return os.path.join(root, "quadrat", "windows")
+    return os.path.join(root, "quadrat", kind)
+
+
+def make_scratch_dir(prefix, scratch_dir=None):
+    """Create an empty scratch directory and return its path.
+
+    :param prefix: The directory name's prefix.
+    :param scratch_dir: Where to make it, or ``None`` for
+        ``QUADRAT_SCRATCH_DIR`` where that is set and the platform
+        temporary directory where not.
+    :returns: The directory, as a `str`. Removing it is the caller's.
+    :raises FileNotFoundError: if the directory to make it in does not
+        exist.
+    :raises OSError: if it cannot be made there.
+    """
+
+    if scratch_dir is None:
+        scratch_dir = os.environ.get(_SCRATCH_DIR_ENV) or None
+    return tempfile.mkdtemp(prefix=prefix, dir=scratch_dir)
 
 
 def window_cache_key(

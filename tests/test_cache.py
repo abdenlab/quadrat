@@ -2297,6 +2297,50 @@ def test_write_cache_arrays_should_write_the_four_the_layout_names(tmp_path, tra
     )
 
 
+def test_make_scratch_dir_should_make_an_empty_directory_where_named(tmp_path):
+    """Test a scratch directory made under a named root.
+
+    Given:
+        A named scratch root and a prefix.
+    When:
+        A scratch directory is made.
+    Then:
+        It should be an empty directory under that root whose name
+        starts with the prefix.
+    """
+
+    # Act
+    made = cache.make_scratch_dir("quadrat-x-", str(tmp_path))
+
+    # Assert
+    assert os.path.dirname(made) == str(tmp_path)
+    assert os.path.basename(made).startswith("quadrat-x-")
+    assert os.listdir(made) == []
+
+
+def test_make_scratch_dir_should_follow_the_environment_when_unnamed(
+    tmp_path, monkeypatch
+):
+    """Test the scratch root a caller names nothing for.
+
+    Given:
+        No scratch root, and ``QUADRAT_SCRATCH_DIR`` set.
+    When:
+        A scratch directory is made.
+    Then:
+        It should sit under the directory the variable names.
+    """
+
+    # Arrange
+    monkeypatch.setenv("QUADRAT_SCRATCH_DIR", str(tmp_path))
+
+    # Act
+    made = cache.make_scratch_dir("quadrat-x-")
+
+    # Assert
+    assert os.path.dirname(made) == str(tmp_path)
+
+
 class TestWindowSignalCache:
     """The grouped cache, read by draw."""
 
@@ -3774,17 +3818,55 @@ def test_default_cache_dir_should_follow_the_environment_on_every_call(monkeypat
     assert second == os.path.join("/tmp/second", "windows")
 
 
-def test_default_cache_dir_should_fall_back_to_the_xdg_convention(monkeypatch):
+def test_default_cache_dir_should_put_each_kind_in_a_directory_of_its_own(monkeypatch):
+    """Test that window entries and managed track entries share a root.
+
+    Given:
+        A cache directory named in the environment.
+    When:
+        The default is asked for windows and for tracks.
+    Then:
+        Each should be a directory of its own, named for its kind,
+        under that root.
+    """
+
+    # Arrange
+    monkeypatch.setenv("QUADRAT_CACHE_DIR", "/tmp/root")
+
+    # Act & assert
+    assert cache.default_cache_dir("windows") == os.path.join("/tmp/root", "windows")
+    assert cache.default_cache_dir("tracks") == os.path.join("/tmp/root", "tracks")
+
+
+def test_default_cache_dir_should_raise_value_error_for_an_unknown_kind():
+    """Test the refusal of a kind of entry this package does not persist.
+
+    Given:
+        A kind that is neither ``"windows"`` nor ``"tracks"``.
+    When:
+        The default is asked for it.
+    Then:
+        It should raise `ValueError` naming the two kinds.
+    """
+
+    # Act & assert
+    with pytest.raises(ValueError, match="'windows', 'tracks'"):
+        cache.default_cache_dir("bigwigs")
+
+
+@pytest.mark.parametrize("kind", ["windows", "tracks"])
+def test_default_cache_dir_should_fall_back_to_the_xdg_convention(monkeypatch, kind):
     """Test where entries go with no variable of our own set.
 
     Given:
-        No ``QUADRAT_CACHE_DIR`` and an ``XDG_CACHE_HOME``.
+        No ``QUADRAT_CACHE_DIR`` and an ``XDG_CACHE_HOME``, for window
+        entries and for managed track entries.
     When:
         The default is asked for.
     Then:
-        It should sit under the XDG directory, named for this package,
-        so caching works with no configuration and relocating the
-        whole user cache relocates this too.
+        It should sit under the XDG directory, named for this package
+        and then for the kind, so caching works with no configuration
+        and relocating the whole user cache relocates this too.
     """
 
     # Arrange
@@ -3792,15 +3874,19 @@ def test_default_cache_dir_should_fall_back_to_the_xdg_convention(monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", "/tmp/xdg")
 
     # Act & assert
-    assert cache.default_cache_dir() == os.path.join("/tmp/xdg", "quadrat", "windows")
+    assert cache.default_cache_dir(kind) == os.path.join("/tmp/xdg", "quadrat", kind)
 
 
-def test_default_cache_dir_should_fall_back_to_a_home_relative_default(monkeypatch):
+@pytest.mark.parametrize("kind", ["windows", "tracks"])
+def test_default_cache_dir_should_fall_back_to_a_home_relative_default(
+    monkeypatch, kind
+):
     """Test where entries go with nothing in the environment at all.
 
     Given:
         Neither the package's variable nor the XDG one set, and a home
-        directory of its own.
+        directory of its own, for window entries and for managed track
+        entries.
     When:
         The default is asked for.
     Then:
@@ -3814,10 +3900,10 @@ def test_default_cache_dir_should_fall_back_to_a_home_relative_default(monkeypat
     monkeypatch.setenv("HOME", "/home/someone")
 
     # Act
-    resolved = cache.default_cache_dir()
+    resolved = cache.default_cache_dir(kind)
 
     # Assert
-    assert resolved == os.path.join("/home/someone", ".cache", "quadrat", "windows")
+    assert resolved == os.path.join("/home/someone", ".cache", "quadrat", kind)
 
 
 @pytest.mark.parametrize("variable", ["QUADRAT_CACHE_DIR", "XDG_CACHE_HOME"])
