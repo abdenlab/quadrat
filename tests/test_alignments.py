@@ -10,6 +10,10 @@ only a CSI beside it, because polars-bio cannot restrict a scan with
 one and treating it as an index would promise a pushdown that does
 not exist.
 
+`bam_index_path` is pinned on the two index spellings htslib
+accepts, the one it prefers where both exist, and a CSI, which it
+does not count.
+
 The contig-naming refusals of a pileup are tested against alignments
 built to mismatch their reference, rather than against the synthetic
 BAMs the rest of this module uses, which are all indexed and all
@@ -602,6 +606,70 @@ def test_require_reference_contigs_should_count_the_contigs_its_refusal_does_not
         alignments.require_reference_contigs(
             dict(TWO_CONTIGS), {"ensembl.bam": header}, ["ensembl.bam"], "genome.fa"
         )
+
+
+@pytest.mark.parametrize("spelling", ["x.bam.bai", "x.bai"])
+def test_bam_index_path_should_answer_either_htslib_spelling(tmp_path, spelling):
+    """Test that both index names htslib accepts are found.
+
+    Given:
+        An alignment whose index is spelled one of the two ways htslib
+        accepts.
+    When:
+        Its index is asked for.
+    Then:
+        It should answer that index's path.
+    """
+
+    # Arrange
+    alignment = tmp_path / "x.bam"
+    alignment.write_bytes(b"")
+    (tmp_path / spelling).write_bytes(b"")
+
+    # Act & assert
+    assert alignments.bam_index_path(alignment) == str(tmp_path / spelling)
+
+
+def test_bam_index_path_should_prefer_the_index_beside_the_file(tmp_path):
+    """Test which index is answered where both spellings exist.
+
+    Given:
+        An alignment with both ``x.bam.bai`` and ``x.bai``.
+    When:
+        Its index is asked for.
+    Then:
+        It should answer ``x.bam.bai``.
+    """
+
+    # Arrange
+    alignment = tmp_path / "x.bam"
+    for name in ("x.bam", "x.bam.bai", "x.bai"):
+        (tmp_path / name).write_bytes(b"")
+
+    # Act & assert
+    assert alignments.bam_index_path(alignment) == str(tmp_path / "x.bam.bai")
+
+
+@pytest.mark.parametrize("present", [[], ["x.bam.csi"]], ids=["nothing", "csi-only"])
+def test_bam_index_path_should_answer_none_without_a_bai(tmp_path, present):
+    """Test that an alignment with no BAI has no index here.
+
+    Given:
+        An alignment with nothing beside it, and one with only a
+        ``.csi``, which polars-bio cannot restrict a scan with.
+    When:
+        Its index is asked for.
+    Then:
+        It should answer ``None``.
+    """
+
+    # Arrange
+    alignment = tmp_path / "x.bam"
+    for name in ["x.bam"] + present:
+        (tmp_path / name).write_bytes(b"")
+
+    # Act & assert
+    assert alignments.bam_index_path(alignment) is None
 
 
 @pytest.mark.parametrize("groups", [1, 4])
