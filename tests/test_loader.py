@@ -31,6 +31,7 @@ import hashlib
 import math
 import os
 import sys
+import tempfile
 import types
 import weakref
 from types import MappingProxyType
@@ -43,7 +44,18 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from hypothesis.extra import numpy as hnp
 
-from quadrat import cache, dataset, groups, loader, loci, sampling, stores
+from quadrat import (
+    Aggregate,
+    cache,
+    dataset,
+    groups,
+    loader,
+    loci,
+    managed,
+    pileup_alignments,
+    sampling,
+    stores,
+)
 from quadrat.rules import Exclusion, Jitter
 from tests import (
     CONFIG_IDS,
@@ -217,6 +229,30 @@ def peak_spans(request, corpus_factory, pysam):
         out_window=OUT_WINDOW,
     )
     return (corpus, *pile_up_spans(corpus, "span", pysam, 1 / 3, request.param))
+
+
+@pytest.fixture(scope="module")
+def alignment_corpus(corpus_factory):
+    """Build two indexed alignments over the loader geometry, with peaks and negatives.
+
+    It carries the signal tracks too, which `arguments` reads for its
+    default signals before a test overrides them.
+    """
+
+    pytest.importorskip("polars_bio")
+    return corpus_factory(
+        "loader-alignments",
+        CHROM_SIZES,
+        n_bams=2,
+        n_reads=400,
+        index_fasta=True,
+        peaks=PEAKS,
+        negatives=NEGATIVES,
+        tracks=SIGNAL_ROWS,
+        in_window=IN_WINDOW,
+        out_window=OUT_WINDOW,
+        max_jitter=MAX_JITTER,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -2806,3 +2842,370 @@ def test_build_training_loader_should_print_nothing_when_not_verbose(corpus, cap
 
     # Assert
     assert capsys.readouterr().out == ""
+
+
+def test_build_training_loader_should_draw_from_alignments_what_it_draws_from_their_tracks(
+    alignment_corpus, tmp_path
+):
+    """Test that a channel given as alignments reads as the tracks they pile up into.
+
+    Given:
+        Two alignments piled up directly, stranded as the signal and
+        unstranded as the control; and the same two given as
+        `quadrat.managed.Alignments`, the stranded one as a group of
+        its own.
+    When:
+        A loader is built from each, with one seed, and one epoch is
+        drawn from both.
+    Then:
+        The two streams should be equal batch for batch, and the
+        loaders' datasets should group the signal as one pair.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    stranded = pileup_alignments(corpus.bams, corpus.fasta, str(tmp_path / "s"))
+    (pooled,) = pileup_alignments(
+        corpus.bams,
+        corpus.fasta,
+        str(tmp_path / "c"),
+        aggregate=Aggregate(unstranded=True),
+    )
+    shared = arguments(corpus, cache_dir=False)
+    direct = loader.build_training_loader(
+        **dict(shared, signals=[stranded], controls=[pooled])
+    )
+
+    # Act
+    piled = loader.build_training_loader(
+        **dict(
+            shared,
+            signals=[managed.Alignments(corpus.bams)],
+            controls=[managed.Alignments(corpus.bams, Aggregate(unstranded=True))],
+        )
+    )
+
+    # Assert
+    assert piled.dataset.signal_groups == direct.dataset.signal_groups == (2,)
+    assert same_batches(drain(piled, n_epochs=1), drain(direct, n_epochs=1))
+
+
+def test_build_training_loader_should_reuse_piled_up_tracks_across_window_sets(
+    alignment_corpus,
+):
+    """Test that managed tracks outlive the window entry they were grouped into.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments`, which
+        persists its tracks under the default managed track directory.
+    When:
+        A second loader is built from it over another window geometry,
+        which misses the window cache.
+    Then:
+        The managed track directory should hold the one entry it held
+        after the first build, the same directory, and the window cache
+        two entries.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(corpus, signals=[managed.Alignments(corpus.bams)])
+    loader.build_training_loader(**given)
+    tracks = cache.default_cache_dir("tracks")
+    (entry,) = [name for name in os.listdir(tracks) if "." not in name]
+    inode = os.stat(os.path.join(tracks, entry)).st_ino
+
+    # Act
+    loader.build_training_loader(**dict(given, max_jitter=MAX_JITTER - 2))
+
+    # Assert
+    assert [name for name in os.listdir(tracks) if "." not in name] == [entry]
+    assert os.stat(os.path.join(tracks, entry)).st_ino == inode
+    windows = cache.default_cache_dir("windows")
+    assert len([name for name in os.listdir(windows) if "." not in name]) == 2
+
+
+def test_build_training_loader_should_persist_no_track_when_nothing_is_cached(
+    alignment_corpus, tmp_path, monkeypatch, mocker
+):
+    """Test that a build that persists nothing piles up into its scratch and removes it.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with
+        ``cache_dir=False`` and a named ``scratch_dir``, its mtime set to
+        the epoch, with ``QUADRAT_SCRATCH_DIR`` and the platform
+        temporary directory each pointed at a directory of their own.
+    When:
+        It is built and drawn from.
+    Then:
+        The named scratch directory should have been written to and be
+        empty again, the other two should be untouched, and nothing
+        should exist under the cache root.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    named, variable, platform = (tmp_path / name for name in ("named", "var", "tmp"))
+    for directory in (named, variable, platform):
+        directory.mkdir()
+        os.utime(directory, ns=(0, 0))
+    monkeypatch.setenv("QUADRAT_SCRATCH_DIR", str(variable))
+    mocker.patch.object(tempfile, "tempdir", str(platform))
+
+    # Act
+    built = loader.build_training_loader(
+        **arguments(
+            corpus,
+            signals=[managed.Alignments(corpus.bams)],
+            cache_dir=False,
+            cache_residency="memory",
+            scratch_dir=str(named),
+        )
+    )
+    drain(built, n_epochs=1)
+
+    # Assert
+    assert named.stat().st_mtime_ns != 0 and list(named.iterdir()) == []
+    for untouched in (variable, platform):
+        assert untouched.stat().st_mtime_ns == 0 and list(untouched.iterdir()) == []
+    assert not os.path.exists(os.path.dirname(cache.default_cache_dir("tracks")))
+
+
+def test_build_training_loader_should_raise_file_not_found_error_for_a_missing_scratch_dir(
+    alignment_corpus, tmp_path
+):
+    """Test the refusal of a scratch directory that does not exist, for a pileup.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with
+        ``cache_dir=False`` and a ``scratch_dir`` with nothing at it.
+    When:
+        It is built.
+    Then:
+        It should raise `FileNotFoundError`.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(
+        corpus,
+        signals=[managed.Alignments(corpus.bams)],
+        cache_dir=False,
+        cache_residency="memory",
+        scratch_dir=str(tmp_path / "absent"),
+    )
+
+    # Act & assert
+    with pytest.raises(FileNotFoundError):
+        loader.build_training_loader(**given)
+
+
+def test_build_training_loader_should_keep_tracks_in_the_default_directory_when_cache_dir_is_named(
+    alignment_corpus, tmp_path
+):
+    """Test that naming the window cache directory does not move the tracks.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with a
+        named ``cache_dir``.
+    When:
+        It is built.
+    Then:
+        The default managed track directory should hold one entry, and
+        the named directory's parent should hold only the named
+        directory.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    windows = tmp_path / "named" / "windows"
+
+    # Act
+    loader.build_training_loader(
+        **arguments(
+            corpus, signals=[managed.Alignments(corpus.bams)], cache_dir=str(windows)
+        )
+    )
+
+    # Assert
+    tracks = cache.default_cache_dir("tracks")
+    assert len([name for name in os.listdir(tracks) if "." not in name]) == 1
+    assert os.listdir(windows.parent) == ["windows"]
+
+
+def test_build_training_loader_should_print_nothing_from_a_pileup_when_not_verbose(
+    alignment_corpus, capsys
+):
+    """Test the silence of a build that piles up.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments`, with
+        ``verbose`` off.
+    When:
+        It is built cold, piling the alignments up.
+    Then:
+        It should print nothing.
+    """
+
+    # Act
+    loader.build_training_loader(
+        **arguments(
+            alignment_corpus,
+            signals=[managed.Alignments(alignment_corpus.bams)],
+            cache_dir=False,
+        )
+    )
+
+    # Assert
+    assert capsys.readouterr().out == ""
+
+
+def test_build_training_loader_should_print_pileup_progress_when_verbose(
+    alignment_corpus, capsys
+):
+    """Test that ``verbose`` reaches the pileup.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments`, with
+        ``verbose`` on.
+    When:
+        It is built cold, piling the alignments up.
+    Then:
+        It should print the pileup's progress, which names the
+        positions it wrote.
+    """
+
+    # Act
+    loader.build_training_loader(
+        **arguments(
+            alignment_corpus,
+            signals=[managed.Alignments(alignment_corpus.bams)],
+            cache_dir=False,
+            verbose=True,
+        )
+    )
+
+    # Assert
+    assert "positions" in capsys.readouterr().out
+
+
+def test_build_training_loader_should_pile_up_into_a_named_track_dir(
+    alignment_corpus, tmp_path
+):
+    """Test that a managed track directory the caller names is used and kept.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with a
+        ``track_dir`` named and ``cache_dir=False``.
+    When:
+        It is built.
+    Then:
+        The named directory should hold one committed entry, and the
+        default managed track directory should not exist.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    named = tmp_path / "named"
+
+    # Act
+    loader.build_training_loader(
+        **arguments(
+            corpus,
+            signals=[managed.Alignments(corpus.bams)],
+            cache_dir=False,
+            track_dir=named,
+        )
+    )
+
+    # Assert
+    entries = [path for path in named.iterdir() if "." not in path.name]
+    assert len(entries) == 1
+    assert (named / (entries[0].name + ".manifest.json")).is_file()
+    assert not os.path.exists(cache.default_cache_dir("tracks"))
+
+
+@pytest.mark.parametrize("track_dir", [False, True])
+def test_build_training_loader_should_refuse_a_track_dir_before_piling_up(
+    alignment_corpus, track_dir
+):
+    """Test the refusal of a managed track directory that is not one.
+
+    Given:
+        A loader built from an `quadrat.managed.Alignments` with
+        ``track_dir`` ``False``, which is not how scratch is asked for,
+        and ``True``.
+    When:
+        It is built.
+    Then:
+        It should raise `TypeError`, with nothing written under the
+        cache root.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(
+        corpus, signals=[managed.Alignments(corpus.bams)], track_dir=track_dir
+    )
+
+    # Act & assert
+    with pytest.raises(TypeError, match="track_dir is a directory"):
+        loader.build_training_loader(**given)
+    assert not os.path.exists(os.path.dirname(cache.default_cache_dir("tracks")))
+
+
+def test_build_training_loader_should_refuse_a_stranded_alignments_inside_a_group(
+    alignment_corpus,
+):
+    """Test the refusal of a stranded pair given inside a larger group.
+
+    Given:
+        A loader whose signals are one group of a track and a stranded
+        `quadrat.managed.Alignments`.
+    When:
+        It is built.
+    Then:
+        It should raise `ValueError` saying a stranded `Alignments` is a
+        group of its own, with nothing written under the cache root.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(
+        corpus, signals=[[corpus.tracks[0], managed.Alignments(corpus.bams)]]
+    )
+
+    # Act & assert
+    with pytest.raises(ValueError, match="a signal group of its own"):
+        loader.build_training_loader(**given)
+    assert not os.path.exists(os.path.dirname(cache.default_cache_dir("tracks")))
+
+
+def test_build_training_loader_should_refuse_a_control_group_before_piling_up_signals(
+    alignment_corpus,
+):
+    """Test that a refused control group piles nothing up for the signals.
+
+    Given:
+        A loader whose signals are one stranded
+        `quadrat.managed.Alignments`, which would be piled up, and whose
+        controls are one group of a track and a stranded `Alignments`.
+    When:
+        It is built.
+    Then:
+        It should raise `ValueError` saying a stranded `Alignments` is a
+        group of its own, with nothing written under the cache root.
+    """
+
+    # Arrange
+    corpus = alignment_corpus
+    given = arguments(
+        corpus,
+        signals=[managed.Alignments(corpus.bams)],
+        controls=[[corpus.tracks[0], managed.Alignments(corpus.bams[:1])]],
+    )
+
+    # Act & assert
+    with pytest.raises(ValueError, match="a signal group of its own"):
+        loader.build_training_loader(**given)
+    assert not os.path.exists(os.path.dirname(cache.default_cache_dir("tracks")))

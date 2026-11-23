@@ -26,6 +26,7 @@ from quadrat.cache import (
 from quadrat.dataset import LocusDataset
 from quadrat.groups import normalize_signal_groups
 from quadrat.loci import readable_windows, require_track_contigs, within_counts
+from quadrat.managed import managed_track_dir_factory, resolve_alignments
 from quadrat.rules import as_jitter
 from quadrat.sampling import PeakNegativeMixSampler, ShardedEpochSampler
 from quadrat.stores import SequenceStore
@@ -190,6 +191,7 @@ def build_training_loader(
     verbose=False,
     cache_residency=None,
     cache_dir=None,
+    track_dir=None,
     fetch_size=None,
     rank=None,
     world_size=None,
@@ -234,6 +236,19 @@ def build_training_loader(
     entry, and `quadrat.cache.default_cache_dir` that nothing here
     reclaims one.
 
+    **Tracks piled up here.** A channel can be given as a
+    `quadrat.managed.Alignments` instead of a track. Each is piled up
+    with `quadrat.pileup_alignments` into an entry under ``track_dir``,
+    as `quadrat.managed.managed_tracks` states, or found there from an
+    earlier call, before anything above runs, and is then read as the
+    tracks it piled up into. An entry is keyed as
+    `quadrat.managed.alignments_key` states, and not by the windows,
+    so a change to the window geometry, the exclusions, the filters or
+    the loci regroups the tracks it finds and piles nothing up again.
+    A pileup runs after every refusal below that is made before
+    anything is read, and what `quadrat.pileup_alignments` raises for
+    it is raised unchanged.
+
     **The batches.** Each is the default collation of what
     `quadrat.dataset.LocusDataset` reads, in the order
     `quadrat.sampling.PeakNegativeMixSampler` plans. Given a
@@ -274,13 +289,15 @@ def build_training_loader(
         case, reads as an all-zero column; any other character is
         refused, with `ValueError`, by the read of a window that holds
         it, which under workers is a worker's read. Where ``cache_dir``
-        is ``False``, a reference with no index and nowhere to write one
-        is refused with `OSError` by the first read, as
-        `quadrat.stores.SequenceStore` states.
+        is ``False`` and no channel is a `quadrat.managed.Alignments`, a
+        reference with no index and nowhere to write one is refused with
+        `OSError` by the first read, as `quadrat.stores.SequenceStore`
+        states.
     :param signals: The signal tracks, as
         `quadrat.groups.normalize_signal_groups` takes them, each track
         of any shape `quadrat.stores.track_frame` accepts, an in-memory
-        one only with ``cache_dir=False``.
+        one only with ``cache_dir=False``, or a
+        `quadrat.managed.Alignments`, piled up as stated above.
     :param controls: The control tracks, in the same form, or ``None``
         or empty for none.
     :param chroms: The contigs to keep, as `quadrat.loci.load_windows`
@@ -313,7 +330,8 @@ def build_training_loader(
         not the batch this rank's loader yields, which holds
         ``batch_size // world_size``.
     :param verbose: Whether to print how many loci were kept, or that
-        an entry was reused.
+        an entry was reused, and the progress of any pileup, as
+        `quadrat.pileup_alignments` takes ``verbose``.
     :param cache_residency: Where the caches keep their arrays, as
         `quadrat.cache.WindowSignalCache.build` takes ``residency``.
     :param cache_dir: The directory holding entries, ``None`` for
@@ -323,6 +341,13 @@ def build_training_loader(
         its caches in a scratch directory until the process exits
         where ``cache_residency`` resolves to ``"mapped"``, as
         `quadrat.cache.WindowSignalCache.from_arrays` states.
+    :param track_dir: The directory tracks piled up from a
+        `quadrat.managed.Alignments` are kept in, or ``None``:
+        ``quadrat.cache.default_cache_dir("tracks")``, or where
+        ``cache_dir`` is ``False`` a scratch directory removed before
+        this returns, as `quadrat.managed.managed_track_dir_factory`
+        makes one and states who it belongs to. A ``cache_dir`` that is
+        named does not move them.
     :param fetch_size: How many samples a worker hands over at once, a
         whole multiple of the batches the loader yields, or ``None``
         to choose one as above. Equal to that batch, it fetches one
@@ -338,7 +363,9 @@ def build_training_loader(
         ``fetch_size`` is given.
     :param scratch_dir: Where a build that persists nothing makes its
         scratch directory, as `quadrat.cache.WindowSignalCache.build`
-        takes it.
+        takes it, and where tracks piled up into a scratch directory, as
+        ``track_dir`` states, are kept, as
+        `quadrat.managed.managed_track_dir_factory` takes it.
     :param timeout: How long to wait for a fetch from a worker, in
         seconds, as `torch.utils.data.DataLoader` takes it; ``0`` waits
         for as long as it takes.
@@ -362,13 +389,17 @@ def build_training_loader(
         sharding counting as rank ``0`` of a world of ``1``; for a
         ``cache_residency`` `quadrat.cache.resolve_residency` refuses;
         for a ``num_workers`` or ``timeout``
-        `torch.utils.data.DataLoader` refuses; if no peak is kept; if
-        ``negative_ratio`` is positive and no negative is kept; or for
+        `torch.utils.data.DataLoader` refuses; if a stranded
+        `quadrat.managed.Alignments` shares its group with another
+        track, as `quadrat.managed.resolve_alignments` refuses it; if no
+        peak is kept; if ``negative_ratio`` is positive and no negative
+        is kept; or for
         anything `quadrat.loci.load_windows` or
         `quadrat.loci.require_track_contigs` refuses by value. Each of
         these refusals but the last three is made before anything is
         read or keyed, and the last three before anything is grouped or
-        persisted.
+        a window entry is persisted, though after every
+        `quadrat.managed.Alignments` has been piled up into its entry.
     :raises TypeError: if ``signals`` or ``controls`` is anything but
         ``None``, a `list` or a `tuple`; if a locus set, an exclusion
         list or a track is held in memory while ``cache_dir`` is not
@@ -380,22 +411,28 @@ def build_training_loader(
         refuses by type; if ``in_window``, ``out_window``,
         ``num_workers`` or ``max_fetch_bytes`` is not an integer as
         `quadrat._engine.require_integer` takes one; if ``fetch_size``
-        or ``random_state`` is given and is not one; or for anything
+        or ``random_state`` is given and is not one; if ``track_dir``
+        is neither ``None`` nor a path; or for anything
         `quadrat.loci.load_windows` refuses by type. Each is made before
         anything is read or keyed, except the second, which is made as
         the cache is keyed, and the last.
     :raises FileNotFoundError: for a reference, a locus file or an
         exclusion list `quadrat.loci.readable_windows` finds nothing
         at, or a track `quadrat.loci.require_track_contigs` finds
-        nothing at, whether or not ``cache_dir`` is ``False``; or for a
-        ``scratch_dir`` that does not exist, where a build that persists
-        nothing makes its scratch directory there.
+        nothing at, whether or not ``cache_dir`` is ``False``; for an
+        alignment of a `quadrat.managed.Alignments` that does not exist;
+        or for a ``scratch_dir`` that does not exist, where a build that
+        persists nothing, or a pileup into a scratch directory, makes
+        its scratch directory there.
     :raises OSError: for a reference `quadrat.cache.window_cache_key`
-        refuses, where ``cache_dir`` is not ``False``, or one
-        `quadrat.loci.load_windows` cannot examine; or for a track
-        `quadrat.stores.track_frame` cannot read.
-    :raises ImportError: if a build is needed and the ``pileup`` extra
-        is not installed.
+        refuses, where ``cache_dir`` is not ``False``, one
+        `quadrat.managed.alignments_key` refuses, whatever ``cache_dir``
+        is, where a channel is a `quadrat.managed.Alignments`, or one
+        `quadrat.loci.load_windows` cannot examine; for a track
+        `quadrat.stores.track_frame` cannot read; or for an entry
+        `quadrat.managed.managed_tracks` cannot write.
+    :raises ImportError: if a build or a pileup is needed and the
+        ``pileup`` extra is not installed.
 
     .. rubric:: Implementation notes
 
@@ -482,26 +519,6 @@ def build_training_loader(
     if chroms is not None and not isinstance(chroms, (str, bytes)):
         chroms = list(chroms)
 
-    key = None
-    if cache_dir is not False:
-        key = window_cache_key(
-            signal_tracks,
-            sequences,
-            peaks,
-            negatives,
-            chroms=chroms,
-            in_window=in_window,
-            out_window=out_window,
-            max_jitter=jitter,
-            summits=summits,
-            exclusion_lists=exclusion_lists,
-            min_counts=min_counts,
-            max_counts=max_counts,
-            signal_groups=signal_groups,
-            controls=control_tracks,
-            control_groups=control_groups,
-        )
-
     def readable(loci, widening, centred):
         windows, keep = readable_windows(
             loci,
@@ -551,17 +568,51 @@ def build_training_loader(
         )
         return peak_windows, negative_windows, int(outliers.sum())
 
-    peak_windows, negative_windows, signal_cache, control_cache, n_outliers = (
-        window_cache(
-            key,
-            kept_windows,
-            signal_tracks,
-            control_tracks,
-            cache_dir=None if cache_dir is False else cache_dir,
-            residency=cache_residency,
-            scratch_dir=scratch_dir,
+    # The default the docstring states: scratch, i.e., `None` to the
+    # block below, only where nothing persists.
+    if track_dir is None and cache_dir is not False:
+        track_dir = default_cache_dir("tracks")
+    # Every track is read by the end of the block, so tracks piled up
+    # into a scratch directory are not needed past it.
+    with managed_track_dir_factory(track_dir, scratch_dir) as track_dir_factory:
+        (signal_tracks, signal_groups), (control_tracks, control_groups) = (
+            resolve_alignments(
+                [(signal_tracks, signal_groups), (control_tracks, control_groups)],
+                sequences,
+                track_dir_factory,
+                verbose=verbose,
+            )
         )
-    )
+        key = None
+        if cache_dir is not False:
+            key = window_cache_key(
+                signal_tracks,
+                sequences,
+                peaks,
+                negatives,
+                chroms=chroms,
+                in_window=in_window,
+                out_window=out_window,
+                max_jitter=jitter,
+                summits=summits,
+                exclusion_lists=exclusion_lists,
+                min_counts=min_counts,
+                max_counts=max_counts,
+                signal_groups=signal_groups,
+                controls=control_tracks,
+                control_groups=control_groups,
+            )
+        peak_windows, negative_windows, signal_cache, control_cache, n_outliers = (
+            window_cache(
+                key,
+                kept_windows,
+                signal_tracks,
+                control_tracks,
+                cache_dir=None if cache_dir is False else cache_dir,
+                residency=cache_residency,
+                scratch_dir=scratch_dir,
+            )
+        )
 
     if verbose and n_outliers is not None:
         print(

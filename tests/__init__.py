@@ -23,6 +23,7 @@ from types import MappingProxyType
 import numpy
 import pytest
 from hypothesis import HealthCheck, settings
+from hypothesis import strategies as st
 
 try:
     import polars
@@ -78,6 +79,48 @@ GOLDEN_CONFIGS = MappingProxyType(
 CONFIG_IDS = tuple(sorted(GOLDEN_CONFIGS))
 
 
+@st.composite
+def aggregates(draw):
+    """Any record `Aggregate` accepts."""
+
+    # Imported here, not at the top: the conftest imports this module
+    # before its environment block, which has to run before anything
+    # imports `quadrat`, for the reason its module docstring gives.
+    from quadrat import Aggregate
+
+    position = draw(st.sampled_from(("five_prime", "three_prime", "midpoint", "span")))
+    exclude = draw(st.integers(0, 0xFFFF))
+    require = draw(st.integers(0, 0xFFFF)) & ~(exclude | 0x4)
+    floor = draw(st.integers(0, 1000))
+    # A midpoint ceiling below one admits no record, so is never drawn.
+    lowest = max(floor, 1) if position == "midpoint" else floor
+    ceiling = draw(st.one_of(st.none(), st.integers(lowest, 2000)))
+    shifts = (
+        (0, 0)
+        if position in ("midpoint", "span")
+        else (draw(st.integers(-50, 50)), draw(st.integers(-50, 50)))
+    )
+    unstranded = draw(
+        st.sampled_from((None, True))
+        if position == "midpoint"
+        else st.one_of(st.none(), st.booleans())
+    )
+    spliced = draw(st.booleans()) if position == "span" else False
+    return Aggregate(
+        exclude_flags=exclude,
+        require_flags=require,
+        min_mapq=draw(st.integers(0, 255)),
+        min_template_length=floor,
+        max_template_length=ceiling,
+        position=position,
+        start_shift=shifts[0],
+        end_shift=shifts[1],
+        unstranded=unstranded,
+        scale_factor=draw(st.floats(-1e6, 1e6, allow_nan=False)),
+        spliced=spliced,
+    )
+
+
 def before_92(config):
     """Return a golden configuration with its jitter drawn as upstream drew it before #92.
 
@@ -87,7 +130,8 @@ def before_92(config):
     """
 
     # Imported here, not at the top: the conftest imports this module
-    # before it sets the cache variable the package reads on import.
+    # before its environment block, which has to run before anything
+    # imports `quadrat`, for the reason its module docstring gives.
     from quadrat.rules import Jitter
 
     bound = config["max_jitter"]

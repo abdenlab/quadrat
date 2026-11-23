@@ -564,19 +564,28 @@ def default_cache_dir(kind="windows"):
     window geometry included, so a sweep over geometries mints a fresh
     entry per configuration and keeps every one of them; each is the
     size of the grouped arrays, which is gigabytes at a realistic locus
-    set. A track entry is the Parquet tracks of one pileup over the
-    whole reference, which grow with the positions its alignments
-    cover.
+    set. A managed track entry, as `quadrat.managed.managed_tracks`
+    writes one, is keyed as `quadrat.managed.alignments_key` states,
+    so one is kept per alignment specification whatever the window
+    sets, and each is the Parquet tracks of one pileup over the whole
+    reference, which grow with the positions its alignments cover. The
+    key holds the package's version, so each release piles every
+    specification up again and leaves the earlier entries in place.
     There is no eviction, no age limit and no size cap, deliberately:
     a retention policy for someone else's disk is the caller's to set,
     and a sweep that deletes gigabytes should not be something a
     library does on its own initiative. A caller who needs the space
     bounded should point ``QUADRAT_CACHE_DIR`` somewhere they manage
     and delete entry directories outright -- each is self-contained,
-    and a missing one is a miss rather than an error.
+    and a missing one is a miss rather than an error. A window entry
+    built from managed tracks is keyed on their files, though, so
+    deleting a track entry also strands every window entry built from
+    it: the entry piled up in its place holds the same rows in new
+    files, which no such window entry's key names. Delete those window
+    entries with it.
 
     :param kind: ``"windows"`` for window cache entries or
-        ``"tracks"`` for track entries.
+        ``"tracks"`` for managed track entries.
     :returns: The directory, as a `str`. It is not created.
     :raises ValueError: if ``kind`` is neither.
     """
